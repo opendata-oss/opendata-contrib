@@ -271,7 +271,15 @@ pub struct SourceBatchDescriptor {
     pub sequence: u64,
     pub location: String,
     pub per_range_metadata: Vec<SourceRangeMetadata>,
-    pub size_hint: Option<u64>,
+    /// Object size in bytes, when the source can supply it without an
+    /// extra round trip. The Buffer source reader passes this through
+    /// from `BatchDescriptor.object_bytes` (RFC 0003), which is
+    /// `None` until the manifest format carries object size as a
+    /// follow-up. When `None`, the runtime's byte-budget accounting
+    /// uses the configured `source.estimated_max_batch_bytes` as a
+    /// pessimistic reservation; see "Backpressure Model > Byte
+    /// Budget Accounting" below.
+    pub object_bytes: Option<u64>,
 }
 
 pub struct SourceBatch {
@@ -316,15 +324,27 @@ pub struct MetadataEnvelope {
 }
 ```
 
-The runtime invokes `accepts(envelope)` per-entry and shards a single
-`SourceBatch` across decoders if multiple are configured. v1 expects a
-single decoder per source and falls back to RFC 0001's "fail closed on
-mismatch" semantics; per-entry routing is a future option (RFC 0001
-"Future: Per-entry signal routing").
+v1 contract: **one decoder per source**. The runtime calls
+`accepts(envelope)` once per source, with the source's configured
+envelope, at startup or on first non-empty batch. If `accepts` returns
+false, the runtime fails closed (mirroring RFC 0001). `decode` is then
+called per `SourceBatch` and consumes the whole batch.
 
-`decode` returns `Vec<DecodedBatch>` so a single `SourceBatch` can fan
-out across signals (e.g. mixed batches in a future router-aware mode).
-For v1 each `Decoder` returns at most one `DecodedBatch` per call.
+The trait shape is wider than the v1 contract on purpose: the decoder
+is invoked per-batch, but `accepts(envelope)` takes a single envelope
+so a future runtime can route entries with different envelopes to
+different decoders. **That future routing is not implemented in v1**
+because `Decoder::decode(&self, batch: SourceBatch)` consumes the
+entire batch; supporting it requires either splitting `SourceBatch`
+upstream of decoders (a runtime change) or evolving the trait to
+`decode(&self, batch: SourceBatch, entry_indices: &[u32])` (a trait
+change). Either path is a follow-up RFC; v1 keeps the homogeneous-
+envelope-per-source rule from RFC 0001.
+
+`decode` returns `Vec<DecodedBatch>` so a future per-signal split can
+fan out across signals (e.g. mixed batches in a future router-aware
+mode). **For v1 each `Decoder` returns at most one `DecodedBatch` per
+call.**
 
 #### `DecodedBatch`
 
@@ -348,9 +368,20 @@ pub struct DecodedBatch {
 
 pub enum DecodedRecords {
     /// Typed Rust records, today: `Vec<DecodedLogRecord>` from RFC 0001.
-    Typed(Box<dyn TypedRecords>),
-    /// Arrow columnar batch. See "Columnar Migration" below.
-    Arrow(arrow_array::RecordBatch),
+    /// Wrapped in `Arc` so a single decoded batch can fan out to many
+    /// sinks via cheap reference counting; sinks that need a typed
+    /// view downcast through `as_any`.
+    Typed(Arc<dyn TypedRecords + Send + Sync>),
+    /// Arrow columnar batch. `RecordBatch` is internally `Arc`-shared
+    /// across columns, but we wrap it in an outer `Arc` so the
+    /// `DecodedRecords` enum is `Clone` cheaply for fanout.
+    Arrow(Arc<arrow_array::RecordBatch>),
+}
+
+impl Clone for DecodedRecords {
+    /// O(1) reference-count clone. Required so the runtime can hand
+    /// the same decoded batch to multiple sinks.
+    fn clone(&self) -> Self { /* trivial */ unimplemented!() }
 }
 
 pub trait TypedRecords: Send + Sync {
@@ -383,6 +414,17 @@ Two design decisions worth flagging:
   columns (RFC 0001 `_odb_*`), and lets the Iceberg writer attach them
   to snapshot metadata or as Parquet columns, without forcing every
   decoder to know either sink's schema.
+- **Both `DecodedRecords` and `SourceCoordinateColumns` are
+  reference-counted for fanout.** A `DecodedBatch` produced by a
+  decoder is consumed once by the runtime, which then constructs one
+  `SinkCommit` per route. Each `SinkCommit` holds an `Arc` clone of
+  the records and the source columns; no record or column data is
+  copied on fanout. The default record-level filter
+  (`RouteAssignment.indices`) ships as an `Option<Arc<Vec<u32>>>` for
+  the same reason. Sinks that need to materialize per-route
+  projections (e.g. an Iceberg writer that writes Parquet columns
+  from a subset of records) do so on their own thread, reading
+  through the Arc.
 
 `source_entry_count` lets the commit group and the ack coordinator
 advance the input high-watermark even when `records` is empty, mirroring
@@ -419,6 +461,16 @@ the decoder layer, not the router.
 
 #### `Sink`
 
+`Sink::write` is **atomic per (source range, route)**. One call commits
+the entire range for one route. Internally a sink may chunk and
+parallelize as it sees fit (the ClickHouse sink today plans
+`Vec<InsertChunk>` and writes them with per-chunk dedupe tokens; the
+Iceberg sink writes one or more Parquet files and one snapshot
+commit), but `write` does not return `Ok` until **every** internal
+piece has durably landed. Partial success inside a `write` call is the
+sink's problem to clean up before returning `Err`; the runtime treats
+the call as either fully durable or not durable at all.
+
 ```rust
 #[async_trait::async_trait]
 pub trait Sink: Send + Sync + 'static {
@@ -428,9 +480,19 @@ pub trait Sink: Send + Sync + 'static {
     /// before pausing upstream pulls (used for fairness across sinks).
     fn write_budget(&self) -> SinkBudget;
 
+    /// Commit one (range, route) atomically. Returns `Ok` only if
+    /// every internal chunk/file/insert is durable; returns the
+    /// appropriate `SinkCommitFailure` variant otherwise.
     async fn write(&self, commit: SinkCommit)
-        -> RuntimeResult<SinkCommitResult>;
+        -> Result<SinkCommitResult, SinkCommitFailure>;
 
+    /// Inspect prior commit state for a given idempotency key. The
+    /// runtime calls this on replay (after a crash) and on
+    /// `MaybeCommitted` failure (after an ambiguous response from
+    /// the sink). Sinks that cannot tell return
+    /// `CommitStatus::Unknown`; the runtime then re-attempts the
+    /// `write` and relies on the sink's table-level dedupe (e.g.
+    /// `ReplacingMergeTree(_adapter_version)`) to clean up.
     async fn check_committed(&self, key: &IdempotencyKey)
         -> RuntimeResult<CommitStatus>;
 }
@@ -442,8 +504,15 @@ pub struct SinkCommit {
     pub high_sequence: u64,
     pub schema_version: SchemaVersion,
     pub idempotency_key: IdempotencyKey,
+    /// O(1) Arc clone of the decoder's output. Multiple
+    /// `SinkCommit`s for the same range (one per route) all share
+    /// the same underlying records.
     pub records: DecodedRecords,
-    pub source_columns: SourceCoordinateColumns,
+    /// Same: shared via Arc across all routes for this range.
+    pub source_columns: Arc<SourceCoordinateColumns>,
+    /// If the route assignment selected a record subset, the
+    /// indices into `records`. `None` means "every record."
+    pub record_indices: Option<Arc<Vec<u32>>>,
 }
 
 pub struct SinkCommitResult {
@@ -451,34 +520,77 @@ pub struct SinkCommitResult {
     pub rows_written: u64,
 }
 
+pub enum SinkCommitFailure {
+    /// Sink definitively did not commit. Safe to retry the same
+    /// `write` call. Examples: connection refused, 5xx before
+    /// request body sent, fast-path validation rejection that
+    /// cannot have produced state.
+    NotCommitted(BoxError),
+    /// Request did not return success, but the sink may have
+    /// committed (e.g. timeout after request body was fully sent,
+    /// connection drop after server-side commit, ClickHouse 200 OK
+    /// dropped on the network). The runtime calls
+    /// `check_committed(idempotency_key)` before deciding whether
+    /// to retry.
+    MaybeCommitted(BoxError),
+    /// Non-retryable. The runtime halts. Examples: schema mismatch,
+    /// permissions error, malformed request that cannot succeed
+    /// without code or schema changes.
+    Fatal(BoxError),
+}
+
 pub enum CommitStatus {
     Committed,
     NotCommitted,
     /// Sink cannot tell from idempotency key alone (e.g. ClickHouse
-    /// insert deduplication window has passed). Treated as
-    /// `NotCommitted` for retry, but logged so an operator can audit.
+    /// insert deduplication window has passed). The runtime treats
+    /// this like `NotCommitted` for the retry decision, re-attempts
+    /// the `write`, and relies on the sink's table-level dedupe
+    /// (e.g. `ReplacingMergeTree(_adapter_version)`) to clean up
+    /// any duplicate rows. `Unknown` is logged separately so an
+    /// operator can audit how often it fires.
     Unknown,
 }
 ```
 
+#### Runtime Handling of `SinkCommitFailure`
+
+The runtime branches on the failure variant before deciding what to do:
+
+| Variant | Runtime action |
+|---|---|
+| `NotCommitted(_)` | Backoff and retry the same `write` call; ack frontier does not advance for this route. After retry budget is exhausted, halt. |
+| `MaybeCommitted(_)` | Call `check_committed(key)`. If `Committed`, mark the route complete on this range without writing again. If `NotCommitted`, retry the `write`. If `Unknown`, retry the `write` and rely on table-level dedupe. |
+| `Fatal(_)` | Halt the runtime. The operator inspects the offending range and decides whether to fix the sink, fix the data, or use the documented escape hatch to advance past the range. |
+
+This is the layer that makes ClickHouse insert timeouts and Iceberg
+catalog-commit timeouts safe. Without it, a `MaybeCommitted` event
+would either ack-on-first-success (data loss if the next sink in
+fanout fails) or retry-on-failure (duplicate Iceberg snapshot, stale
+ClickHouse insert dedupe token).
+
 `check_committed(key)` is the primitive that lets a sink say "I already
-have this; do not write it again" on replay. The ClickHouse sink
-implements it as a no-op that always returns `Unknown` because alpha
-ClickHouse dedupes at the table layer with `ReplacingMergeTree`. The
-Iceberg sink implements it by inspecting snapshot metadata for a file
-keyed on the `IdempotencyKey`. Sinks that genuinely cannot detect prior
-commit return `Unknown` and accept that replay may admit duplicates,
-which the table-level mechanism (or the operator) must clean up.
+have this; do not write it again." It is the same call used for
+crash-replay (after a process restart, before the runtime advances
+acks past the durable frontier) and for `MaybeCommitted` resolution.
+The ClickHouse sink implements it as a no-op that always returns
+`Unknown` because alpha ClickHouse dedupes at the table layer with
+`ReplacingMergeTree(_adapter_version)`. The Iceberg sink implements it
+by inspecting snapshot metadata for a file whose key matches.
 
 #### `IdempotencyContract`
 
-The idempotency key is a pure function of source coordinates, route,
-schema version, and chunking parameters. The runtime constructs it; the
-sink consumes it.
+The runtime-level idempotency key identifies a single (source range,
+route) commit. **It does not include `chunk_index`**: the sink's
+`write` call is atomic over the range×route, so the runtime never
+observes individual chunks. Sinks that internally chunk (e.g.
+ClickHouse insert chunks, Iceberg Parquet files) construct their own
+per-chunk identifiers from the runtime's `IdempotencyKey` plus a
+sink-internal index.
 
 ```rust
 pub trait IdempotencyContract: Send + Sync {
-    fn key(&self, scope: IdempotencyScope) -> IdempotencyKey;
+    fn key(&self, scope: IdempotencyScope<'_>) -> IdempotencyKey;
 }
 
 pub struct IdempotencyScope<'a> {
@@ -487,8 +599,14 @@ pub struct IdempotencyScope<'a> {
     pub low_sequence: u64,
     pub high_sequence: u64,
     pub schema_version: SchemaVersion,
+    /// Pure-function hash of every input that affects how the sink
+    /// will internally chunk and order this commit (commit-group
+    /// thresholds, ordering rule id, sink-specific config). Two
+    /// runtime configurations that produce the same internal
+    /// chunk/file boundaries have the same fingerprint; any change
+    /// that could move a record produces a different fingerprint
+    /// and therefore a different idempotency key.
     pub chunking_fingerprint: u64,
-    pub chunk_index: u32,
 }
 
 pub struct IdempotencyKey(pub String);
@@ -497,11 +615,22 @@ pub struct IdempotencyKey(pub String);
 The default implementation produces:
 
 ```text
-{source}:{route}:{low}-{high}:{schema_version}:{chunking_fingerprint}:{chunk_index}
+{source}:{route}:{low}-{high}:{schema_version}:{chunking_fingerprint}
 ```
 
-This is the same shape as RFC 0001's per-chunk token, generalized so
-non-ClickHouse sinks can reuse it.
+This is RFC 0001's per-chunk token format with `chunk_index` stripped:
+the runtime hands the sink one job per (range, route), so a single
+key is enough at the runtime layer.
+
+The ClickHouse sink, internally, builds RFC 0001's full token by
+appending its own `chunk_index`:
+
+```text
+{runtime_idempotency_key}:{chunk_index}
+```
+
+The Iceberg sink does the analogous thing for its Parquet file
+identity. Sinks own that suffix; the runtime never constructs it.
 
 ### Per-Source Ack Coordinator
 
@@ -540,9 +669,18 @@ The state transitions are:
    set is the union of route ids in those assignments. Empty
    assignments (a `DecodedBatch` that no route claimed) still register
    a pending range so input progress can advance.
-2. **Range becomes complete-on-route** when a sink reports a successful
-   commit (via `Sink::write` returning `Ok` *or* `check_committed`
-   returning `Committed`).
+2. **Range becomes complete-on-route** when the sink for that route
+   reports a successful commit. Because `Sink::write` is atomic per
+   (range, route) (see "`Sink`" above), there is **exactly one**
+   `Sink::write` invocation per (range, route) — no per-chunk
+   completion to track at the runtime layer. A route is marked
+   complete when:
+   - `Sink::write(commit)` returns `Ok(_)`, or
+   - `Sink::write(commit)` returns `Err(MaybeCommitted)` and the
+     subsequent `check_committed(key)` returns `Committed`, or
+   - On replay after restart, `check_committed(key)` returns
+     `Committed` before the runtime would have re-attempted the
+     `write`.
 3. **Range becomes complete** when `committed_routes ==
    required_routes`.
 4. **Frontier advances** to the highest contiguous complete sequence
@@ -558,23 +696,37 @@ add or remove routes for the range. If a range is `required_routes =
 {}`, it is complete the moment it is registered (zero-record batch with
 no routes claiming it).
 
+> **Why route-level tracking is sufficient.** Earlier drafts of this
+> RFC tracked completion per `(route, chunk_index)`. That was
+> ambiguous because a sink can choose its own chunk count, and the
+> runtime would have had to either pre-declare the chunk count or
+> count completion events without knowing the upper bound. The
+> "atomic per (range, route)" rule on `Sink::write` collapses this
+> into a single-bit-per-route check.
+
 #### Crash Semantics
 
 - **Crash before any sink commit**: nothing in the Buffer ack moves.
   Source replays the range. Same outcome as RFC 0001.
-- **Crash after one sink commit, before another**: ack frontier did not
-  advance (range incomplete). Source replays. The committed sink's
-  `check_committed(key)` should return `Committed` and the runtime
-  marks the route complete without rewriting; the uncommitted sink
-  replays normally. Sinks whose `check_committed` returns `Unknown`
-  re-attempt and rely on their own dedupe (e.g. ClickHouse table-level
-  dedupe).
+- **Crash after one route's sink commit, before another's**: ack
+  frontier did not advance (range incomplete). Source replays. For each
+  required route, the runtime calls `check_committed(key)` *before*
+  re-attempting `Sink::write`:
+  - The committed route's sink returns `Committed`; the runtime marks
+    the route complete without rewriting.
+  - The uncommitted route's sink returns `NotCommitted` or `Unknown`;
+    the runtime calls `Sink::write` and waits for success.
 - **Crash after all sink commits, before ack flush**: same as above,
-  except every sink reports `Committed` on replay. Frontier advances
-  and flushes on the next loop iteration.
+  except every required route's `check_committed` returns `Committed`.
+  Frontier advances and flushes on the next loop iteration.
+- **Crash mid-`MaybeCommitted` resolution** (write returned ambiguous,
+  process died before `check_committed` resolved): same as the
+  preceding case. Replay re-enters the `check_committed` path; the
+  sink's answer is the source of truth.
 - **Crash after ack flush**: source will not replay this range. Every
-  sink must already have committed it. The runtime never advances the
-  frontier without all required commits, so this is the invariant.
+  required route's sink must already have committed it, and the
+  runtime advanced the frontier only after all required
+  commits. This is the invariant.
 
 #### Fanout Invariant
 
@@ -607,6 +759,11 @@ later config schema RFC may rename, but the semantics carry through):
 
 - `source.max_inflight_batches`
 - `source.max_inflight_bytes`
+- `source.estimated_max_batch_bytes` — pessimistic reservation per
+  batch when `BatchDescriptor.object_bytes` is `None`. Defaults to
+  `source.max_inflight_bytes / source.max_inflight_batches` rounded
+  up; operators override when the workload is known to use larger
+  batches.
 - `source.fetch_concurrency`
 - `source.decompress_concurrency`
 - `decode.concurrency`
@@ -616,6 +773,47 @@ later config schema RFC may rename, but the semantics carry through):
 - `sink.<name>.max_concurrent_commits`
 - `sink.<name>.retry.max_attempts`
 - `sink.<name>.retry.initial_backoff_ms`
+
+#### Byte Budget Accounting
+
+In-flight bytes are tracked from descriptor reservation through sink
+commit. The accounting rule is the same regardless of source:
+
+1. **At descriptor reservation** (when `next_descriptors` produces a
+   batch and the runtime decides whether to fetch it):
+   - If `descriptor.object_bytes == Some(n)`, reserve `n` bytes from
+     the source's in-flight budget.
+   - If `descriptor.object_bytes == None` (Buffer's current case;
+     RFC 0003 reserves the field but the manifest does not yet carry
+     it), reserve `source.estimated_max_batch_bytes` bytes.
+2. **After fetch and decode**: the reservation is reconciled to the
+   actual `SourceBatch` payload size (post-decompress, pre-decode)
+   plus the decoded `DecodedBatch.estimated_bytes()`. The previous
+   reservation is released; the actual size is held for as long as
+   the batch is in any in-flight stage.
+3. **Through fanout**: when a `DecodedBatch` is fanned to N routes,
+   the byte reservation is *not* multiplied by N. The records are
+   `Arc`-shared (see "DecodedBatch" above), so the underlying memory
+   exists once. Per-route stage accounting tracks which routes still
+   hold a reference; bytes are released only when the last route
+   completes.
+4. **At sink commit success**: the actual size is released from the
+   route's slice of the budget.
+5. **On retry / `MaybeCommitted` resolution**: the reservation
+   persists until the route is decisively complete or the runtime
+   halts.
+
+The runtime never uses HEAD requests against object storage to
+discover sizes. The `estimated_max_batch_bytes` fallback is intentional
+slack: it overcounts in the common case and the source poller pauses
+sooner than it strictly has to. When a future Buffer manifest format
+revision (or an opt-in producer-side metadata extension) provides
+`object_bytes`, the accounting becomes tight.
+
+Phase 6 of the impl plan must demonstrate this by showing
+`runtime_stage_inflight_bytes{stage,source}` rising and the source
+poller backing off on a slow-sink injection — the test is in the
+correctness harness, not in benchmark numbers.
 
 Required metrics (stage-labeled):
 
@@ -1082,3 +1280,4 @@ Phase-aligned with the impl plan.
 | Date | Description |
 |---|---|
 | 2026-05-07 | Initial draft. Generalizes RFC 0001 into a sink-neutral runtime; defines source/decoder/router/sink traits, AckCoordinator state machine, fanout invariant, columnar migration path, pluggability levels, and validation criteria phase by phase. |
+| 2026-05-07 (rev 2) | Phase 0 gate revision. (1) `Sink::write` is now atomic per (range, route); chunk_index removed from runtime IdempotencyKey (sinks build per-chunk identifiers internally); AckCoordinator tracks one bit per (range, route). (2) `DecodedRecords` switches `Box<dyn TypedRecords>` → `Arc<dyn TypedRecords + Send + Sync>` and `RecordBatch` → `Arc<RecordBatch>`; `SinkCommit.source_columns` is `Arc<SourceCoordinateColumns>`; fanout is O(1) Arc clones, no record copies. (3) Byte-budget accounting documented end-to-end with `BatchDescriptor.object_bytes` (RFC 0003) and `source.estimated_max_batch_bytes` pessimistic-reservation fallback; HEAD requests explicitly avoided. (4) New `SinkCommitFailure { NotCommitted, MaybeCommitted, Fatal }` enum; runtime calls `check_committed` on `MaybeCommitted` before retry. (5) Decoder per-entry routing marked future (current trait consumes whole `SourceBatch`; v1 = one decoder per source). |
