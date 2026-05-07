@@ -22,6 +22,7 @@ const ENVELOPE_LEN: usize = 4;
 pub enum SignalType {
     Metrics,
     Logs,
+    Traces,
 }
 
 impl SignalType {
@@ -29,6 +30,7 @@ impl SignalType {
         match self {
             SignalType::Metrics => 1,
             SignalType::Logs => 2,
+            SignalType::Traces => 3,
         }
     }
 
@@ -36,6 +38,7 @@ impl SignalType {
         match byte {
             1 => Some(SignalType::Metrics),
             2 => Some(SignalType::Logs),
+            3 => Some(SignalType::Traces),
             _ => None,
         }
     }
@@ -44,6 +47,7 @@ impl SignalType {
         match self {
             SignalType::Metrics => "metrics",
             SignalType::Logs => "logs",
+            SignalType::Traces => "traces",
         }
     }
 }
