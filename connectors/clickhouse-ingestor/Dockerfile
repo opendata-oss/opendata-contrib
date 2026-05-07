@@ -21,7 +21,7 @@ COPY . .
 # Build the clickhouse-ingestor binary in release mode.
 # --manifest-path keeps the build scoped to this workspace member.
 # --locked ensures reproducible builds from Cargo.lock.
-RUN cargo build --release --locked --manifest-path clickhouse-ingestor/Cargo.toml
+RUN cargo build --release --locked --manifest-path connectors/clickhouse-ingestor/Cargo.toml
 
 # Runtime stage
 # Pin to multi-arch manifest list digest for reproducible builds (supports amd64/arm64)

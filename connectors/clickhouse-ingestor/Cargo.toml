@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 description = "Reusable Rust runtime that consumes OpenData Buffer batches and writes them into ClickHouse"
 license = "MIT"
-repository = "https://github.com/opendata-oss/opendata"
+repository = "https://github.com/opendata-oss/opendata-contrib"
 
 [lib]
 name = "clickhouse_ingestor"
