@@ -1,0 +1,112 @@
+name: Release
+
+# Tag format: <connector>/v<semver>, e.g. clickhouse-ingestor/v0.1.0.
+# A matching push triggers a binary release (GitHub Release asset) and a
+# container image release (GHCR) in parallel. The two jobs are independent;
+# either can be retried without re-running the other.
+
+on:
+  push:
+    tags:
+      - 'clickhouse-ingestor/v*'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-binary:
+    name: Build binary (x86_64-unknown-linux-gnu)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Resolve version
+        id: ver
+        run: |
+          # clickhouse-ingestor/v0.1.0 -> v0.1.0
+          VERSION="${GITHUB_REF_NAME##*/}"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Build release binary
+        run: cargo build --release --locked --manifest-path connectors/clickhouse-ingestor/Cargo.toml
+
+      - name: Package tarball
+        id: pkg
+        run: |
+          VERSION="${{ steps.ver.outputs.version }}"
+          ARCHIVE="clickhouse-ingestor-${VERSION}-x86_64-unknown-linux-gnu.tar.gz"
+          mkdir -p dist
+          tar -C target/release -czf "dist/${ARCHIVE}" clickhouse-ingestor
+          (cd dist && sha256sum "${ARCHIVE}" > "${ARCHIVE}.sha256")
+          echo "archive=dist/${ARCHIVE}" >> "$GITHUB_OUTPUT"
+          echo "sha256=dist/${ARCHIVE}.sha256" >> "$GITHUB_OUTPUT"
+
+      - name: Create or update GitHub Release with binary asset
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ${{ steps.pkg.outputs.archive }}
+            ${{ steps.pkg.outputs.sha256 }}
+          generate_release_notes: true
+
+  build-image:
+    name: Build & push image (linux/amd64)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Free Disk Space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          docker-images: true
+          swap-storage: true
+
+      - uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: ver
+        run: |
+          VERSION="${GITHUB_REF_NAME##*/}"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: connectors/clickhouse-ingestor/Dockerfile
+          push: true
+          platforms: linux/amd64
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/clickhouse-ingestor:${{ steps.ver.outputs.version }}
+          cache-from: type=registry,ref=ghcr.io/${{ github.repository_owner }}/clickhouse-ingestor:buildcache
+          cache-to: type=registry,ref=ghcr.io/${{ github.repository_owner }}/clickhouse-ingestor:buildcache,mode=max
+
+      - name: Output image URI
+        run: |
+          IMAGE="ghcr.io/${{ github.repository_owner }}/clickhouse-ingestor:${{ steps.ver.outputs.version }}"
+          echo "## Image Released" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Image:** \`${IMAGE}\`" >> "$GITHUB_STEP_SUMMARY"
