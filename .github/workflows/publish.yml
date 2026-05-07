@@ -7,10 +7,14 @@ run-name: "Publish ${{ inputs.connector }} (${{ inputs.bump }})"
 #   2. cargo test --workspace
 #   3. commits the version bump on main
 #   4. tags <connector>/v<X.Y.Z>
-#   5. pushes both the commit and the tag
+#   5. pushes both, then explicitly dispatches build-binaries.yml against
+#      the new tag.
 #
-# The tag push fires build-binaries.yml, which creates the GitHub Release,
-# builds the matrix of binaries, and pushes the GHCR image.
+# Note: GITHUB_TOKEN-authored pushes do not trigger downstream workflows
+# (a deliberate GitHub recursion guard), so the final dispatch step is
+# what kicks off build-binaries.yml. opendata uses an org-scoped GitHub
+# App token instead, which has push-with-trigger; we don't have that
+# secret here, and dispatching is functionally equivalent.
 
 on:
   workflow_dispatch:
@@ -33,6 +37,7 @@ on:
 
 permissions:
   contents: write
+  actions: write   # to dispatch build-binaries.yml
 
 env:
   CARGO_TERM_COLOR: always
@@ -52,21 +57,9 @@ jobs:
           docker-images: true
           swap-storage: true
 
-      # An app token is required so the commit + tag push fire downstream
-      # workflows (default GITHUB_TOKEN-authored pushes do not, by design).
-      # Re-uses the opendata-oss org-level secret already wired into the
-      # publish flow on the opendata repo.
-      - name: Generate token
-        id: app-token
-        uses: actions/create-github-app-token@v1
-        with:
-          app-id: 2838764
-          private-key: ${{ secrets.GHA_BOT_PRIVATE_KEY }}
-
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          token: ${{ steps.app-token.outputs.token }}
           fetch-depth: 0
 
       - name: Configure git
@@ -105,3 +98,13 @@ jobs:
         run: |
           git push origin HEAD
           git push origin "${{ inputs.connector }}/v${{ steps.version.outputs.new_version }}"
+
+      - name: Dispatch build-binaries.yml
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: "${{ inputs.connector }}/v${{ steps.version.outputs.new_version }}"
+        run: |
+          gh workflow run build-binaries.yml \
+            --repo "$GITHUB_REPOSITORY" \
+            --ref "$TAG" \
+            -f tag="$TAG"
