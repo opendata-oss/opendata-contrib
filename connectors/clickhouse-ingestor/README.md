@@ -2,9 +2,9 @@
 
 A standalone service that consumes OTLP logs from an OpenData Buffer and writes them to a ClickHouse table.
 
-The runtime is generic at the Buffer-reader and metadata-envelope layers; signal-specific decoding and ClickHouse table mapping live in pluggable adapters. The current alpha ships an **OTLP logs adapter only**. Pointing it at a metrics manifest fails closed.
+The runtime is generic at the Buffer-reader and metadata-envelope layers; signal-specific decoding and ClickHouse table mapping live in pluggable adapters. The current alpha **ships an OTLP logs adapter** as the published binary; the trait surfaces (`SignalDecoder`, `Adapter`) are public so you can compose your own decoder + adapter for any other signal type — see ["Add a new signal type"](#add-a-new-signal-type) below for a worked OTLP traces example.
 
-The design (ack semantics, dedupe, idempotency tokens, schema ownership) is described in [`rfcs/0001-clickhouse-ingestor.md`](../../rfcs/0001-clickhouse-ingestor.md). This README is for operators who want to run the binary.
+The design (ack semantics, dedupe, idempotency tokens, schema ownership) is described in [`rfcs/0001-clickhouse-ingestor.md`](../../rfcs/0001-clickhouse-ingestor.md). The first part of this README is for operators who want to run the published binary against an OTLP logs source; the last section is for developers who want to extend it.
 
 ## What you need
 
@@ -221,8 +221,114 @@ Once the process is up:
 
 Re-running the ingestor over already-inserted batches is safe: `ReplacingMergeTree(_adapter_version)` collapses duplicates on merge, the per-chunk `insert_deduplication_token` is a backstop, and queries that need exactly-once semantics should use `FINAL` (or query-time dedupe).
 
+## Add a new signal type
+
+The published binary is wired for OTLP logs only — but everything below the binary is generic. The runtime, commit-group coalescer, ack controller, and ClickHouse writer are all signal-agnostic; only the decoder and the adapter are signal-specific. To pipe a different kind of data (OTLP traces, OTLP metrics, your own protobuf, etc.) into ClickHouse, you implement two traits and write a binary that wires them up.
+
+The crate's integration tests include a **complete worked example for OTLP traces**: [`tests/clickhouse_round_trip_traces.rs`](tests/clickhouse_round_trip_traces.rs). Read that file first if you want a runnable reference. The summary below mirrors what it does.
+
+### What you write
+
+**1. A decoded record type.** One flat struct per logical row, carrying [`SourceCoordinates`](src/signal.rs) (sequence/entry/record indices that uniquely identify the row) plus the fields you'll write into ClickHouse:
+
+```rust
+#[derive(Debug, Clone)]
+struct DecodedSpanRecord {
+    source: SourceCoordinates,
+    trace_id_hex: String,
+    span_id_hex: String,
+    name: String,
+    duration_nanos: u64,
+    service_name: Option<String>,
+    // ...
+}
+
+impl RecordSize for DecodedSpanRecord {
+    fn approx_size_bytes(&self) -> usize { /* ... */ }
+}
+```
+
+`RecordSize` is what the commit group uses to enforce `max_bytes` — a rough estimate is fine; deterministic across replays is what matters.
+
+**2. A `SignalDecoder` impl.** Walks the protobuf payload (or whatever encoding you have) and flattens it into a `Vec<DecodedSpanRecord>`. The `record_index` you assign per record is the third coordinate of the `(sequence, entry_index, record_index)` triple that identifies a row — keep it monotonic within an entry:
+
+```rust
+impl SignalDecoder for OtlpTracesDecoder {
+    type Output = Vec<DecodedSpanRecord>;
+
+    fn decode(
+        &self,
+        batch: &RawBufferBatch,
+        _envelopes: &[MetadataEnvelope],
+    ) -> IngestorResult<Self::Output> {
+        // ... walk ResourceSpans -> ScopeSpans -> Span, emit records
+    }
+}
+```
+
+**3. An `Adapter` impl.** Consumes a drained `CommitGroupBatch<DecodedSpanRecord>` and emits a deterministic `Vec<InsertChunk>`. Each chunk carries the columns + rows for one ClickHouse `INSERT`, plus an idempotency token of the form `{manifest_path}:{database}.{table}:{low}-{high}:{adapter_version}:{chunking_fingerprint}:{chunk_index}`:
+
+```rust
+impl Adapter for OtlpTracesClickHouseAdapter {
+    type Input = DecodedSpanRecord;
+
+    fn plan(&self, batch: CommitGroupBatch<Self::Input>) -> IngestorResult<Vec<InsertChunk>> {
+        // 1. Sort records by (sequence, entry_index, record_index) for stable chunking.
+        // 2. Split into chunks bounded by max_chunk_rows + max_chunk_bytes.
+        // 3. For each chunk, emit a InsertChunk with rows mapped via your row builder.
+        // 4. Token = build_token(manifest_path, config, fingerprint, low, high, chunk_index).
+    }
+}
+```
+
+The `chunking_fingerprint` is a stable hash of every input that affects chunk boundaries (database, table, max_chunk_rows, max_chunk_bytes, adapter_version). It's part of the token so a configuration change between partial-success and ack doesn't collide tokens with rows produced under different rules. See `chunking_fingerprint()` in the worked example for the canonical shape.
+
+**4. A ClickHouse table DDL.** Match the columns your adapter emits. The alpha logs DDL uses `ReplacingMergeTree(_adapter_version)` partitioned by `toDate(Timestamp)` and `ORDER BY (toDate(Timestamp), <high-cardinality-prefix>, _odb_sequence, _odb_entry_index, _odb_record_index)`. The `_odb_*` suffix is what gives `(sequence, entry_index, record_index)` a unique role in the dedupe key — preserve it. The leading prefix is your call: pick columns that give time + service skipping for your common queries.
+
+**Key constraint:** any change to a column that participates in `ORDER BY` requires a **new table** and a backfill or rewrite. Non-`ORDER BY` column changes are fine with an `_adapter_version` bump (the merge tiebreaker resolves replays to the new mapping).
+
+**5. A binary or test that wires it up.** The `clickhouse_ingestor` crate is a library too — your binary builds a `BufferConsumerRuntime` from the consumer + your decoder + your adapter + a writer:
+
+```rust
+let runtime = BufferConsumerRuntime::new(
+    consumer,
+    OtlpTracesDecoder,                                 // your SignalDecoder
+    OtlpTracesClickHouseAdapter::new(adapter_cfg),     // your Adapter
+    Some(writer),                                      // ClickHouseWriter (or None for dry-run)
+    RuntimeOptions {
+        manifest_path: manifest_path.into(),
+        data_path_prefix: data_prefix.into(),
+        configured_envelope: ConfiguredEnvelope {
+            version: 1,
+            signal_type: SignalType::Traces,    // <- match what the producer wrote
+            encoding: PayloadEncoding::OtlpProtobuf,
+        },
+        commit_group: CommitGroupThresholds { /* max_rows, max_bytes, max_age */ },
+        ack_flush_policy: AckFlushPolicy::EveryCommitGroup,
+        dry_run: false,
+        poll_interval: Duration::from_millis(20),
+    },
+);
+runtime.run(shutdown).await
+```
+
+`SignalType` already covers the OTLP signal types (`Logs`, `Metrics`, `Traces`); for arbitrary non-OTLP payloads you'd extend that enum (additive, just byte-mapping + a name) or carry signal-type-as-data inside the envelope's `reserved` byte and dispatch in your decoder.
+
+### Verifying it works
+
+The traces test runs the same testcontainers + Buffer Producer + runtime + ClickHouse pattern as the logs test:
+
+```sh
+cargo test -p clickhouse-ingestor --features integration-tests \
+  --test clickhouse_round_trip_traces -- --nocapture
+```
+
+Both tests should pass on a machine with Docker available — they exercise the full producer → manifest → consumer → decoder → adapter → writer → `SELECT count()` loop against a real ClickHouse container. If you change the runtime, commit-group, or writer code, run both as a regression check; the traces test is the one that proves the public trait surfaces are usable for new signals.
+
 ## See also
 
 - [RFC 0001 — ClickHouse Ingestor](../../rfcs/0001-clickhouse-ingestor.md): full design, ack/retry semantics, dedupe model.
+- [`tests/clickhouse_round_trip.rs`](tests/clickhouse_round_trip.rs): logs end-to-end test (the published path).
+- [`tests/clickhouse_round_trip_traces.rs`](tests/clickhouse_round_trip_traces.rs): traces end-to-end test (the worked extension example).
 - [opendata-go OpenData OTel exporter](https://github.com/opendata-oss/opendata-go/tree/main/exporter/opendataexporter): the producer side that writes OTLP logs into the Buffer.
 - [`opendata-buffer` crate](https://crates.io/crates/opendata-buffer): the underlying Buffer producer/consumer library.

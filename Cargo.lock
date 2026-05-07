@@ -2199,6 +2199,8 @@ dependencies = [
  "futures-util",
  "glob",
  "opentelemetry",
+ "percent-encoding",
+ "rand 0.8.6",
  "serde_json",
  "thiserror 2.0.18",
 ]
