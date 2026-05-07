@@ -1,0 +1,107 @@
+name: Publish Connector
+run-name: "Publish ${{ inputs.connector }} (${{ inputs.bump }})"
+
+# workflow_dispatch is the operator-facing entry point: choose a connector,
+# choose a semver bump strategy, and this workflow:
+#   1. cargo set-version --bump <patch|minor|major>
+#   2. cargo test --workspace
+#   3. commits the version bump on main
+#   4. tags <connector>/v<X.Y.Z>
+#   5. pushes both the commit and the tag
+#
+# The tag push fires build-binaries.yml, which creates the GitHub Release,
+# builds the matrix of binaries, and pushes the GHCR image.
+
+on:
+  workflow_dispatch:
+    inputs:
+      connector:
+        description: "Connector to publish"
+        required: true
+        type: choice
+        options:
+          - clickhouse-ingestor
+      bump:
+        description: "Version bump strategy"
+        required: true
+        type: choice
+        default: patch
+        options:
+          - patch
+          - minor
+          - major
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Free Disk Space (Ubuntu)
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          docker-images: true
+          swap-storage: true
+
+      # An app token is required so the commit + tag push fire downstream
+      # workflows (default GITHUB_TOKEN-authored pushes do not, by design).
+      # Re-uses the opendata-oss org-level secret already wired into the
+      # publish flow on the opendata repo.
+      - name: Generate token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: 2838764
+          private-key: ${{ secrets.GHA_BOT_PRIVATE_KEY }}
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+          fetch-depth: 0
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-edit
+        run: cargo install cargo-edit
+
+      - name: Bump version
+        run: cargo set-version -p ${{ inputs.connector }} --bump ${{ inputs.bump }}
+
+      - name: Read new version
+        id: version
+        run: |
+          NEW_VERSION=$(cargo metadata --format-version 1 --no-deps \
+            | jq -r '.packages[] | select(.name=="${{ inputs.connector }}") | .version')
+          echo "new_version=$NEW_VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Run tests
+        run: cargo test --workspace
+
+      - name: Commit and tag
+        run: |
+          git add -A
+          git commit -m "release: ${{ inputs.connector }} v${{ steps.version.outputs.new_version }}"
+          git tag "${{ inputs.connector }}/v${{ steps.version.outputs.new_version }}"
+
+      - name: Push commit and tag
+        run: |
+          git push origin HEAD
+          git push origin "${{ inputs.connector }}/v${{ steps.version.outputs.new_version }}"

@@ -1,0 +1,217 @@
+name: Build Binaries
+
+# Triggered by tag pushes from publish.yml (or manual tag pushes for
+# hotfixes). Parses the tag (`<connector>/v<X.Y.Z>`), creates a GitHub
+# Release, builds binaries for a matrix of targets, and pushes the
+# container image to GHCR.
+
+on:
+  push:
+    tags: ['*/v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to build (e.g., clickhouse-ingestor/v0.1.0)'
+        required: true
+        type: string
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check-binary:
+    name: Check connector
+    runs-on: ubuntu-latest
+    outputs:
+      has_binary: ${{ steps.check.outputs.has_binary }}
+      crate_name: ${{ steps.check.outputs.crate_name }}
+      version: ${{ steps.check.outputs.version }}
+      features: ${{ steps.check.outputs.features }}
+      tag: ${{ steps.check.outputs.tag }}
+      docker_path: ${{ steps.check.outputs.docker_path }}
+    steps:
+      - name: Parse tag and check for binary
+        id: check
+        run: |
+          TAG="${{ inputs.tag || github.ref_name }}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+          CRATE_NAME="${TAG%/v*}"
+          VERSION="${TAG#*/v}"
+          echo "crate_name=$CRATE_NAME" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+          # docker_path is the directory containing the Dockerfile
+          # relative to the repo root.
+          case "$CRATE_NAME" in
+            clickhouse-ingestor)
+              echo "has_binary=true" >> "$GITHUB_OUTPUT"
+              echo "features=" >> "$GITHUB_OUTPUT"
+              echo "docker_path=connectors/clickhouse-ingestor" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "has_binary=false" >> "$GITHUB_OUTPUT"
+              echo "features=" >> "$GITHUB_OUTPUT"
+              echo "docker_path=" >> "$GITHUB_OUTPUT"
+              ;;
+          esac
+
+  create-release:
+    name: Create GitHub Release
+    needs: [check-binary]
+    if: needs.check-binary.outputs.has_binary == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.check-binary.outputs.tag }}
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.check-binary.outputs.tag }}
+          name: ${{ needs.check-binary.outputs.crate_name }} v${{ needs.check-binary.outputs.version }}
+          generate_release_notes: true
+          draft: false
+
+  build-binaries:
+    name: Build ${{ matrix.target }}
+    needs: [check-binary, create-release]
+    if: needs.check-binary.outputs.has_binary == 'true'
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+
+    steps:
+      - name: Free Disk Space (Ubuntu)
+        if: runner.os == 'Linux'
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          docker-images: true
+          swap-storage: true
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.check-binary.outputs.tag }}
+
+      - name: Install dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libssl-dev pkg-config
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release -p ${{ needs.check-binary.outputs.crate_name }} --features "${{ needs.check-binary.outputs.features }}"
+
+      - name: Package binary (unix)
+        if: runner.os != 'Windows'
+        run: |
+          cd target/release
+          tar -czvf ../../${{ needs.check-binary.outputs.crate_name }}-${{ needs.check-binary.outputs.version }}-${{ matrix.target }}.tar.gz ${{ needs.check-binary.outputs.crate_name }}
+
+      - name: Package binary (windows)
+        if: runner.os == 'Windows'
+        run: |
+          cd target/release
+          7z a ../../${{ needs.check-binary.outputs.crate_name }}-${{ needs.check-binary.outputs.version }}-${{ matrix.target }}.zip ${{ needs.check-binary.outputs.crate_name }}.exe
+
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.check-binary.outputs.tag }}
+          files: |
+            ${{ needs.check-binary.outputs.crate_name }}-*.tar.gz
+            ${{ needs.check-binary.outputs.crate_name }}-*.zip
+
+  build-docker:
+    name: Build Docker image
+    needs: [check-binary, create-release]
+    if: needs.check-binary.outputs.docker_path != ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    env:
+      IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/${{ needs.check-binary.outputs.crate_name }}
+    steps:
+      - name: Free Disk Space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          docker-images: true
+          swap-storage: true
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.check-binary.outputs.tag }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          tags: |
+            type=semver,pattern={{version}},value=v${{ needs.check-binary.outputs.version }}
+            type=semver,pattern={{major}}.{{minor}},value=v${{ needs.check-binary.outputs.version }}
+            type=raw,value=latest
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ${{ needs.check-binary.outputs.docker_path }}/Dockerfile
+          push: true
+          platforms: linux/amd64
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=registry,ref=${{ env.IMAGE_NAME }}:buildcache
+          cache-to: type=registry,ref=${{ env.IMAGE_NAME }}:buildcache,mode=max
+
+      - name: Output image URI
+        run: |
+          echo "## Docker Image Published" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Image:** \`${{ env.IMAGE_NAME }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Tags:**" >> "$GITHUB_STEP_SUMMARY"
+          echo '${{ steps.meta.outputs.tags }}' | while read -r tag; do
+            echo "- \`${tag}\`" >> "$GITHUB_STEP_SUMMARY"
+          done

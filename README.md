@@ -25,14 +25,14 @@ The runtime is generic at the Buffer-reader and metadata-envelope layers. Signal
 
 ## Releases
 
-Tag a connector release as `<connector>/v<semver>` (e.g. `clickhouse-ingestor/v0.1.0`). The `release.yml` workflow then publishes:
+Releases are cut from GitHub Actions, not from the local checkout. The flow is two workflows:
 
-- A GitHub Release with a `linux/amd64` binary tarball (`clickhouse-ingestor-vX.Y.Z-x86_64-unknown-linux-gnu.tar.gz`) and `.sha256`.
-- A container image at `ghcr.io/opendata-oss/clickhouse-ingestor:vX.Y.Z`.
+1. **`publish.yml`** (manual `workflow_dispatch`): pick a connector and a `patch` / `minor` / `major` bump. The workflow runs `cargo set-version`, runs the test suite, commits the bump on `main`, and pushes a `<connector>/v<X.Y.Z>` tag.
+2. **`build-binaries.yml`** (fires on the pushed tag): creates a GitHub Release, builds binaries across `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `aarch64-apple-darwin`, and `x86_64-pc-windows-msvc`, and pushes the container image to `ghcr.io/opendata-oss/<connector>:vX.Y.Z` (also tagged `:X.Y` and `:latest` via `docker/metadata-action`).
 
-The two jobs are independent — either can be re-run without affecting the other. For pre-release branch builds (no tag), use the `build-image.yml` workflow's `workflow_dispatch` trigger; it produces image tags of the form `<branch>-<sha>`.
+For ad-hoc branch builds without cutting a release, use `build-image.yml`'s `workflow_dispatch` trigger; it produces image tags of the form `<branch>-<sha>`.
 
-For platforms not covered by the published binary (macOS, ARM Linux), build from source:
+To build locally for a platform not in the matrix:
 
 ```sh
 cargo build --release --locked --manifest-path connectors/clickhouse-ingestor/Cargo.toml
