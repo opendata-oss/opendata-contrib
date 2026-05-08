@@ -31,7 +31,7 @@ use crate::envelope::{ConfiguredEnvelope, decode_envelopes, validate_consistent}
 use crate::error::{IngestorError, IngestorResult};
 use crate::metrics as m;
 use crate::signal::SignalDecoder;
-use crate::source::split_into_raw_entries;
+use crate::source::{SourceId, split_into_raw_entries};
 use crate::writer::ClickHouseWriter;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -233,7 +233,8 @@ where
     where
         A::Input: RecordSize,
     {
-        let raw = split_into_raw_entries(batch, &self.options.manifest_path);
+        let raw =
+            split_into_raw_entries(batch, SourceId::from("buffer"), &self.options.manifest_path);
         let envelopes = match decode_envelopes(&raw) {
             Ok(envs) => envs,
             Err(e) => {

@@ -1,6 +1,6 @@
 //! Signal-specific payload decoding.
 //!
-//! Converts a [`RawBufferBatch`] into typed records carrying Buffer source
+//! Converts a [`SourceBatch`] into typed records carrying Buffer source
 //! coordinates. The trait is the seam between the generic ingestor and the
 //! data shape; the alpha implementation is [`OtlpLogsDecoder`].
 //!
@@ -16,9 +16,10 @@ use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue, any_value::Valu
 use opentelemetry_proto::tonic::logs::v1::LogRecord;
 use prost::Message;
 
+use crate::commit_group::RecordSize;
 use crate::envelope::MetadataEnvelope;
 use crate::error::{IngestorError, IngestorResult};
-use crate::source::{RawBufferBatch, RawEntry};
+use crate::source::{SourceBatch, SourceEntry};
 
 /// Buffer source coordinates carried forward to the adapter.
 #[derive(Debug, Clone)]
@@ -41,7 +42,7 @@ pub trait SignalDecoder {
     /// uniformity within a batch.
     fn decode(
         &self,
-        batch: &RawBufferBatch,
+        batch: &SourceBatch,
         envelopes: &[MetadataEnvelope],
     ) -> IngestorResult<Self::Output>;
 }
@@ -70,6 +71,24 @@ pub struct DecodedLogRecord {
 /// wrapper type.
 pub type DecodedLogs = Vec<DecodedLogRecord>;
 
+impl RecordSize for DecodedLogRecord {
+    fn approx_size_bytes(&self) -> usize {
+        let mut sz = std::mem::size_of::<Self>();
+        sz += self.severity_text.len();
+        sz += self.body.len();
+        sz += self.service_name.as_ref().map_or(0, |s| s.len());
+        sz += self.scope_name.as_ref().map_or(0, |s| s.len());
+        sz += self.trace_id_hex.len() + self.span_id_hex.len();
+        for (k, v) in &self.resource_attributes {
+            sz += k.len() + v.len();
+        }
+        for (k, v) in &self.log_attributes {
+            sz += k.len() + v.len();
+        }
+        sz
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct OtlpLogsDecoder;
 
@@ -84,7 +103,7 @@ impl SignalDecoder for OtlpLogsDecoder {
 
     fn decode(
         &self,
-        batch: &RawBufferBatch,
+        batch: &SourceBatch,
         _envelopes: &[MetadataEnvelope],
     ) -> IngestorResult<Self::Output> {
         let mut records = Vec::new();
@@ -96,8 +115,8 @@ impl SignalDecoder for OtlpLogsDecoder {
 }
 
 fn decode_entry(
-    batch: &RawBufferBatch,
-    entry: &RawEntry,
+    batch: &SourceBatch,
+    entry: &SourceEntry,
     records: &mut Vec<DecodedLogRecord>,
 ) -> IngestorResult<()> {
     let req = ExportLogsServiceRequest::decode(entry.raw_bytes.as_ref()).map_err(|e| {
@@ -193,7 +212,7 @@ fn log_record_summary(rec: &LogRecord) -> String {
 mod tests {
     use super::*;
     use crate::envelope::{MetadataEnvelope, PayloadEncoding, SignalType};
-    use crate::source::{RawBufferBatch, RawEntry};
+    use crate::source::{SourceBatch, SourceEntry};
     use bytes::Bytes;
     use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue, any_value::Value};
     use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
@@ -245,15 +264,16 @@ mod tests {
         ExportLogsServiceRequest { resource_logs }
     }
 
-    fn batch_with_payloads(payloads: Vec<Vec<u8>>) -> RawBufferBatch {
-        RawBufferBatch {
+    fn batch_with_payloads(payloads: Vec<Vec<u8>>) -> SourceBatch {
+        SourceBatch {
+            source: "buffer".into(),
             sequence: 42,
             manifest_path: "ingest/test/manifest".into(),
             data_object_path: "ingest/test/data/abc.batch".into(),
             entries: payloads
                 .into_iter()
                 .enumerate()
-                .map(|(i, payload)| RawEntry {
+                .map(|(i, payload)| SourceEntry {
                     entry_index: i as u32,
                     raw_bytes: Bytes::from(payload),
                     raw_metadata: Bytes::from_static(&[1, 2, 1, 0]),
@@ -263,7 +283,7 @@ mod tests {
         }
     }
 
-    fn logs_envelope_for(batch: &RawBufferBatch) -> Vec<MetadataEnvelope> {
+    fn logs_envelope_for(batch: &SourceBatch) -> Vec<MetadataEnvelope> {
         batch
             .entries
             .iter()

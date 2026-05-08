@@ -14,6 +14,7 @@
 //! §Open Question 2, no `panic!()` lives in production paths.
 
 pub mod ack_coordinator;
+pub mod commit_group;
 pub mod decoded_batch;
 pub mod decoder;
 pub mod envelope;

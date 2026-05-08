@@ -1,18 +1,23 @@
-//! Commit group: coalesce decoded records across Buffer batches.
+//! Commit group: coalesce decoded records across source batches.
 //!
-//! The runtime feeds Buffer batches into [`CommitGroup::append`] one at a
-//! time, then asks [`CommitGroup::should_flush`] after each append and on
-//! a timer wakeup. When a threshold trips, [`CommitGroup::drain`] hands a
-//! [`CommitGroupBatch`] downstream.
+//! The runtime feeds source batches into [`CommitGroup::append`] one
+//! at a time, then asks [`CommitGroup::should_flush`] after each
+//! append and on a timer wakeup. When a threshold trips,
+//! [`CommitGroup::drain`] hands a [`CommitGroupBatch`] downstream.
 //!
-//! Two properties pinned down by the RFC:
+//! Two properties pinned down by RFC 0001 + RFC 0002 rev 5:
 //!
-//! - **Input progress is independent of output rows.** `append` always
-//!   advances the high-watermark even when `records.is_empty()`, so a
-//!   Buffer batch that decoded to zero rows still ack-progresses.
-//! - **Max-age is enforced via a timer.** [`CommitGroup::time_until_max_age`]
-//!   tells the runtime how long it can `select!` on a sleep before the
-//!   group must flush regardless of whether new batches arrive.
+//! - **Input progress is independent of output rows.** `append`
+//!   always advances the high-watermark even when `records.is_empty()`,
+//!   so a source batch that decoded to zero rows still ack-progresses.
+//! - **Max-age is enforced via a timer.**
+//!   [`CommitGroup::time_until_max_age`] tells the runtime how long
+//!   it can `select!` on a sleep before the group must flush
+//!   regardless of whether new batches arrive.
+//!
+//! Phase 4.3 moves this from `clickhouse-ingestor::commit_group`. The
+//! `RecordSize` impl for the OTLP-logs typed record stays alongside
+//! the record itself in the OTel decoder crate.
 
 use std::time::{Duration, Instant};
 
@@ -35,28 +40,11 @@ impl Default for CommitGroupThresholds {
     }
 }
 
-/// Trait that decoded records implement so the commit group can size its
-/// in-memory buffer in bytes without crossing a payload-format boundary.
+/// Trait that decoded records implement so the commit group can size
+/// its in-memory buffer in bytes without crossing a payload-format
+/// boundary.
 pub trait RecordSize {
     fn approx_size_bytes(&self) -> usize;
-}
-
-impl RecordSize for crate::signal::DecodedLogRecord {
-    fn approx_size_bytes(&self) -> usize {
-        let mut sz = std::mem::size_of::<Self>();
-        sz += self.severity_text.len();
-        sz += self.body.len();
-        sz += self.service_name.as_ref().map_or(0, |s| s.len());
-        sz += self.scope_name.as_ref().map_or(0, |s| s.len());
-        sz += self.trace_id_hex.len() + self.span_id_hex.len();
-        for (k, v) in &self.resource_attributes {
-            sz += k.len() + v.len();
-        }
-        for (k, v) in &self.log_attributes {
-            sz += k.len() + v.len();
-        }
-        sz
-    }
 }
 
 #[derive(Debug)]
@@ -81,8 +69,9 @@ impl<R: RecordSize> CommitGroup<R> {
         }
     }
 
-    /// Record the successful processing of a Buffer sequence. Always
-    /// advances the input high-watermark, even when `records` is empty.
+    /// Record the successful processing of a source sequence. Always
+    /// advances the input high-watermark, even when `records` is
+    /// empty.
     pub fn append(&mut self, records: Vec<R>, sequence: u64) {
         if self.opened_at.is_none() {
             self.opened_at = Some(Instant::now());
@@ -144,20 +133,22 @@ impl<R: RecordSize> CommitGroup<R> {
         false
     }
 
-    /// Returns the time remaining until the open group's max_age elapses,
-    /// or `None` if no batch has been absorbed yet (in which case the
-    /// runtime should block on `consumer.next_batch()` rather than a
-    /// timer). Used by the runtime's `select!` loop.
+    /// Returns the time remaining until the open group's max_age
+    /// elapses, or `None` if no batch has been absorbed yet (in
+    /// which case the runtime should block on the source descriptor
+    /// poll rather than a timer). Used by the runtime's `select!`
+    /// loop.
     pub fn time_until_max_age(&self, now: Instant) -> Option<Duration> {
         let opened = self.opened_at?;
         let elapsed = now.saturating_duration_since(opened);
         Some(self.thresholds.max_age.saturating_sub(elapsed))
     }
 
-    /// Drain the group's contents, leaving an empty group ready to absorb
-    /// the next batch. `bytes` on the returned batch is the sum of
-    /// `RecordSize::approx_size_bytes` at drain time so the runtime can
-    /// record the `commit_group_size_bytes` histogram without re-summing.
+    /// Drain the group's contents, leaving an empty group ready to
+    /// absorb the next batch. `bytes` on the returned batch is the
+    /// sum of `RecordSize::approx_size_bytes` at drain time so the
+    /// runtime can record the `commit_group_size_bytes` histogram
+    /// without re-summing.
     pub fn drain(&mut self) -> CommitGroupBatch<R> {
         let records = std::mem::take(&mut self.records);
         let low = self.low_sequence.expect("drain called on empty group");
@@ -195,8 +186,8 @@ impl<R> CommitGroupBatch<R> {
 mod tests {
     use super::*;
 
-    /// Lightweight test record: just carries a known size so we can drive
-    /// byte thresholds directly.
+    /// Lightweight test record: just carries a known size so we can
+    /// drive byte thresholds directly.
     struct TestRecord {
         size: usize,
     }
@@ -295,9 +286,9 @@ mod tests {
 
     #[test]
     fn drain_after_zero_row_appends_returns_empty_batch_with_progress() {
-        // The zero-row case: Buffer batches absorbed without any decoded
-        // rows still flush a CommitGroupBatch with low/high set so the
-        // ack controller advances Buffer past those sequences.
+        // The zero-row case: source batches absorbed without any
+        // decoded rows still flush a CommitGroupBatch with low/high
+        // set so the ack controller advances past those sequences.
         let mut g = CommitGroup::<TestRecord>::new(thresholds(10, 10_000, 0));
         g.append(vec![], 3);
         g.append(vec![], 4);

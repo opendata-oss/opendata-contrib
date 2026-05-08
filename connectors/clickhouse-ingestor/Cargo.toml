@@ -32,6 +32,7 @@ futures.workspace = true
 hex.workspace = true
 metrics.workspace = true
 metrics-exporter-prometheus.workspace = true
+opendata-ingest-runtime = { path = "../../runtime/opendata-ingest-runtime" }
 opentelemetry-proto = { workspace = true }
 prost.workspace = true
 reqwest.workspace = true
