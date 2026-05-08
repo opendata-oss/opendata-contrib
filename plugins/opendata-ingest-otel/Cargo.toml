@@ -1,0 +1,13 @@
+[package]
+name = "opendata-ingest-otel"
+version.workspace = true
+edition.workspace = true
+description = "OTLP signal decoders (logs, metrics, traces) implementing opendata_ingest_runtime::Decoder. Depends on opendata-ingest-runtime; the runtime never depends on this crate."
+license = "MIT"
+repository = "https://github.com/opendata-oss/opendata-contrib"
+
+[lib]
+name = "opendata_ingest_otel"
+path = "src/lib.rs"
+
+[dependencies]

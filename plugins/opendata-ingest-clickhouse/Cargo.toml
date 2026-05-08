@@ -1,0 +1,13 @@
+[package]
+name = "opendata-ingest-clickhouse"
+version.workspace = true
+edition.workspace = true
+description = "ClickHouse sink plugin for the generic ingest runtime. Implements opendata_ingest_runtime::Sink. Houses the adapter, writer, and ClickHouse-specific config/metrics."
+license = "MIT"
+repository = "https://github.com/opendata-oss/opendata-contrib"
+
+[lib]
+name = "opendata_ingest_clickhouse"
+path = "src/lib.rs"
+
+[dependencies]

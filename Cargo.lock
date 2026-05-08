@@ -2156,6 +2156,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "opendata-ingest-clickhouse"
+version = "0.1.2"
+
+[[package]]
+name = "opendata-ingest-otel"
+version = "0.1.2"
+
+[[package]]
+name = "opendata-ingest-runtime"
+version = "0.1.2"
+
+[[package]]
 name = "openssl-probe"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
