@@ -749,11 +749,12 @@ The state transitions are:
    assignments (a `DecodedBatch` that no route claimed) still register
    a pending range so input progress can advance.
 2. **Range becomes complete-on-route** when the sink for that route
-   reports a successful commit. Because `Sink::write` is atomic per
-   (range, route) (see "`Sink`" above), there is **exactly one**
-   `Sink::write` invocation per (range, route) — no per-chunk
-   completion to track at the runtime layer. A route is marked
-   complete when:
+   reports a successful commit. The runtime issues **exactly one**
+   `Sink::write` call per (range, route) at a time; the sink's
+   contract (see "`Sink`" above) is that `Ok(_)` means the full
+   route-level commit is complete and that retry of the same
+   `SinkCommit` is idempotent. No per-chunk completion tracking
+   inside the runtime. A route is marked complete when:
    - `Sink::write(commit)` returns `Ok(_)`, or
    - `Sink::write(commit)` returns `Err(MaybeCommitted)` and the
      subsequent `check_committed(key)` returns `Committed`, or
@@ -780,8 +781,10 @@ no routes claiming it).
 > ambiguous because a sink can choose its own chunk count, and the
 > runtime would have had to either pre-declare the chunk count or
 > count completion events without knowing the upper bound. The
-> "atomic per (range, route)" rule on `Sink::write` collapses this
-> into a single-bit-per-route check.
+> sink contract — `Ok(_)` means the full route-level commit is
+> complete, and retry of the same `SinkCommit` is idempotent —
+> collapses this into a single-bit-per-route check at the runtime
+> layer.
 
 #### Crash Semantics
 
@@ -1382,3 +1385,4 @@ Phase-aligned with the impl plan.
 | 2026-05-07 (rev 2) | Phase 0 gate revision. (1) `Sink::write` is now atomic per (range, route); chunk_index removed from runtime IdempotencyKey (sinks build per-chunk identifiers internally); AckCoordinator tracks one bit per (range, route). (2) `DecodedRecords` switches `Box<dyn TypedRecords>` → `Arc<dyn TypedRecords + Send + Sync>` and `RecordBatch` → `Arc<RecordBatch>`; `SinkCommit.source_columns` is `Arc<SourceCoordinateColumns>`; fanout is O(1) Arc clones, no record copies. (3) Byte-budget accounting documented end-to-end with `BatchDescriptor.object_bytes` (RFC 0003) and `source.estimated_max_batch_bytes` pessimistic-reservation fallback; HEAD requests explicitly avoided. (4) New `SinkCommitFailure { NotCommitted, MaybeCommitted, Fatal }` enum; runtime calls `check_committed` on `MaybeCommitted` before retry. (5) Decoder per-entry routing marked future (current trait consumes whole `SourceBatch`; v1 = one decoder per source). |
 | 2026-05-07 (rev 3) | Phase 0 gate reconciliation. (a) Split `SourceReader` into `SourceReader: Send + 'static` (manifest owner, `&mut self` next_descriptors / ack_through / flush_acks) and `SourceFetchHandle: Send + Sync` (cloneable, concurrency-safe `fetch`). The earlier draft claimed `fetch(&self)` was concurrent on a `Send`-only trait, which did not match RFC 0003's `&mut self` `fetch_descriptor`. The new shape mirrors RFC 0003. (b) Updated the Buffer source-reader implementation section to describe `BufferSourceReader` + `BufferSourceFetchHandle` and to call `ConsumerFetchHandle::fetch` (RFC 0003 rev 2), not the stale `Consumer::fetch_descriptor(&self)`. (c) Reworded the `Sink::write` contract: dropped "partial success is the sink's problem to clean up" (too strong for ClickHouse / Iceberg); replaced with a three-rule contract — `Ok(_)` means full route-level commit, retry of the same `SinkCommit` must be idempotent, `check_committed` reflects route-level (not internal-chunk) commit. The runtime does not require atomic-with-rollback. |
 | 2026-05-07 (rev 4) | `Sink::write` rustdoc reworded from "Commit one (range, route) atomically" to "Commit one route-level unit ..." and explicitly references the idempotent-retry contract. The "atomically" wording revived the rolled-back-state interpretation that rev 3's surrounding prose had walked back. |
+| 2026-05-07 (rev 5) | AckCoordinator narrative reworded to drop "atomic per (range, route)" — both the state-transition step (#2) and the "Why route-level tracking is sufficient" callout now say "`Ok(_)` means the full route-level commit is complete and retry of the same `SinkCommit` is idempotent." Pure wording fix; the contract has been route-level + idempotent-retry since rev 3. |
