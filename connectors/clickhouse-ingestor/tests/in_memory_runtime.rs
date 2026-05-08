@@ -12,11 +12,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use clickhouse_ingestor::adapter::Adapter;
 use clickhouse_ingestor::adapter::logs::LogsAdapterConfig;
+use clickhouse_ingestor::adapter::{Adapter, AdapterResult};
 use clickhouse_ingestor::commit_group::{CommitGroupBatch, CommitGroupThresholds};
 use clickhouse_ingestor::envelope::{ConfiguredEnvelope, PayloadEncoding, SignalType};
-use clickhouse_ingestor::error::IngestorResult;
 use clickhouse_ingestor::{
     AckFlushPolicy, BufferConsumerRuntime, InsertChunk, OtlpLogsClickHouseAdapter, OtlpLogsDecoder,
     RuntimeOptions,
@@ -218,7 +217,7 @@ impl RecordingAdapter {
 impl Adapter for RecordingAdapter {
     type Input = clickhouse_ingestor::DecodedLogRecord;
 
-    fn plan(&self, batch: CommitGroupBatch<Self::Input>) -> IngestorResult<Vec<InsertChunk>> {
+    fn plan(&self, batch: CommitGroupBatch<Self::Input>) -> AdapterResult<Vec<InsertChunk>> {
         let chunks = self.inner.plan(batch)?;
         self.captured.lock().unwrap().extend(chunks.iter().cloned());
         Ok(chunks)
@@ -357,7 +356,7 @@ struct DroppingAdapter {
 
 impl Adapter for DroppingAdapter {
     type Input = clickhouse_ingestor::DecodedLogRecord;
-    fn plan(&self, _batch: CommitGroupBatch<Self::Input>) -> IngestorResult<Vec<InsertChunk>> {
+    fn plan(&self, _batch: CommitGroupBatch<Self::Input>) -> AdapterResult<Vec<InsertChunk>> {
         // Returns no chunks even when records are present, simulating
         // an adapter bug that drops everything.
         let _ = &self.fingerprint;

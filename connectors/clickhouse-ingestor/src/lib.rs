@@ -14,17 +14,16 @@
 //!   -> AckController              (range ack, flush)
 //! ```
 //!
-//! The infra/app boundary is meaningful: the runtime, envelope decoder,
-//! commit group, ack controller, and writer are signal- and table-shape-
-//! agnostic; the signal decoder and adapter are signal-specific.
-//!
-//! Phase 4.3 moves the source-batch / envelope / commit-group concepts
-//! into `opendata-ingest-runtime`. Their modules are re-exported here so
-//! existing top-level paths (`clickhouse_ingestor::commit_group::*`,
-//! `::envelope::*`, `::source::*`) keep resolving through Phase 4.
+//! Phase 4.3 moved source-batch / envelope / commit-group concepts into
+//! `opendata-ingest-runtime`. Phase 4.4a moves the OTLP logs decoder
+//! into `opendata-ingest-otel` and the ClickHouse adapter + writer into
+//! `opendata-ingest-clickhouse`. They are re-exported under their
+//! existing top-level paths so the binary, integration tests, and any
+//! external dependent on the alpha keep their imports stable through
+//! Phase 4. Phase 4.4c rewires the binary onto `Runtime::builder` and
+//! retires the transitional `SignalDecoder` trait + `BufferConsumerRuntime`.
 
 pub mod ack;
-pub mod adapter;
 pub mod bench;
 pub mod config;
 pub mod error;
@@ -32,8 +31,8 @@ pub mod metrics;
 pub mod metrics_server;
 pub mod runtime;
 pub mod signal;
-pub mod writer;
 
+pub use opendata_ingest_clickhouse::{adapter, writer};
 pub use opendata_ingest_runtime::{commit_group, envelope, source};
 
 pub use ack::{AckController, AckFlushPolicy};

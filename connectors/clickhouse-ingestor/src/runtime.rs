@@ -282,10 +282,7 @@ where
             Ok(chunks) => chunks,
             Err(e) => {
                 metrics::counter!(m::DECODE_FAILURES_TOTAL, "stage" => "adapter").increment(1);
-                return Err(match e {
-                    IngestorError::Adapter(_) => e,
-                    other => IngestorError::Adapter(other.to_string()),
-                });
+                return Err(e.into());
             }
         };
 

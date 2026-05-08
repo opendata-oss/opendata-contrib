@@ -14,8 +14,16 @@ use std::collections::BTreeMap;
 
 use serde_json::Value as JsonValue;
 
-use crate::commit_group::CommitGroupBatch;
-use crate::error::IngestorResult;
+use opendata_ingest_runtime::commit_group::CommitGroupBatch;
+use thiserror::Error;
+
+#[derive(Debug, Error)]
+pub enum AdapterError {
+    #[error("adapter: {0}")]
+    Plan(String),
+}
+
+pub type AdapterResult<T> = Result<T, AdapterError>;
 
 /// One column value in an [`InsertChunk`] row. Aligns with the column
 /// types expected by the alpha logs DDL — primitive types, plus
@@ -211,7 +219,7 @@ pub trait Adapter {
     ///    always produces the same rows on a replay.
     /// 3. Each chunk's `idempotency_token` is unique within the batch and
     ///    follows the format documented in RFC 0003.
-    fn plan(&self, batch: CommitGroupBatch<Self::Input>) -> IngestorResult<Vec<InsertChunk>>;
+    fn plan(&self, batch: CommitGroupBatch<Self::Input>) -> AdapterResult<Vec<InsertChunk>>;
 }
 
 #[cfg(test)]

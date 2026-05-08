@@ -485,6 +485,8 @@ dependencies = [
  "metrics-exporter-prometheus",
  "opendata-buffer",
  "opendata-common",
+ "opendata-ingest-clickhouse",
+ "opendata-ingest-otel",
  "opendata-ingest-runtime",
  "opentelemetry-proto",
  "prost",
@@ -2159,10 +2161,32 @@ dependencies = [
 [[package]]
 name = "opendata-ingest-clickhouse"
 version = "0.1.2"
+dependencies = [
+ "hex",
+ "metrics",
+ "opendata-ingest-otel",
+ "opendata-ingest-runtime",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "urlencoding",
+]
 
 [[package]]
 name = "opendata-ingest-otel"
 version = "0.1.2"
+dependencies = [
+ "bytes",
+ "hex",
+ "opendata-ingest-runtime",
+ "opentelemetry-proto",
+ "prost",
+ "thiserror 2.0.18",
+]
 
 [[package]]
 name = "opendata-ingest-runtime"

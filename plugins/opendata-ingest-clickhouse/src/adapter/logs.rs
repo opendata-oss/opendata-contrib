@@ -16,10 +16,12 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::adapter::{Adapter, ClickHouseSettings, InsertChunk, RowValue};
-use crate::commit_group::{CommitGroupBatch, RecordSize};
-use crate::error::IngestorResult;
-use crate::signal::DecodedLogRecord;
+use opendata_ingest_otel::logs::DecodedLogRecord;
+use opendata_ingest_runtime::commit_group::{CommitGroupBatch, RecordSize};
+
+use crate::adapter::{
+    Adapter, AdapterError, AdapterResult, ClickHouseSettings, InsertChunk, RowValue,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct LogsAdapterConfig {
@@ -127,7 +129,7 @@ const COLUMNS: &[&str] = &[
 impl Adapter for OtlpLogsClickHouseAdapter {
     type Input = DecodedLogRecord;
 
-    fn plan(&self, batch: CommitGroupBatch<Self::Input>) -> IngestorResult<Vec<InsertChunk>> {
+    fn plan(&self, batch: CommitGroupBatch<Self::Input>) -> AdapterResult<Vec<InsertChunk>> {
         let CommitGroupBatch {
             mut records,
             low_sequence,
@@ -171,7 +173,7 @@ impl Adapter for OtlpLogsClickHouseAdapter {
             .iter()
             .find(|r| r.source.manifest_path != manifest_path)
         {
-            return Err(crate::error::IngestorError::Adapter(format!(
+            return Err(AdapterError::Plan(format!(
                 "commit group mixes manifest paths: first record has {first}, found {other}",
                 first = manifest_path,
                 other = mismatch.source.manifest_path,
@@ -355,7 +357,7 @@ pub fn logs_table_ddl(config: &LogsAdapterConfig) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::signal::SourceCoordinates;
+    use opendata_ingest_otel::logs::SourceCoordinates;
     use std::collections::BTreeMap;
 
     fn cfg() -> LogsAdapterConfig {

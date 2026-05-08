@@ -32,6 +32,8 @@ futures.workspace = true
 hex.workspace = true
 metrics.workspace = true
 metrics-exporter-prometheus.workspace = true
+opendata-ingest-clickhouse = { path = "../../plugins/opendata-ingest-clickhouse" }
+opendata-ingest-otel = { path = "../../plugins/opendata-ingest-otel" }
 opendata-ingest-runtime = { path = "../../runtime/opendata-ingest-runtime" }
 opentelemetry-proto = { workspace = true }
 prost.workspace = true

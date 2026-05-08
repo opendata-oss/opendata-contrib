@@ -4,6 +4,7 @@
 //! all flow into [`IngestorError`] so the runtime loop can dispatch on a
 //! single error shape.
 
+use opendata_ingest_clickhouse::AdapterError;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -31,6 +32,12 @@ pub enum IngestorError {
 
     #[error("{0}")]
     Other(String),
+}
+
+impl From<AdapterError> for IngestorError {
+    fn from(e: AdapterError) -> Self {
+        IngestorError::Adapter(e.to_string())
+    }
 }
 
 pub type IngestorResult<T> = Result<T, IngestorError>;

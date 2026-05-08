@@ -11,3 +11,15 @@ name = "opendata_ingest_clickhouse"
 path = "src/lib.rs"
 
 [dependencies]
+hex = { workspace = true }
+metrics = { workspace = true }
+opendata-ingest-otel = { path = "../opendata-ingest-otel" }
+opendata-ingest-runtime = { path = "../../runtime/opendata-ingest-runtime" }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+urlencoding = { workspace = true }

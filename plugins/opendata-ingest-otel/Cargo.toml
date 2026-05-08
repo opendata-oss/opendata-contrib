@@ -11,3 +11,11 @@ name = "opendata_ingest_otel"
 path = "src/lib.rs"
 
 [dependencies]
+hex = { workspace = true }
+opendata-ingest-runtime = { path = "../../runtime/opendata-ingest-runtime" }
+opentelemetry-proto = { workspace = true }
+prost = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+bytes = { workspace = true }

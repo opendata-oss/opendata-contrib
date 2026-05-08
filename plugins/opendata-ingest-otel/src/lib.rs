@@ -1,7 +1,9 @@
 //! OTLP signal decoders for the generic ingest runtime.
 //!
-//! Phase 4.1 stub: empty crate. Phase 4.4 moves
-//! `clickhouse_ingestor::signal::OtlpLogsDecoder` here as
-//! `opendata_ingest_otel::logs::OtlpLogsDecoder`, implementing
-//! `opendata_ingest_runtime::Decoder`. The runtime crate never
-//! depends on this crate; the dependency runs OTel→runtime only.
+//! Phase 4.4a homes the OTLP logs decoder body here. The
+//! `opendata_ingest_runtime::Decoder` trait impl that connects this
+//! decoder to the runtime lands in Phase 4.4b. The runtime crate
+//! never depends on this crate; the dependency runs OTel→runtime
+//! only.
+
+pub mod logs;

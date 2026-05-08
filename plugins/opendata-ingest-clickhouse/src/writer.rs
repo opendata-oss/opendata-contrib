@@ -18,6 +18,11 @@ use tracing::{debug, warn};
 
 use crate::adapter::InsertChunk;
 
+/// Metric name shared with `clickhouse-ingestor::metrics`. Emitted
+/// per-attempt by the writer; the registry-side `describe_counter!`
+/// still lives in the binary crate's metrics module.
+const RETRY_COUNT_TOTAL: &str = "ingestor_retry_count_total";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WriterErrorClass {
     /// Network glitch, timeout, 5xx, 429. Caller should back off and retry
@@ -151,7 +156,7 @@ impl ClickHouseWriter {
                 Err(err) => match err.class() {
                     WriterErrorClass::Retryable if attempt < self.config.max_attempts => {
                         metrics::counter!(
-                            crate::metrics::RETRY_COUNT_TOTAL,
+                            RETRY_COUNT_TOTAL,
                             "reason" => "retryable",
                         )
                         .increment(1);
