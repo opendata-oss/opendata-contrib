@@ -159,10 +159,17 @@ pub struct BatchDescriptor {
 impl Consumer {
     pub async fn next_descriptors(&mut self, max: usize)
         -> Result<Vec<BatchDescriptor>>;
-    pub async fn fetch_descriptor(&self, descriptor: BatchDescriptor)
-        -> Result<ConsumedBatch>;
+    pub fn fetch_handle(&self) -> ConsumerFetchHandle;
     pub async fn ack_through(&mut self, sequence: u64) -> Result<()>;
-    pub async fn flush(&self) -> Result<()>;
+    pub async fn flush(&mut self) -> Result<()>;
+}
+
+#[derive(Clone)]
+pub struct ConsumerFetchHandle { /* Arc<dyn ObjectStore> + manifest_path */ }
+
+impl ConsumerFetchHandle {
+    pub async fn fetch(&self, descriptor: BatchDescriptor)
+        -> Result<ConsumedBatch>;
 }
 ```
 
@@ -233,7 +240,12 @@ never call `Consumer::ack` or touch backpressure budgets directly.
 All trait names below are placeholders the implementation may rename;
 the invariants are the contract.
 
-#### `SourceReader`
+#### `SourceReader` and `SourceFetchHandle`
+
+The source side splits into two traits, mirroring RFC 0003's
+`Consumer` / `ConsumerFetchHandle` shape. The runtime owns one
+`SourceReader` per source (`&mut self` for descriptor poll and ack)
+and clones an N-way `SourceFetchHandle` into fetch worker tasks.
 
 ```rust
 #[async_trait::async_trait]
@@ -242,18 +254,18 @@ pub trait SourceReader: Send + 'static {
     /// idempotency keys.
     fn id(&self) -> &SourceId;
 
-    /// Fetch up to `max` new descriptors past the current cursor. Must
-    /// not mutate the durable ack frontier. Returning fewer than `max`
-    /// is allowed and signals "no more visible right now"; the runtime
-    /// will sleep and retry.
+    /// Fetch up to `max` new descriptors past the current cursor.
+    /// Must not mutate the durable ack frontier. Returning fewer than
+    /// `max` is allowed and signals "no more visible right now"; the
+    /// runtime will sleep and retry.
     async fn next_descriptors(&mut self, max: usize, budget: SourceBudget)
         -> RuntimeResult<Vec<SourceBatchDescriptor>>;
 
-    /// Fetch a single descriptor. May be called concurrently from
-    /// multiple workers. Implementations should not mutate manifest
-    /// state here.
-    async fn fetch(&self, descriptor: SourceBatchDescriptor)
-        -> RuntimeResult<SourceBatch>;
+    /// Construct a cloneable handle for fetching descriptors
+    /// concurrently. Construction is O(1); the handle holds shared
+    /// references to whatever the source needs (object store handle,
+    /// HTTP client, etc.) and no manifest state.
+    fn fetch_handle(&self) -> Box<dyn SourceFetchHandle>;
 
     /// Advance the durable ack frontier through (and including)
     /// `sequence`. Implementations are responsible for the in-order
@@ -264,6 +276,23 @@ pub trait SourceReader: Send + 'static {
     /// Force the underlying source's durable checkpoint. The runtime
     /// calls this on flush boundaries.
     async fn flush_acks(&mut self) -> RuntimeResult<()>;
+}
+
+/// Cloneable, concurrency-safe fetch primitive. The runtime calls
+/// `fetch` from N workers in parallel against distinct descriptors.
+/// Implementations must not touch manifest or ack state here.
+#[async_trait::async_trait]
+pub trait SourceFetchHandle: Send + Sync {
+    async fn fetch(&self, descriptor: SourceBatchDescriptor)
+        -> RuntimeResult<SourceBatch>;
+
+    /// Object-safe clone. The default `Clone` derive does not work
+    /// across `dyn Trait`; implementations return a new boxed handle.
+    fn clone_box(&self) -> Box<dyn SourceFetchHandle>;
+}
+
+impl Clone for Box<dyn SourceFetchHandle> {
+    fn clone(&self) -> Self { self.clone_box() }
 }
 
 pub struct SourceBatchDescriptor {
@@ -300,12 +329,23 @@ pub struct SourceEntry {
 
 `SourceBatch` is a renamed superset of RFC 0001's `RawBufferBatch`. The
 Buffer implementation of `SourceReader` shells out to
-`buffer::Consumer::next_descriptors`/`fetch_descriptor`/`ack_through`
-and reuses the existing `split_into_raw_entries` materialization.
+`buffer::Consumer::next_descriptors` / `Consumer::ack_through` /
+`Consumer::flush` for the manifest-owner methods, and to
+`buffer::ConsumerFetchHandle::fetch` (RFC 0003) inside its
+`SourceFetchHandle`. It reuses the existing `split_into_raw_entries`
+materialization to convert each `buffer::ConsumedBatch` into a
+`SourceBatch`.
 
-The trait is async to keep the door open for non-Buffer sources later
-(Kafka, file scan, direct OTLP push). Adding sources should not require
-runtime changes; they only need to honor in-order acks within a source.
+The two-trait split is what keeps `SourceReader` itself only `Send`
+(it owns mutable manifest state) while `SourceFetchHandle: Send +
+Sync` lets fetch workers run concurrently. `SourceReader::fetch_handle`
+returns a fresh boxed handle; the runtime clones it into N workers
+via `Box<dyn SourceFetchHandle>`'s `Clone` impl.
+
+The traits are async to keep the door open for non-Buffer sources
+later (Kafka, file scan, direct OTLP push). Adding sources should
+not require runtime changes; they only need to honor in-order acks
+within a source and provide a concurrency-safe fetch handle.
 
 #### `Decoder`
 
@@ -461,15 +501,50 @@ the decoder layer, not the router.
 
 #### `Sink`
 
-`Sink::write` is **atomic per (source range, route)**. One call commits
-the entire range for one route. Internally a sink may chunk and
+`Sink::write` is the **route-level commit unit**. One call covers the
+entire (source range, route) pair. Internally a sink may chunk and
 parallelize as it sees fit (the ClickHouse sink today plans
 `Vec<InsertChunk>` and writes them with per-chunk dedupe tokens; the
 Iceberg sink writes one or more Parquet files and one snapshot
-commit), but `write` does not return `Ok` until **every** internal
-piece has durably landed. Partial success inside a `write` call is the
-sink's problem to clean up before returning `Err`; the runtime treats
-the call as either fully durable or not durable at all.
+commit), but the sink must satisfy two contracts:
+
+1. **`Ok(_)` means the full route-level commit is complete.** Every
+   internal chunk/file/insert that the sink decided to write for this
+   `SinkCommit` has durably landed. The runtime then marks the route
+   complete for this range.
+2. **Retry of the same `SinkCommit` must be idempotent.** If `write`
+   returns `Err(NotCommitted)` or `Err(MaybeCommitted)`, the runtime
+   may call `write(commit)` again with the same `SinkCommit`. The
+   sink must use the runtime's `IdempotencyKey` (or a sink-internal
+   identifier derived from it deterministically — e.g. the same key
+   plus a stable internal chunk index) so a second attempt does not
+   produce duplicate data. ClickHouse uses `insert_deduplication_token`
+   plus `ReplacingMergeTree(_adapter_version)`. Iceberg uses
+   deterministic Parquet file paths plus a `check_committed` snapshot
+   lookup.
+3. **`check_committed(idempotency_key)` reflects route-level commit.**
+   It returns `Committed` only when the full range×route landed under
+   that key — not when some internal chunks landed and others didn't.
+   Sinks that cannot tell whether all their internal pieces are
+   present return `Unknown`; the runtime then re-attempts `write` and
+   relies on the sink's idempotency to drop the redundant work.
+
+The runtime does **not** require sinks to roll back partial state on
+failure. ClickHouse cannot transactionally undo successful inserts;
+Iceberg can cancel a snapshot commit but cannot reliably delete data
+files written outside that commit. Requiring atomic-with-rollback
+would force sinks into either a two-phase commit none of these systems
+support cleanly, or aggressive cleanup paths that turn ambiguous
+errors into data loss. The "idempotent retry" rule is the right
+contract for both ClickHouse insert dedupe and Iceberg snapshot-based
+identity.
+
+What the runtime *does* require: between `Err(_)` and the next
+`write` retry, the sink must not produce divergent state for the
+same `IdempotencyKey`. A sink that decides on retry to use a
+different chunking, a different Parquet schema, or a different
+internal commit identity violates the idempotency contract and will
+cause duplicate data.
 
 ```rust
 #[async_trait::async_trait]
@@ -862,18 +937,38 @@ the migration stalls and we revisit the runtime contract.
 ### Source Reader: Buffer Implementation
 
 `opendata-ingest-runtime` ships one source reader,
-`BufferSourceReader`, that wraps `buffer::Consumer`:
+`BufferSourceReader`, that wraps `buffer::Consumer` plus a paired
+`BufferSourceFetchHandle` that wraps `buffer::ConsumerFetchHandle`
+(RFC 0003).
+
+`BufferSourceReader` (manifest owner, `&mut self`):
 
 - `next_descriptors(max, budget)` calls
   `Consumer::next_descriptors(max)` and rejects descriptors past
   `budget.bytes_remaining` to keep the source under
-  `source.max_inflight_bytes`.
-- `fetch(descriptor)` calls `Consumer::fetch_descriptor(descriptor)`.
+  `source.max_inflight_bytes`. Each returned `SourceBatchDescriptor`
+  carries `object_bytes` straight through from
+  `BatchDescriptor.object_bytes` (RFC 0003), which is `None` until
+  the manifest format extension lands; the runtime then falls back to
+  `source.estimated_max_batch_bytes` for budget reservation.
+- `fetch_handle()` returns `Box::new(BufferSourceFetchHandle {
+  inner: consumer.fetch_handle() })`.
 - `ack_through(seq)` calls `Consumer::ack_through(seq)`.
 - `flush_acks` calls `Consumer::flush()`.
-- `split_into_raw_entries` (today in `clickhouse-ingestor::source`) is
-  pulled into the runtime crate so it can be reused by future sources
-  that surface per-range metadata in the same shape.
+
+`BufferSourceFetchHandle` (cloneable fetcher, `&self`):
+
+- `fetch(descriptor)` calls
+  `ConsumerFetchHandle::fetch(buffer_descriptor)` (the underlying
+  `buffer::BatchDescriptor`, reconstructed from `SourceBatchDescriptor`),
+  receives a `buffer::ConsumedBatch`, and runs `split_into_raw_entries`
+  to produce a `SourceBatch`.
+- `clone_box()` clones the inner `ConsumerFetchHandle` (which is `Clone`)
+  and returns a new `Box<dyn SourceFetchHandle>`.
+
+`split_into_raw_entries` (today in `clickhouse-ingestor::source`) is
+pulled into the runtime crate so it can be reused by future sources
+that surface per-range metadata in the same shape.
 
 If RFC 0003 of opendata-buffer is not yet released, the runtime can
 fall back to a serial path that calls `Consumer::next_batch` and
@@ -1281,3 +1376,4 @@ Phase-aligned with the impl plan.
 |---|---|
 | 2026-05-07 | Initial draft. Generalizes RFC 0001 into a sink-neutral runtime; defines source/decoder/router/sink traits, AckCoordinator state machine, fanout invariant, columnar migration path, pluggability levels, and validation criteria phase by phase. |
 | 2026-05-07 (rev 2) | Phase 0 gate revision. (1) `Sink::write` is now atomic per (range, route); chunk_index removed from runtime IdempotencyKey (sinks build per-chunk identifiers internally); AckCoordinator tracks one bit per (range, route). (2) `DecodedRecords` switches `Box<dyn TypedRecords>` → `Arc<dyn TypedRecords + Send + Sync>` and `RecordBatch` → `Arc<RecordBatch>`; `SinkCommit.source_columns` is `Arc<SourceCoordinateColumns>`; fanout is O(1) Arc clones, no record copies. (3) Byte-budget accounting documented end-to-end with `BatchDescriptor.object_bytes` (RFC 0003) and `source.estimated_max_batch_bytes` pessimistic-reservation fallback; HEAD requests explicitly avoided. (4) New `SinkCommitFailure { NotCommitted, MaybeCommitted, Fatal }` enum; runtime calls `check_committed` on `MaybeCommitted` before retry. (5) Decoder per-entry routing marked future (current trait consumes whole `SourceBatch`; v1 = one decoder per source). |
+| 2026-05-07 (rev 3) | Phase 0 gate reconciliation. (a) Split `SourceReader` into `SourceReader: Send + 'static` (manifest owner, `&mut self` next_descriptors / ack_through / flush_acks) and `SourceFetchHandle: Send + Sync` (cloneable, concurrency-safe `fetch`). The earlier draft claimed `fetch(&self)` was concurrent on a `Send`-only trait, which did not match RFC 0003's `&mut self` `fetch_descriptor`. The new shape mirrors RFC 0003. (b) Updated the Buffer source-reader implementation section to describe `BufferSourceReader` + `BufferSourceFetchHandle` and to call `ConsumerFetchHandle::fetch` (RFC 0003 rev 2), not the stale `Consumer::fetch_descriptor(&self)`. (c) Reworded the `Sink::write` contract: dropped "partial success is the sink's problem to clean up" (too strong for ClickHouse / Iceberg); replaced with a three-rule contract — `Ok(_)` means full route-level commit, retry of the same `SinkCommit` must be idempotent, `check_committed` reflects route-level (not internal-chunk) commit. The runtime does not require atomic-with-rollback. |
