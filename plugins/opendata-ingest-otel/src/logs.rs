@@ -1,13 +1,18 @@
 //! OTLP logs decoder.
 //!
-//! Phase 4.4a moves this from `clickhouse-ingestor::signal`. The
-//! `opendata_ingest_runtime::Decoder` trait impl that connects this
-//! decoder to the runtime lands in Phase 4.4b. For Phase 4 the
-//! transitional `clickhouse-ingestor::signal::SignalDecoder` shim
-//! stays alongside `BufferConsumerRuntime` and calls the inherent
-//! [`OtlpLogsDecoder::decode_logs`] method below.
+//! Phase 4.4a moved this from `clickhouse-ingestor::signal`. Phase
+//! 4.4b adds the [`opendata_ingest_runtime::decoder::Decoder`]
+//! impl that connects the decoder to the runtime, plus the
+//! [`TypedDecodedLogs`] newtype that wraps `Vec<DecodedLogRecord>`
+//! behind the runtime's `TypedRecords` trait so a `DecodedBatch`
+//! can carry the v1 records under `Arc<dyn TypedRecords>`. Phase
+//! 4.4c retires the transitional
+//! `clickhouse-ingestor::signal::SignalDecoder` shim once
+//! `Runtime::builder` replaces `BufferConsumerRuntime`.
 
+use std::any::Any;
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
 use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue, any_value::Value};
@@ -15,6 +20,13 @@ use prost::Message;
 use thiserror::Error;
 
 use opendata_ingest_runtime::commit_group::RecordSize;
+use opendata_ingest_runtime::decoded_batch::{
+    BatchStats, DecodedBatch, DecodedRecords, SourceCoordinateColumns, TypedRecords, TypedSchema,
+};
+use opendata_ingest_runtime::decoder::Decoder;
+use opendata_ingest_runtime::envelope::{MetadataEnvelope, PayloadEncoding, SignalType};
+use opendata_ingest_runtime::error::{RuntimeError, RuntimeResult};
+use opendata_ingest_runtime::idempotency::SchemaVersion;
 use opendata_ingest_runtime::source::{SourceBatch, SourceEntry};
 
 #[derive(Debug, Error)]
@@ -91,9 +103,7 @@ impl OtlpLogsDecoder {
 
     /// Decode every OTLP-protobuf entry in `batch` into flattened
     /// log records. Returns the records in `(entry_index,
-    /// record_index)` order. Phase 4.4b adds the
-    /// `opendata_ingest_runtime::Decoder` trait impl that wraps
-    /// this method.
+    /// record_index)` order.
     pub fn decode_logs(
         &self,
         batch: &SourceBatch,
@@ -103,6 +113,117 @@ impl OtlpLogsDecoder {
             decode_entry(batch, entry, &mut records)?;
         }
         Ok(records)
+    }
+}
+
+/// Schema name advertised by [`TypedDecodedLogs`]. Sinks that need
+/// to dispatch on schema name match against this string.
+pub const OTLP_LOGS_SCHEMA_NAME: &str = "opendata.otel.logs.v1";
+
+/// `TypedRecords` adapter that wraps `Vec<DecodedLogRecord>` so the
+/// runtime's `DecodedRecords::Typed(Arc<dyn TypedRecords>)` carrier
+/// can hand v1 records to ClickHouse. Sinks downcast through
+/// [`TypedRecords::as_any`] to recover the typed view.
+#[derive(Debug)]
+pub struct TypedDecodedLogs {
+    records: Vec<DecodedLogRecord>,
+    schema: TypedSchema,
+}
+
+impl TypedDecodedLogs {
+    pub fn new(records: Vec<DecodedLogRecord>) -> Self {
+        Self {
+            records,
+            schema: TypedSchema {
+                name: OTLP_LOGS_SCHEMA_NAME.into(),
+                version: SchemaVersion(1),
+            },
+        }
+    }
+
+    pub fn records(&self) -> &[DecodedLogRecord] {
+        &self.records
+    }
+}
+
+impl TypedRecords for TypedDecodedLogs {
+    fn record_count(&self) -> usize {
+        self.records.len()
+    }
+
+    fn estimated_bytes(&self) -> usize {
+        self.records.iter().map(|r| r.approx_size_bytes()).sum()
+    }
+
+    fn schema(&self) -> &TypedSchema {
+        &self.schema
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+impl Decoder for OtlpLogsDecoder {
+    fn accepts(&self, envelope: &MetadataEnvelope) -> bool {
+        envelope.version == 1
+            && envelope.signal_type == SignalType::Logs
+            && envelope.encoding == PayloadEncoding::OtlpProtobuf
+    }
+
+    fn decode(&self, batch: SourceBatch) -> RuntimeResult<Vec<DecodedBatch>> {
+        let source = batch.source.clone();
+        let manifest_path = batch.manifest_path.clone();
+        let data_path = batch.data_object_path.clone();
+        let sequence = batch.sequence;
+        let entry_count = batch.entries.len() as u32;
+
+        let records = self
+            .decode_logs(&batch)
+            .map_err(|e| RuntimeError::Decoder(Box::new(e)))?;
+
+        let record_count = records.len();
+        let decoded_byte_estimate: u64 = records.iter().map(|r| r.approx_size_bytes() as u64).sum();
+
+        let mut sequences = Vec::with_capacity(record_count);
+        let mut entry_indices = Vec::with_capacity(record_count);
+        let mut record_indices = Vec::with_capacity(record_count);
+        let mut ingestion_time_ms = Vec::with_capacity(record_count);
+        for r in &records {
+            sequences.push(r.source.sequence);
+            entry_indices.push(r.source.entry_index);
+            record_indices.push(r.source.record_index);
+            ingestion_time_ms.push(r.source.ingestion_time_ms);
+        }
+
+        let source_columns = SourceCoordinateColumns {
+            manifest_path,
+            data_path,
+            sequences,
+            entry_indices,
+            record_indices,
+            ingestion_time_ms,
+        };
+
+        let stats = BatchStats {
+            // Source-byte accounting (post-decompress) lands when the
+            // runtime wires the byte budget end-to-end in Phase 6.
+            source_byte_count: 0,
+            decoded_byte_estimate,
+        };
+
+        let typed = Arc::new(TypedDecodedLogs::new(records));
+
+        Ok(vec![DecodedBatch {
+            source,
+            low_sequence: sequence,
+            high_sequence: sequence,
+            source_entry_count: entry_count,
+            records: DecodedRecords::Typed(typed),
+            source_columns,
+            stats,
+            schema_version: SchemaVersion(1),
+        }])
     }
 }
 
