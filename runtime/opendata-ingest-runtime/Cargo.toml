@@ -11,3 +11,7 @@ name = "opendata_ingest_runtime"
 path = "src/lib.rs"
 
 [dependencies]
+async-trait = "0.1"
+bytes = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }

@@ -1,0 +1,33 @@
+//! Decoder trait (RFC 0002 rev 5 §`Decoder`).
+//!
+//! v1 contract: one decoder per source. The runtime calls
+//! `accepts(envelope)` once with the source's configured envelope at
+//! startup or first non-empty batch, then drives `decode` per
+//! source batch. Per-entry routing across decoders is supported by
+//! the trait shape but not implemented in v1; v1 fails closed on
+//! mixed envelopes within a single source, mirroring RFC 0001.
+
+use crate::decoded_batch::DecodedBatch;
+use crate::envelope::MetadataEnvelope;
+use crate::error::RuntimeResult;
+use crate::source::{SourceBatch, SourceId};
+
+pub trait Decoder: Send + Sync + 'static {
+    fn accepts(&self, envelope: &MetadataEnvelope) -> bool;
+
+    /// Consume an entire source batch and produce zero or more
+    /// decoded batches. v1 returns at most one (RFC 0002 rev 5).
+    fn decode(&self, batch: SourceBatch) -> RuntimeResult<Vec<DecodedBatch>>;
+}
+
+/// Source-level context the runtime constructs once per source and
+/// hands to decoder plumbing for diagnostics, metric labels, and
+/// (Phase 6+) per-source schema-version overrides. The `Decoder`
+/// trait does not consume it directly in v1 — the v1 trait shape
+/// matches RFC 0002 rev 5 verbatim — but the type lives here so
+/// future-runtime routing has a stable carrier.
+#[derive(Debug, Clone)]
+pub struct DecodeContext {
+    pub source: SourceId,
+    pub configured_envelope: MetadataEnvelope,
+}
