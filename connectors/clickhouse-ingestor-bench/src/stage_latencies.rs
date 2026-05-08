@@ -295,9 +295,15 @@ async fn run_iteration(iter: usize, captured: Captured, args: &Args) -> Result<I
         }
     }
 
-    let elapsed = timed_start.elapsed().as_secs_f64();
+    // Trigger graceful shutdown and wait for the runtime to drain its
+    // open commit group. This includes the final flush_group +
+    // adapter_plan + ack_through pass — work that must be inside the
+    // timed window for `iteration_elapsed_seconds` to reflect the
+    // full pipeline cost. Stopping the timer at last_decoded_sequence
+    // would exclude the drain.
     shutdown.cancel();
     let _ = handle.await;
+    let elapsed = timed_start.elapsed().as_secs_f64();
 
     let mut h = captured.drain_histograms();
     let counters = captured.drain_counters();
@@ -543,6 +549,29 @@ async fn main() -> Result<()> {
     });
     std::fs::write(run_dir.join("results.json"), serde_json::to_string_pretty(&results)?)?;
 
+    // timeseries.json — schema v2 required for unit 1.4.
+    let series_fetch = build_aggregated_series(
+        "buffer.fetch_duration_seconds",
+        &iters.iter().map(|r| r.fetch_duration_seconds.clone()).collect::<Vec<_>>(),
+    );
+    let series_cg_rows = build_aggregated_series(
+        "ingestor_commit_group_size_rows",
+        &iters.iter().map(|r| r.commit_group_size_rows.clone()).collect::<Vec<_>>(),
+    );
+    let series_cg_bytes = build_aggregated_series(
+        "ingestor_commit_group_size_bytes",
+        &iters.iter().map(|r| r.commit_group_size_bytes.clone()).collect::<Vec<_>>(),
+    );
+    let iteration_starts: Vec<u64> = iters.iter().map(|r| r.started_unix_ms).collect();
+    let timeseries = json!({
+        "schema_version": 2,
+        "window_seconds": 1.0,
+        "iterations_aggregated": iters.len(),
+        "iteration_starts_unix_ms": iteration_starts,
+        "series": [series_fetch, series_cg_rows, series_cg_bytes],
+    });
+    std::fs::write(run_dir.join("timeseries.json"), serde_json::to_string_pretty(&timeseries)?)?;
+
     let workload_canonical = json!({
         "kind": "ch-ingestor-otlp-logs",
         "log_records_per_payload": args.log_records_per_payload,
@@ -643,6 +672,39 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+/// Aggregate per-iteration series into a schema-v2 timeseries entry,
+/// aligned by sample index. Same approach as the 1.3 bench.
+fn build_aggregated_series(metric: &str, per_iter: &[Vec<f64>]) -> serde_json::Value {
+    let max_len = per_iter.iter().map(|v| v.len()).max().unwrap_or(0);
+    let mut samples: Vec<serde_json::Value> = Vec::with_capacity(max_len);
+    for j in 0..max_len {
+        let mut values: Vec<f64> = Vec::with_capacity(per_iter.len());
+        for it in per_iter {
+            if let Some(v) = it.get(j).copied() {
+                values.push(v);
+            }
+        }
+        if values.is_empty() { continue; }
+        values.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let med = values[values.len() / 2];
+        let p90_idx = ((values.len() as f64 - 1.0) * 0.9) as usize;
+        let p90 = values[p90_idx];
+        let max = *values.last().unwrap();
+        samples.push(json!({
+            "t_offset_ms": j as i64,
+            "median": med,
+            "p90":    p90,
+            "max":    max,
+            "n":      values.len(),
+        }));
+    }
+    json!({
+        "metric": metric,
+        "labels": { "alignment": "sample_index" },
+        "samples": samples,
+    })
+}
+
 fn bucket_counts(samples: &[f64], buckets: &[f64]) -> Vec<u64> {
     let mut counts = vec![0u64; buckets.len()];
     for v in samples {
@@ -654,12 +716,14 @@ fn bucket_counts(samples: &[f64], buckets: &[f64]) -> Vec<u64> {
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
-    // FNV-64-extended placeholder consistent with the 1.3 bench's
-    // labeling. See comment in 1.3 for why this is not actual SHA-256.
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in bytes {
-        h ^= *b as u64;
-        h = h.wrapping_mul(0x100_0000_01b3);
+    use sha2::Digest;
+    let mut h = sha2::Sha256::new();
+    h.update(bytes);
+    let out = h.finalize();
+    let mut s = String::with_capacity(64);
+    for b in out {
+        use std::fmt::Write;
+        let _ = write!(&mut s, "{b:02x}");
     }
-    format!("{h:016x}{h:016x}{h:016x}{h:016x}")
+    s
 }
