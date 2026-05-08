@@ -1,0 +1,25 @@
+[package]
+name = "clickhouse-ingestor-bench"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[[bin]]
+name = "ch-ingestor-bench-stage-latencies"
+path = "src/stage_latencies.rs"
+
+[dependencies]
+clickhouse-ingestor = { path = "../clickhouse-ingestor" }
+buffer.workspace = true
+common.workspace = true
+anyhow.workspace = true
+bytes.workspace = true
+clap.workspace = true
+metrics.workspace = true
+opentelemetry-proto.workspace = true
+prost.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+slatedb.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true

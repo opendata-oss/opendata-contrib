@@ -505,6 +505,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "clickhouse-ingestor-bench"
+version = "0.1.2"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "clap",
+ "clickhouse-ingestor",
+ "metrics",
+ "opendata-buffer",
+ "opendata-common",
+ "opentelemetry-proto",
+ "prost",
+ "serde",
+ "serde_json",
+ "slatedb",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
 name = "cmake"
 version = "0.1.58"
 source = "registry+https://github.com/rust-lang/crates.io-index"
