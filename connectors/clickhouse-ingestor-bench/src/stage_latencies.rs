@@ -673,7 +673,10 @@ async fn main() -> Result<()> {
 }
 
 /// Aggregate per-iteration series into a schema-v2 timeseries entry,
-/// aligned by sample index. Same approach as the 1.3 bench.
+/// aligned on sample index (one observation per Buffer batch / commit
+/// group event). See `plans/odb-high-throughput/benchmarks.md` rev 5:
+/// each sample carries `sample_index` (not `t_offset_ms`) and the
+/// series envelope declares `labels.alignment = "sample_index"`.
 fn build_aggregated_series(metric: &str, per_iter: &[Vec<f64>]) -> serde_json::Value {
     let max_len = per_iter.iter().map(|v| v.len()).max().unwrap_or(0);
     let mut samples: Vec<serde_json::Value> = Vec::with_capacity(max_len);
@@ -691,7 +694,7 @@ fn build_aggregated_series(metric: &str, per_iter: &[Vec<f64>]) -> serde_json::V
         let p90 = values[p90_idx];
         let max = *values.last().unwrap();
         samples.push(json!({
-            "t_offset_ms": j as i64,
+            "sample_index": j as i64,
             "median": med,
             "p90":    p90,
             "max":    max,
