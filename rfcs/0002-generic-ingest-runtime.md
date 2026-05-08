@@ -555,9 +555,13 @@ pub trait Sink: Send + Sync + 'static {
     /// before pausing upstream pulls (used for fairness across sinks).
     fn write_budget(&self) -> SinkBudget;
 
-    /// Commit one (range, route) atomically. Returns `Ok` only if
-    /// every internal chunk/file/insert is durable; returns the
-    /// appropriate `SinkCommitFailure` variant otherwise.
+    /// Commit one route-level unit (the whole `SinkCommit` for one
+    /// range × one route). Returns `Ok` only when the full commit is
+    /// durable per the rules above; returns the appropriate
+    /// `SinkCommitFailure` variant otherwise. The runtime is allowed
+    /// to retry the same `SinkCommit` after a non-fatal failure;
+    /// implementations must keep retry idempotent (see
+    /// "Idempotency Contract" below).
     async fn write(&self, commit: SinkCommit)
         -> Result<SinkCommitResult, SinkCommitFailure>;
 
@@ -1377,3 +1381,4 @@ Phase-aligned with the impl plan.
 | 2026-05-07 | Initial draft. Generalizes RFC 0001 into a sink-neutral runtime; defines source/decoder/router/sink traits, AckCoordinator state machine, fanout invariant, columnar migration path, pluggability levels, and validation criteria phase by phase. |
 | 2026-05-07 (rev 2) | Phase 0 gate revision. (1) `Sink::write` is now atomic per (range, route); chunk_index removed from runtime IdempotencyKey (sinks build per-chunk identifiers internally); AckCoordinator tracks one bit per (range, route). (2) `DecodedRecords` switches `Box<dyn TypedRecords>` → `Arc<dyn TypedRecords + Send + Sync>` and `RecordBatch` → `Arc<RecordBatch>`; `SinkCommit.source_columns` is `Arc<SourceCoordinateColumns>`; fanout is O(1) Arc clones, no record copies. (3) Byte-budget accounting documented end-to-end with `BatchDescriptor.object_bytes` (RFC 0003) and `source.estimated_max_batch_bytes` pessimistic-reservation fallback; HEAD requests explicitly avoided. (4) New `SinkCommitFailure { NotCommitted, MaybeCommitted, Fatal }` enum; runtime calls `check_committed` on `MaybeCommitted` before retry. (5) Decoder per-entry routing marked future (current trait consumes whole `SourceBatch`; v1 = one decoder per source). |
 | 2026-05-07 (rev 3) | Phase 0 gate reconciliation. (a) Split `SourceReader` into `SourceReader: Send + 'static` (manifest owner, `&mut self` next_descriptors / ack_through / flush_acks) and `SourceFetchHandle: Send + Sync` (cloneable, concurrency-safe `fetch`). The earlier draft claimed `fetch(&self)` was concurrent on a `Send`-only trait, which did not match RFC 0003's `&mut self` `fetch_descriptor`. The new shape mirrors RFC 0003. (b) Updated the Buffer source-reader implementation section to describe `BufferSourceReader` + `BufferSourceFetchHandle` and to call `ConsumerFetchHandle::fetch` (RFC 0003 rev 2), not the stale `Consumer::fetch_descriptor(&self)`. (c) Reworded the `Sink::write` contract: dropped "partial success is the sink's problem to clean up" (too strong for ClickHouse / Iceberg); replaced with a three-rule contract — `Ok(_)` means full route-level commit, retry of the same `SinkCommit` must be idempotent, `check_committed` reflects route-level (not internal-chunk) commit. The runtime does not require atomic-with-rollback. |
+| 2026-05-07 (rev 4) | `Sink::write` rustdoc reworded from "Commit one (range, route) atomically" to "Commit one route-level unit ..." and explicitly references the idempotent-retry contract. The "atomically" wording revived the rolled-back-state interpretation that rev 3's surrounding prose had walked back. |
