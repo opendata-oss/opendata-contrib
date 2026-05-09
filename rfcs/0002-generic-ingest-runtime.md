@@ -9,19 +9,26 @@
 ## Summary
 
 This RFC defines `opendata-ingest-runtime`, a sink-neutral runtime that consumes
-OpenData Buffer streams (and, later, other sources) and routes decoded records
-to one or more target sinks. It generalizes the layering from the shipped
-ClickHouse ingestor (RFC 0001) into traits and a per-source `AckCoordinator`
-that hold even when multiple sinks fan out from the same source and complete
-out of order.
+OpenData Buffer streams (and, later, other sources) and writes decoded records
+to **one configured sink per runtime service**. It generalizes the layering
+from the shipped ClickHouse ingestor (RFC 0001) into traits and a per-source
+`AckCoordinator` that holds even when multiple sources share one sink and
+ranges complete out of order.
 
-The runtime is built around five trait boundaries: `SourceReader`,
-`Decoder`, `Router`, `Sink`, and `IdempotencyContract`. The pipeline is
-staged with bounded queues and a shared in-flight byte budget, so a slow
-or failing sink pauses upstream work without unbounded memory growth.
-Buffer ack advances only when every routed sink has durably committed
-the corresponding source sequence range, or has verified that the chunk
-was already committed by an earlier attempt.
+A single runtime service hosts N sources -> 1 sink. **Independent sinks are
+isolated by independent Buffer queues and runtime service instances.** If the
+same upstream data must land in two sinks, the documented deployment is
+producer-side queue duplication plus two isolated runtime processes.
+Independent sinks should not share a runtime ack frontier, memory budget,
+retry loop, or process liveness.
+
+The runtime is built around four trait boundaries: `SourceReader`, `Decoder`,
+`Sink`, and `IdempotencyContract`. The pipeline is staged with bounded queues
+and a shared in-flight byte budget, so a slow or failing sink pauses upstream
+work without unbounded memory growth. For each source, Buffer ack advances
+only when the configured sink has durably committed the corresponding source
+sequence range, or has verified that the range was already committed by an
+earlier attempt.
 
 The decoded unit starts as typed Rust records (compatible with the
 current `DecodedLogRecord` path) and migrates to Arrow `RecordBatch`
@@ -32,8 +39,8 @@ deferred until the native path is measured.
 
 The first integration is RFC 0001's ClickHouse ingestor, ported through
 the generic runtime without intentional behavior changes. The next sink
-is an append-only Iceberg writer (separate RFC). The same runtime hosts
-both in one process.
+is an append-only Iceberg writer (separate RFC), deployed as a standalone
+single-sink runtime service.
 
 ## Motivation
 
@@ -43,63 +50,72 @@ groups, plans deterministic ClickHouse insert chunks, executes them, and
 acks Buffer only after all chunks succeed. The layering is sound, but
 six things are tied to the ClickHouse sink today:
 
-1. The runtime polling loop, the commit group, and the ack controller
-   live in the `clickhouse-ingestor` crate. A second sink would either
-   duplicate them or import a ClickHouse-specific crate just to reuse
-   them.
+1. **The runtime is ClickHouse-specific.** The runtime polling loop, the
+   commit group, and the ack controller live in the `clickhouse-ingestor`
+   crate. A different sink (e.g. Iceberg) would either duplicate them or
+   import a ClickHouse-specific crate just to reuse them.
 2. The adapter trait outputs `Vec<InsertChunk>` with a
    ClickHouse-shaped `Row = Vec<RowValue>`. That row type is
    row-oriented, JSON-leaning, and not a useful interchange format for
    columnar sinks like Iceberg/Delta or for a binary ClickHouse path.
-3. The runtime is single-sink. There is no fanout, no per-sink
-   completion tracking, and no per-source ack frontier independent of
-   sink completion order.
+3. **The runtime is single-source / single-loop.** One Buffer manifest,
+   one serial decode path, one writer pass. There is no per-source ack
+   coordinator, no source/decoder/sink boundary, and no model for
+   multiple sources sharing one sink in the same process.
 4. The Buffer consumer API is serial: `Consumer::next_batch` combines
    manifest read, object fetch, and decode in one call. That ceiling
    limits source throughput regardless of decode/sink concurrency.
-5. Backpressure is implicit in the synchronous pipeline. Slow sinks slow
-   the loop, but there is no shared byte budget and no explicit
+5. **Backpressure is implicit** in the synchronous pipeline. Slow sinks
+   slow the loop, but there is no shared byte budget and no explicit
    "backpressure reason" surfaced in metrics.
 6. The schema and target table are compiled into the binary. There is
    no path for an operator to write the same OTLP logs to a custom
    ClickHouse table or a new Iceberg table without forking the binary.
 
 The high-throughput design (`plans/odb-high-throughput`) calls for one
-service that can host multiple Buffer sources, route to multiple sinks,
-preserve at-least-once with per-sink idempotency, and approach
+service that can host **multiple Buffer sources for one sink**, preserve
+at-least-once with per-source idempotency at the sink, and approach
 single-node network or sink-ingest limits. None of that fits inside the
-ClickHouse ingestor as written.
+ClickHouse ingestor as written. Independent sinks (e.g. ClickHouse and
+Iceberg) deploy as separate runtime services with their own Buffer
+queues; same-process multi-sink fanout is out of scope (see
+"Alternatives: Same-Process Multi-Sink Fanout").
 
 The cheapest path forward is to pull the runtime, ack control, commit
 grouping, and pipeline scaffolding into a separate crate, define the
 trait surface that source readers and sinks plug into, and re-host the
 ClickHouse logs path on top of it without intentional behavior changes.
 That refactor isolates the correctness work (per-source ack frontier,
-fanout invariants, idempotency contract) from the throughput work
-(parallel fetch, parallel decode, columnar representation, binary
+single-sink commit invariants, idempotency contract) from the throughput
+work (parallel fetch, parallel decode, columnar representation, binary
 serialization).
 
 ## Goals
 
 - Define a sink-neutral runtime crate, `opendata-ingest-runtime`, that
-  owns polling, decode orchestration, routing, commit grouping, retry,
+  owns polling, decode orchestration, per-source commit grouping, retry,
   ack, and backpressure.
-- Define the trait surface for source reading, decoding, routing, sinks,
-  and idempotency, with no ClickHouse-specific types.
-- Define the per-source `AckCoordinator` state machine and the fanout
-  invariant: source ack advances only after every routed sink has
-  durably committed or verified prior commit of the relevant source
-  sequence range.
-- Define the bounded-stage pipeline with shared byte budget, so target
-  slowdown pauses source pulls without unbounded memory growth.
+- Define the trait surface for source reading, decoding, sinks, and
+  idempotency, with no ClickHouse-specific types.
+- Define the per-source `AckCoordinator` state machine and the
+  single-sink ack invariant:
+
+  > For each source, ack advances only after the configured sink has
+  > durably committed or verified prior commit for the relevant source
+  > sequence range.
+
+- Define the bounded-stage pipeline with shared byte budget and
+  source-aware fairness, so sink slowdown pauses source pulls without
+  unbounded memory growth and a hot source does not permanently starve
+  a low-volume source on the shared sink writer pool.
 - Define the columnar migration path: typed records first, Arrow
   `RecordBatch` before the first lakehouse sink and before ClickHouse
   binary serialization.
 - Define pluggability: native plugin crates as the v1 path, declarative
   schema/mapping for target tables as the v2 path, dynamic plugins as a
   measured follow-up.
-- Define the configuration shape that supports multiple sources and
-  multiple sinks in one process with independent ack frontiers.
+- Define the configuration shape that supports **multiple sources and
+  one sink in one process**, with independent per-source ack frontiers.
 - Set validation criteria for the runtime extraction and for the
   pipelined runtime.
 
@@ -107,6 +123,18 @@ serialization).
 
 - Concrete sink implementations. The ClickHouse and Iceberg sinks each
   have their own RFCs and crates. This RFC defines what they plug into.
+- **Same-process multi-sink fanout.** A runtime service has exactly one
+  configured sink. Independent sinks deploy as separate runtime services
+  with their own Buffer queues; producer-side queue duplication is the
+  documented pattern for delivering the same upstream stream to two
+  sinks.
+- **Coordinating ack across two sinks (e.g. ClickHouse and Iceberg) in
+  one runtime service.** Independent sinks should not share a runtime
+  ack frontier, memory budget, retry loop, or process liveness.
+- **Per-sink "skip-and-record" data-loss policy.** Without an explicit
+  operator-facing data-loss policy, silently dropping a range from one
+  sink is worse than halting; v1 chooses safety and a single sink
+  per service avoids the question.
 - Buffer producer-side concerns. Producer parallelism, exporter
   configuration, and manifest commit coordination are separate work in
   the `opendata-go` repo.
@@ -126,6 +154,22 @@ serialization).
   dedupe and crash semantics carry over to the ClickHouse sink as it
   ports to the runtime.
 
+### Deployment Guidance for Independent Sinks
+
+To write the same upstream stream into two independent sinks, define
+two service configs with separate Buffer manifests and run two
+processes:
+
+```text
+producer -> Buffer queue A -> runtime service A -> ClickHouse
+         -> Buffer queue B -> runtime service B -> Iceberg
+```
+
+The producer side duplicates the OTel payload into both queues. Each
+runtime service is a single-sink service with its own ack frontier,
+memory budget, retry loop, and process. A slow or fatal sink can stall
+its own source pulls without dragging down the other sink's pipeline.
+
 ## Background
 
 This RFC builds on:
@@ -141,7 +185,8 @@ This RFC builds on:
 - **opendata-contrib RFC 0001 (ClickHouse Ingestor)**: shipped layering
   for the ClickHouse logs path. The generic runtime preserves every
   layer in 0001 and renames or generalizes only what must change to
-  support multiple sinks.
+  support a sink-neutral runtime that can host different sink types
+  (one per service).
 - **`plans/odb-high-throughput/odb-high-throughput-ingestor-design.md`**:
   the design narrative this RFC formalizes. The design doc is the
   product story; this RFC is the contract.
@@ -189,34 +234,34 @@ The runtime relies on three properties from this contract:
 
 ### Architecture
 
-The runtime owns the horizontal stages between Buffer (or another
-source) and the routed sinks:
+The runtime owns the horizontal stages between Buffer (or another source)
+and the configured sink. N source pipelines feed one shared sink writer
+pool:
 
 ```text
-                          ╔═══ ingest-runtime process ═════════════════════════════════════════════════════════════════════════════════════╗
-                          ║                                                                                                                ║
-                          ║   ┌──────────────┐   ┌──────────────┐   ┌─────────────────┐   ┌──────────────┐   ┌──────────────┐               ║
-                          ║   │ Descriptor   │   │  Fetch+      │   │ Envelope+Signal │   │ Router       │   │ CommitGroup  │               ║
-                       ┌──╫───▶  poller      ├───▶  decompress  ├───▶ decoder         ├───▶ per record   ├───▶ per route    │               ║
-                       │  ║   │ (per source) │   │   workers    │   │   workers       │   │              │   │              │               ║
-╔══Object Storage══╗   │  ║   └──────┬───────┘   └──────────────┘   └─────────────────┘   └──────────────┘   └──────┬───────┘               ║
-║                  ║   │  ║          │                                                                              │                       ║
-║   Manifest +     ║   │  ║          │                                                                              │                       ║
-║   Batches        ╞══►┘  ║          │                                                                              ▼                       ║
-║                  ║      ║          │                                                                       ┌──────────────┐               ║
-╚═════════▲════════╝      ║          │                                                                       │ Sink writer  │               ║   ╔══Sinks═════════╗
-          │               ║          │                                                                       │   workers    │               ║   ║                ║
-          │               ║          │                                                                       │  per sink    ├───────────────╫───▶ ClickHouse,    ║
-          │               ║          │                                                                       │              │               ║   ║ Iceberg, fake, ║
-          │               ║          │                                                                       └──────┬───────┘               ║   ║ ...            ║
-          │               ║          │                                                                              │                       ║   ╚════════════════╝
-          │               ║          │                                                                              ▼                       ║
-          │               ║          │                                                                       ┌──────────────┐               ║
-          │               ║          └─────────────────────── ack frontier per source ──────────────────────▶│ Ack          │               ║
-          └───────────────╫───────────  (only after every routed sink commits the sequence range)──────────  │ coordinator  │               ║
-                          ║                                                                                  └──────────────┘               ║
-                          ║                                                                                                                 ║
-                          ╚═════════════════════════════════════════════════════════════════════════════════════════════════════════════════╝
+                          ╔═══ ingest-runtime process (1 sink) ════════════════════════════════════════════════════════════════════════╗
+                          ║                                                                                                            ║
+                          ║   ┌──────────────┐   ┌──────────────┐   ┌─────────────────┐   ┌──────────────┐                              ║
+                          ║   │ Descriptor   │   │  Fetch+      │   │ Envelope+Signal │   │ CommitGroup  │                              ║
+                       ┌──╫───▶  poller      ├───▶  decompress  ├───▶ decoder         ├───▶ per source   │                              ║
+                       │  ║   │ (per source) │   │   workers    │   │   workers       │   │              │                              ║
+╔══Object Storage══╗   │  ║   └──────┬───────┘   └──────────────┘   └─────────────────┘   └──────┬───────┘                              ║
+║                  ║   │  ║          │ N source pipelines                                        │                                      ║
+║   Manifest(s) +  ║   │  ║          │                                                           ▼                                      ║
+║   Batches        ╞══►┘  ║          │                                                  ┌──────────────────┐                            ║
+║                  ║      ║          │                                                  │ Shared sink      │                            ║
+╚═════════▲════════╝      ║          │                                                  │ writer pool      │                            ║   ╔══Sink═════════════╗
+          │               ║          │                                                  │ (with source     ├────────────────────────────╫───▶ ClickHouse OR     ║
+          │               ║          │                                                  │  fairness)       │                            ║   ║ Iceberg OR fake   ║
+          │               ║          │                                                  └────────┬─────────┘                            ║   ╚════════════════════╝
+          │               ║          │                                                           │
+          │               ║          │                                                           ▼                                      ║
+          │               ║          │                                                  ┌──────────────────┐                            ║
+          │               ║          └────────── per-source ack frontier ──────────────▶│ AckCoordinator   │                            ║
+          └───────────────╫─────────  (only after configured sink commit for that range) │ (one per source) │                            ║
+                          ║                                                              └──────────────────┘                            ║
+                          ║                                                                                                            ║
+                          ╚════════════════════════════════════════════════════════════════════════════════════════════════════════════╝
 ```
 
 What is generic vs. plugin:
@@ -226,14 +271,20 @@ What is generic vs. plugin:
 | Source descriptor poller, fetch workers, decompression | Runtime (per source plugin shape) |
 | Per-entry envelope materialization (RFC 0001 `RawEntry`) | Runtime |
 | Signal decoder | Plugin (`Decoder`) |
-| Routing | Plugin (`Router`) |
-| Commit group, deterministic chunking | Runtime |
+| Per-source commit group, deterministic chunking | Runtime |
 | Sink write, retry classification, idempotency check | Plugin (`Sink` + `IdempotencyContract`) |
-| Ack coordinator, source ack/flush, backpressure | Runtime |
+| Per-source `AckCoordinator`, source ack/flush, multi-source fairness across the shared sink writer | Runtime |
 | Metrics scaffolding | Runtime; plugins may add labeled metrics |
 
 The runtime never inspects payload bytes after decode. The plugins
 never call `Consumer::ack` or touch backpressure budgets directly.
+
+Routing concepts (e.g. attribute-based table selection inside one sink)
+are out of the runtime hot path. If different sources in the same
+service need to land in different physical tables of the configured
+sink, that is handled at the sink/schema-mapping layer (see
+"Configuration Shape" and "Future Improvements"), not as a runtime
+trait.
 
 ### Trait Surface
 
@@ -372,8 +423,8 @@ called per `SourceBatch` and consumes the whole batch.
 
 The trait shape is wider than the v1 contract on purpose: the decoder
 is invoked per-batch, but `accepts(envelope)` takes a single envelope
-so a future runtime can route entries with different envelopes to
-different decoders. **That future routing is not implemented in v1**
+so a future runtime can dispatch entries with different envelopes to
+different decoders. **That future dispatch is not implemented in v1**
 because `Decoder::decode(&self, batch: SourceBatch)` consumes the
 entire batch; supporting it requires either splitting `SourceBatch`
 upstream of decoders (a runtime change) or evolving the trait to
@@ -382,9 +433,9 @@ change). Either path is a follow-up RFC; v1 keeps the homogeneous-
 envelope-per-source rule from RFC 0001.
 
 `decode` returns `Vec<DecodedBatch>` so a future per-signal split can
-fan out across signals (e.g. mixed batches in a future router-aware
-mode). **For v1 each `Decoder` returns at most one `DecodedBatch` per
-call.**
+emit multiple decoded batches (e.g. mixed signals in a future
+multi-signal source). **For v1 each `Decoder` returns at most one
+`DecodedBatch` per call.**
 
 #### `DecodedBatch`
 
@@ -408,19 +459,21 @@ pub struct DecodedBatch {
 
 pub enum DecodedRecords {
     /// Typed Rust records, today: `Vec<DecodedLogRecord>` from RFC 0001.
-    /// Wrapped in `Arc` so a single decoded batch can fan out to many
-    /// sinks via cheap reference counting; sinks that need a typed
-    /// view downcast through `as_any`.
+    /// Wrapped in `Arc` so the runtime can hand the batch through
+    /// async stages (commit-group append, sink-writer queue, retry
+    /// path) without copying records; sinks that need a typed view
+    /// downcast through `as_any`.
     Typed(Arc<dyn TypedRecords + Send + Sync>),
     /// Arrow columnar batch. `RecordBatch` is internally `Arc`-shared
     /// across columns, but we wrap it in an outer `Arc` so the
-    /// `DecodedRecords` enum is `Clone` cheaply for fanout.
+    /// `DecodedRecords` enum is `Clone` cheaply across stages.
     Arrow(Arc<arrow_array::RecordBatch>),
 }
 
 impl Clone for DecodedRecords {
-    /// O(1) reference-count clone. Required so the runtime can hand
-    /// the same decoded batch to multiple sinks.
+    /// O(1) reference-count clone. Used by the runtime to pass the
+    /// decoded batch through async stages (commit-group, sink-writer
+    /// queue, retry) without copying records.
     fn clone(&self) -> Self { /* trivial */ unimplemented!() }
 }
 
@@ -455,63 +508,44 @@ Two design decisions worth flagging:
   to snapshot metadata or as Parquet columns, without forcing every
   decoder to know either sink's schema.
 - **Both `DecodedRecords` and `SourceCoordinateColumns` are
-  reference-counted for fanout.** A `DecodedBatch` produced by a
-  decoder is consumed once by the runtime, which then constructs one
-  `SinkCommit` per route. Each `SinkCommit` holds an `Arc` clone of
-  the records and the source columns; no record or column data is
-  copied on fanout. The default record-level filter
-  (`RouteAssignment.indices`) ships as an `Option<Arc<Vec<u32>>>` for
-  the same reason. Sinks that need to materialize per-route
-  projections (e.g. an Iceberg writer that writes Parquet columns
-  from a subset of records) do so on their own thread, reading
-  through the Arc.
+  reference-counted.** A `DecodedBatch` produced by a decoder is
+  consumed once by the runtime, which then constructs one `SinkCommit`
+  for that source range and hands it to the configured sink. The
+  `SinkCommit` holds an `Arc` clone of the records and source columns
+  so the runtime can keep a copy on the retry path (for `MaybeCommitted`
+  resolution) without copying record data. Sinks that need to
+  materialize a projection of the batch (e.g. an Iceberg writer that
+  writes Parquet columns from a subset of fields) do so on their own
+  thread, reading through the Arc.
 
 `source_entry_count` lets the commit group and the ack coordinator
 advance the input high-watermark even when `records` is empty, mirroring
 RFC 0001's "Input progress is independent of output rows" property.
 
-#### `Router`
+#### Routing (Future)
 
-```rust
-pub trait Router: Send + Sync + 'static {
-    fn routes(&self) -> &[RouteId];
-
-    fn route(&self, batch: &DecodedBatch)
-        -> RuntimeResult<Vec<RouteAssignment>>;
-}
-
-pub struct RouteAssignment {
-    pub route: RouteId,
-    /// Indices into the batch's records that go to this route. `None`
-    /// means "all records." For v1 the default router emits one
-    /// assignment per route covering all records (no record-level
-    /// filtering).
-    pub indices: Option<Vec<u32>>,
-}
-```
-
-The default router maps `(source, signal_type) -> [route0, route1,
-...]` from configuration and assigns every record in a `DecodedBatch`
-to every route. v2 routers can shard by attribute, tenant, or any
-record-level predicate.
-
-The `Router` is invoked once per `DecodedBatch`. It does not see
-source bytes; if a use case needs byte-level routing, it belongs in
-the decoder layer, not the router.
+There is no `Router` trait in v1. A runtime service has one configured
+sink and the entire `DecodedBatch` flows to that sink for the source
+range it covers. If a future use case requires record-level routing
+inside one sink (e.g. attribute-based table selection), that is
+handled at the sink/schema-mapping layer (see "Configuration Shape" and
+"Future Improvements") rather than as a runtime trait. Cross-sink
+fanout in one runtime process is explicitly out of scope; see
+"Alternatives: Same-Process Multi-Sink Fanout".
 
 #### `Sink`
 
-`Sink::write` is the **route-level commit unit**. One call covers the
-entire (source range, route) pair. Internally a sink may chunk and
-parallelize as it sees fit (the ClickHouse sink today plans
-`Vec<InsertChunk>` and writes them with per-chunk dedupe tokens; the
-Iceberg sink writes one or more Parquet files and one snapshot
-commit), but the sink must satisfy two contracts:
+`Sink::write` is the **source-range commit unit**. One call covers
+one source sequence range for the configured sink. Internally a sink
+may chunk and parallelize as it sees fit (the ClickHouse sink today
+plans `Vec<InsertChunk>` and writes them with per-chunk dedupe
+tokens; the Iceberg sink writes one or more Parquet files and one
+snapshot commit), but the sink must satisfy three contracts:
 
-1. **`Ok(_)` means the full route-level commit is complete.** Every
+1. **`Ok(_)` means the full source-range commit is complete.** Every
    internal chunk/file/insert that the sink decided to write for this
-   `SinkCommit` has durably landed. The runtime then marks the route
-   complete for this range.
+   `SinkCommit` has durably landed. The runtime then marks the range
+   committed for this source.
 2. **Retry of the same `SinkCommit` must be idempotent.** If `write`
    returns `Err(NotCommitted)` or `Err(MaybeCommitted)`, the runtime
    may call `write(commit)` again with the same `SinkCommit`. The
@@ -522,12 +556,12 @@ commit), but the sink must satisfy two contracts:
    plus `ReplacingMergeTree(_adapter_version)`. Iceberg uses
    deterministic Parquet file paths plus a `check_committed` snapshot
    lookup.
-3. **`check_committed(idempotency_key)` reflects route-level commit.**
-   It returns `Committed` only when the full range×route landed under
-   that key — not when some internal chunks landed and others didn't.
-   Sinks that cannot tell whether all their internal pieces are
-   present return `Unknown`; the runtime then re-attempts `write` and
-   relies on the sink's idempotency to drop the redundant work.
+3. **`check_committed(idempotency_key)` reflects source-range commit.**
+   It returns `Committed` only when the full source range landed
+   under that key — not when some internal chunks landed and others
+   didn't. Sinks that cannot tell whether all their internal pieces
+   are present return `Unknown`; the runtime then re-attempts `write`
+   and relies on the sink's idempotency to drop the redundant work.
 
 The runtime does **not** require sinks to roll back partial state on
 failure. ClickHouse cannot transactionally undo successful inserts;
@@ -552,12 +586,13 @@ pub trait Sink: Send + Sync + 'static {
     fn id(&self) -> &SinkId;
 
     /// Maximum bytes-in-flight the runtime should hold for this sink
-    /// before pausing upstream pulls (used for fairness across sinks).
+    /// before pausing upstream pulls (used for fairness across the
+    /// sources sharing this sink writer pool).
     fn write_budget(&self) -> SinkBudget;
 
-    /// Commit one route-level unit (the whole `SinkCommit` for one
-    /// range × one route). Returns `Ok` only when the full commit is
-    /// durable per the rules above; returns the appropriate
+    /// Commit one source-range unit (the whole `SinkCommit` for one
+    /// source sequence range). Returns `Ok` only when the full commit
+    /// is durable per the rules above; returns the appropriate
     /// `SinkCommitFailure` variant otherwise. The runtime is allowed
     /// to retry the same `SinkCommit` after a non-fatal failure;
     /// implementations must keep retry idempotent (see
@@ -578,20 +613,18 @@ pub trait Sink: Send + Sync + 'static {
 
 pub struct SinkCommit {
     pub source: SourceId,
-    pub route: RouteId,
+    /// Identity of the configured sink. The runtime service hosts a
+    /// single sink, so this value is constant across calls; it is
+    /// retained in the commit shape for observability (metric labels)
+    /// and idempotency-key collision resistance across deployments.
+    pub sink: SinkId,
     pub low_sequence: u64,
     pub high_sequence: u64,
     pub schema_version: SchemaVersion,
     pub idempotency_key: IdempotencyKey,
-    /// O(1) Arc clone of the decoder's output. Multiple
-    /// `SinkCommit`s for the same range (one per route) all share
-    /// the same underlying records.
+    /// O(1) Arc clone of the decoder's output for this source range.
     pub records: DecodedRecords,
-    /// Same: shared via Arc across all routes for this range.
     pub source_columns: Arc<SourceCoordinateColumns>,
-    /// If the route assignment selected a record subset, the
-    /// indices into `records`. `None` means "every record."
-    pub record_indices: Option<Arc<Vec<u32>>>,
 }
 
 pub struct SinkCommitResult {
@@ -638,15 +671,15 @@ The runtime branches on the failure variant before deciding what to do:
 
 | Variant | Runtime action |
 |---|---|
-| `NotCommitted(_)` | Backoff and retry the same `write` call; ack frontier does not advance for this route. After retry budget is exhausted, halt. |
-| `MaybeCommitted(_)` | Call `check_committed(key)`. If `Committed`, mark the route complete on this range without writing again. If `NotCommitted`, retry the `write`. If `Unknown`, retry the `write` and rely on table-level dedupe. |
+| `NotCommitted(_)` | Backoff and retry the same `write` call; the source's ack frontier does not advance for this range. After retry budget is exhausted, halt. |
+| `MaybeCommitted(_)` | Call `check_committed(key)`. If `Committed`, mark the range committed without writing again. If `NotCommitted`, retry the `write`. If `Unknown`, retry the `write` and rely on table-level dedupe. |
 | `Fatal(_)` | Halt the runtime. The operator inspects the offending range and decides whether to fix the sink, fix the data, or use the documented escape hatch to advance past the range. |
 
-This is the layer that makes ClickHouse insert timeouts and Iceberg
-catalog-commit timeouts safe. Without it, a `MaybeCommitted` event
-would either ack-on-first-success (data loss if the next sink in
-fanout fails) or retry-on-failure (duplicate Iceberg snapshot, stale
-ClickHouse insert dedupe token).
+This is the layer that protects single-sink idempotency under
+ClickHouse insert timeouts and Iceberg catalog-commit timeouts.
+Without it, a `MaybeCommitted` event would either ack-on-first-success
+(data loss if the sink quietly didn't commit) or retry-on-failure
+(duplicate Iceberg snapshot, stale ClickHouse insert dedupe token).
 
 `check_committed(key)` is the primitive that lets a sink say "I already
 have this; do not write it again." It is the same call used for
@@ -659,10 +692,10 @@ by inspecting snapshot metadata for a file whose key matches.
 
 #### `IdempotencyContract`
 
-The runtime-level idempotency key identifies a single (source range,
-route) commit. **It does not include `chunk_index`**: the sink's
-`write` call is atomic over the range×route, so the runtime never
-observes individual chunks. Sinks that internally chunk (e.g.
+The runtime-level idempotency key identifies a single (source range)
+commit at the configured sink. **It does not include `chunk_index`**:
+the sink's `write` call covers a whole source range, so the runtime
+never observes individual chunks. Sinks that internally chunk (e.g.
 ClickHouse insert chunks, Iceberg Parquet files) construct their own
 per-chunk identifiers from the runtime's `IdempotencyKey` plus a
 sink-internal index.
@@ -674,7 +707,12 @@ pub trait IdempotencyContract: Send + Sync {
 
 pub struct IdempotencyScope<'a> {
     pub source: &'a SourceId,
-    pub route: &'a RouteId,
+    /// Stable identity of the configured sink. Kept in the scope so
+    /// the same source-range key is distinct across deployments that
+    /// share an upstream Buffer (e.g. duplicated-queue deployments
+    /// that fan out to ClickHouse and Iceberg in separate runtime
+    /// services).
+    pub sink: &'a SinkId,
     pub low_sequence: u64,
     pub high_sequence: u64,
     pub schema_version: SchemaVersion,
@@ -694,12 +732,15 @@ pub struct IdempotencyKey(pub String);
 The default implementation produces:
 
 ```text
-{source}:{route}:{low}-{high}:{schema_version}:{chunking_fingerprint}
+{source}:{sink}:{low}-{high}:{schema_version}:{chunking_fingerprint}
 ```
 
-This is RFC 0001's per-chunk token format with `chunk_index` stripped:
-the runtime hands the sink one job per (range, route), so a single
-key is enough at the runtime layer.
+This is RFC 0001's per-chunk token format with `chunk_index` stripped
+and `route` replaced by `sink`: the runtime hands the configured sink
+one job per source range, so a single key is enough at the runtime
+layer. Including `sink` in the key keeps duplicated-queue deployments
+(same upstream stream feeding two isolated runtime services) free of
+key collisions across services.
 
 The ClickHouse sink, internally, builds RFC 0001's full token by
 appending its own `chunk_index`:
@@ -714,16 +755,17 @@ identity. Sinks own that suffix; the runtime never constructs it.
 ### Per-Source Ack Coordinator
 
 The ack coordinator is the single most important piece of correctness
-that changes from RFC 0001 to this RFC.
+that changes from RFC 0001 to this RFC. There is **one coordinator per
+source**; coordinators are independent — one source's committed range
+never advances another source's frontier.
 
 #### State Machine
 
 For each source, the coordinator tracks:
 
 - A monotonic `acked_frontier` (the durable Buffer ack high-watermark).
-- A set of `pending` sequence ranges, each annotated with the routes it
-  was assigned to.
-- A per-range, per-route `committed` flag.
+- A set of `pending` sequence ranges, each carrying a single
+  sink-commit bit.
 
 ```rust
 pub struct AckCoordinator {
@@ -736,105 +778,99 @@ pub struct AckCoordinator {
 pub struct PendingRange {
     pub low: u64,
     pub high: u64,
-    pub required_routes: HashSet<RouteId>,
-    pub committed_routes: HashSet<RouteId>,
+    pub sink_committed: bool,
 }
 ```
 
 The state transitions are:
 
-1. **Range becomes pending** when the runtime hands a `DecodedBatch`
-   to the router and gets back `RouteAssignment[]`. The required_routes
-   set is the union of route ids in those assignments. Empty
-   assignments (a `DecodedBatch` that no route claimed) still register
-   a pending range so input progress can advance.
-2. **Range becomes complete-on-route** when the sink for that route
-   reports a successful commit. The runtime issues **exactly one**
-   `Sink::write` call per (range, route) at a time; the sink's
-   contract (see "`Sink`" above) is that `Ok(_)` means the full
-   route-level commit is complete and that retry of the same
-   `SinkCommit` is idempotent. No per-chunk completion tracking
-   inside the runtime. A route is marked complete when:
+1. **Range becomes pending** when decoded records enter the
+   per-source commit group, or when an empty decoded batch still
+   represents input progress (zero-record batch). Pending ranges are
+   tracked by source sequence because concurrent fetch / decode /
+   write can complete ranges out of order.
+2. **Range becomes committed** when the configured sink reports a
+   successful commit. The runtime issues **exactly one**
+   `Sink::write` call per range at a time; the sink's contract (see
+   "`Sink`" above) is that `Ok(_)` means the full source-range commit
+   is complete and that retry of the same `SinkCommit` is idempotent.
+   No per-chunk completion tracking inside the runtime. A range is
+   marked committed when:
    - `Sink::write(commit)` returns `Ok(_)`, or
    - `Sink::write(commit)` returns `Err(MaybeCommitted)` and the
      subsequent `check_committed(key)` returns `Committed`, or
    - On replay after restart, `check_committed(key)` returns
      `Committed` before the runtime would have re-attempted the
      `write`.
-3. **Range becomes complete** when `committed_routes ==
-   required_routes`.
-4. **Frontier advances** to the highest contiguous complete sequence
+3. **Frontier advances** to the highest contiguous committed sequence
    from the current `acked_frontier`. The coordinator never advances
    over a hole.
-5. **Flush** calls `SourceReader::ack_through(frontier)` and then
+4. **Flush** calls `SourceReader::ack_through(frontier)` and then
    `SourceReader::flush_acks` per the configured `AckFlushPolicy`
    (default: every commit group, mirroring RFC 0001).
 
-The required_routes set is computed once per pending range and frozen.
-Subsequent record-level filtering by routers does not retroactively
-add or remove routes for the range. If a range is `required_routes =
-{}`, it is complete the moment it is registered (zero-record batch with
-no routes claiming it).
-
-> **Why route-level tracking is sufficient.** Earlier drafts of this
-> RFC tracked completion per `(route, chunk_index)`. That was
-> ambiguous because a sink can choose its own chunk count, and the
-> runtime would have had to either pre-declare the chunk count or
-> count completion events without knowing the upper bound. The
-> sink contract — `Ok(_)` means the full route-level commit is
-> complete, and retry of the same `SinkCommit` is idempotent —
-> collapses this into a single-bit-per-route check at the runtime
-> layer.
+> **Why a single-bit per range is sufficient.** Earlier drafts of this
+> RFC tracked completion per `(route, chunk_index)` and then per
+> `(range, route)`. The current scope (one configured sink per
+> runtime service) plus the sink contract — `Ok(_)` means the full
+> source-range commit is complete, and retry of the same `SinkCommit`
+> is idempotent — collapses this into a single-bit-per-range check
+> at the runtime layer. Cross-sink fanout is not a runtime concern;
+> see "Alternatives: Same-Process Multi-Sink Fanout".
 
 #### Crash Semantics
 
-- **Crash before any sink commit**: nothing in the Buffer ack moves.
+- **Crash before sink commit**: nothing in the Buffer ack moves.
   Source replays the range. Same outcome as RFC 0001.
-- **Crash after one route's sink commit, before another's**: ack
-  frontier did not advance (range incomplete). Source replays. For each
-  required route, the runtime calls `check_committed(key)` *before*
+- **Crash after sink commit, before ack flush**: the ack frontier did
+  not advance (the range was committed but not yet flushed). On
+  replay the runtime calls `check_committed(key)` *before*
   re-attempting `Sink::write`:
-  - The committed route's sink returns `Committed`; the runtime marks
-    the route complete without rewriting.
-  - The uncommitted route's sink returns `NotCommitted` or `Unknown`;
-    the runtime calls `Sink::write` and waits for success.
-- **Crash after all sink commits, before ack flush**: same as above,
-  except every required route's `check_committed` returns `Committed`.
-  Frontier advances and flushes on the next loop iteration.
+  - The sink returns `Committed`; the runtime marks the range
+    committed without rewriting and advances the frontier on the next
+    loop iteration.
+  - The sink returns `NotCommitted` or `Unknown`; the runtime calls
+    `Sink::write` and waits for success. Idempotent retry handles the
+    duplicate case.
 - **Crash mid-`MaybeCommitted` resolution** (write returned ambiguous,
-  process died before `check_committed` resolved): same as the
-  preceding case. Replay re-enters the `check_committed` path; the
-  sink's answer is the source of truth.
-- **Crash after ack flush**: source will not replay this range. Every
-  required route's sink must already have committed it, and the
-  runtime advanced the frontier only after all required
-  commits. This is the invariant.
+  process died before `check_committed` resolved): replay re-enters
+  the `check_committed` path; the sink's answer is the source of
+  truth.
+- **Crash after ack flush**: source will not replay this range. The
+  configured sink must already have committed it, and the runtime
+  advanced the frontier only after that commit. This is the
+  invariant.
 
-#### Fanout Invariant
+#### Single-Sink Ack Invariant
 
-> **Buffer ack advances only after every routed sink has either
-> durably committed the relevant source sequence range or reported
-> `Committed` for the range's idempotency key.**
+> **For each source, Buffer ack advances only after the configured
+> sink has either durably committed the relevant source sequence
+> range or reported `Committed` for that range's idempotency key.**
 
 This is the single sentence the gate reviewer should re-validate at
 every phase that touches ack flow. Tests in Phase 5 of the impl plan
 must demonstrate this invariant under deterministic out-of-order
-completion, partial-fanout failure, and replay.
+range completion, retry / `MaybeCommitted` resolution, replay, and
+multi-source ack isolation (one source's frontier never advances
+another source's frontier).
 
 ### Backpressure Model
 
 Stages communicate through bounded queues plus a shared in-flight byte
-budget per source:
+budget per source. The configured sink owns a single shared writer
+budget across all sources hosted by the service, with source-aware
+fairness so a hot source cannot permanently starve a low-volume
+source:
 
 | Stage | Backpressure trigger |
 |---|---|
 | Descriptor poll | Source descriptor queue full or in-flight bytes ≥ `source.max_inflight_bytes` |
-| Object fetch | Fetch worker semaphore full |
-| Decompress | Decompress worker semaphore full |
-| Decode | Decode worker semaphore full |
-| Route + commit-group | Per-route commit group at row/byte/age threshold |
-| Sink write | Sink-specific budget (`Sink::write_budget`); slow sink fills its writer queue and stalls upstream |
-| Ack | Frontier blocked on incomplete pending range |
+| Object fetch | Fetch worker semaphore full (per source) |
+| Decompress | Decompress worker semaphore full (per source) |
+| Decode | Decode worker semaphore full (per source) |
+| Per-source commit-group | Source's commit group at row/byte/age threshold |
+| Sink write | Sink-wide budget (`Sink::write_budget`); slow sink fills its writer queue and stalls upstream for every source feeding it |
+| Ack | Frontier blocked on uncommitted pending range (per source) |
 
 Required configuration knobs (these names are stable across phases; a
 later config schema RFC may rename, but the semantics carry through):
@@ -873,16 +909,10 @@ commit. The accounting rule is the same regardless of source:
    plus the decoded `DecodedBatch.estimated_bytes()`. The previous
    reservation is released; the actual size is held for as long as
    the batch is in any in-flight stage.
-3. **Through fanout**: when a `DecodedBatch` is fanned to N routes,
-   the byte reservation is *not* multiplied by N. The records are
-   `Arc`-shared (see "DecodedBatch" above), so the underlying memory
-   exists once. Per-route stage accounting tracks which routes still
-   hold a reference; bytes are released only when the last route
-   completes.
-4. **At sink commit success**: the actual size is released from the
-   route's slice of the budget.
-5. **On retry / `MaybeCommitted` resolution**: the reservation
-   persists until the route is decisively complete or the runtime
+3. **At sink commit success**: the reservation is released from the
+   source's slice of the budget.
+4. **On retry / `MaybeCommitted` resolution**: the reservation
+   persists until the range is decisively committed or the runtime
    halts.
 
 The runtime never uses HEAD requests against object storage to
@@ -899,15 +929,17 @@ correctness harness, not in benchmark numbers.
 
 Required metrics (stage-labeled):
 
-- `runtime_stage_queue_depth{stage,source}`
-- `runtime_stage_inflight_bytes{stage,source}`
+- `runtime_source_queue_depth{stage,source}`
+- `runtime_source_inflight_bytes{stage,source}`
 - `runtime_stage_latency_seconds{stage,source}`
 - `runtime_ack_frontier{source}` (gauge)
 - `runtime_pending_ranges{source}` (gauge)
 - `runtime_backpressure_reason{source,reason}` (counter; `reason` ∈
   `source_budget`, `decode_budget`, `sink_budget`, `retrying`,
   `fatal_error`)
-- `runtime_route_commits_total{source,route,result}` (`result` ∈
+- `runtime_sink_queue_depth{sink}` (gauge)
+- `runtime_sink_inflight_bytes{sink}` (gauge)
+- `runtime_sink_commits_total{source,sink,result}` (`result` ∈
   `committed`, `verified_already_committed`, `failed_retryable`,
   `failed_fatal`)
 
@@ -983,7 +1015,7 @@ emits a single descriptor whose location is the just-fetched batch.
 This compatibility path is required only during Phase 4
 (extraction) and removed in Phase 6 (pipelining).
 
-### Decoder and Router: v1 Defaults
+### Decoder: v1 Defaults
 
 v1 ships:
 
@@ -991,12 +1023,13 @@ v1 ships:
   unchanged behavior. `accepts(envelope)` returns true for `(version=1,
   signal_type=Logs, encoding=OtlpProtobuf)`.
 - A future `OtlpMetricsDecoder` once metrics targets ship; not v1.
-- `StaticRouter`: routes every `DecodedBatch` to a fixed list of
-  `RouteId`s, configured per source.
 
-Per-entry envelope routing across decoders is supported by the trait
+Per-entry envelope dispatch across decoders is supported by the trait
 shape but not implemented in v1. v1 fails closed on mixed envelopes
 within a single source, mirroring RFC 0001.
+
+There is no `Router` trait in v1. Each source's `DecodedBatch` flows
+to the single configured sink for the runtime service.
 
 ### Sink Plugins: ClickHouse and Iceberg
 
@@ -1016,8 +1049,10 @@ their own RFCs and crates. The required compatibility points:
 
 ### Configuration Shape
 
-The runtime configuration treats sources and sinks as named, indexed
-resources; routes are the wires between them.
+The runtime configuration treats sources as a list and the sink as a
+single top-level block. **Validation rejects more than one sink in
+one service.** To write to two sinks, define two service configs with
+separate Buffer manifests and run two runtime processes.
 
 ```yaml
 runtime:
@@ -1039,7 +1074,6 @@ sources:
       signal_type: logs
       encoding: otlp_protobuf
     decoder: otlp_logs
-    routes: [logs_clickhouse, logs_iceberg]
     commit_group:
       max_rows: 100000
       max_bytes: 33554432
@@ -1053,50 +1087,40 @@ sources:
       decompress_concurrency: 4
       decode_concurrency: 4
 
-sinks:
-  - id: logs_clickhouse
-    type: clickhouse
-    endpoint: https://...clickhouse.cloud:8443
-    database: observability
-    table: logs
-    schema_ref: builtin/otel_logs_clickhouse_v1
-    insert_quorum: auto
-    apply_deduplication_token: true
-    max_concurrent_commits: 4
-    retry:
-      max_attempts: 6
-      initial_backoff_ms: 100
-
-  - id: logs_iceberg
-    type: iceberg
-    catalog:
-      type: rest
-      endpoint: https://catalog.example.com
-    namespace: observability
-    table: logs
-    schema_ref: builtin/otel_logs_iceberg_v1
-    object_store:
-      type: Aws
-      bucket: opendata-iceberg-logs
-      region: us-west-2
-    max_concurrent_commits: 2
+sink:
+  id: logs_clickhouse
+  type: clickhouse
+  endpoint: https://...clickhouse.cloud:8443
+  database: observability
+  table: logs
+  schema_ref: builtin/otel_logs_clickhouse_v1
+  insert_quorum: auto
+  apply_deduplication_token: true
+  max_concurrent_commits: 4
+  retry:
+    max_attempts: 6
+    initial_backoff_ms: 100
 ```
 
 Key shape decisions:
 
-- **Sources and sinks are top-level lists keyed by `id`.** Routes are
-  references by id, not nested objects. This keeps multi-fanout
-  configurations readable when one source feeds many sinks.
+- **`sink` is singular.** Two sinks => two runtime services, with
+  independent Buffer queues and processes.
+- **Sources are a top-level list keyed by `id`.** Each source has its
+  own commit-group, ack, and backpressure config; sharing a pool
+  would couple high-volume and low-volume signals.
 - **`schema_ref` selects a built-in template or a user-supplied
   schema/mapping file** (Phase 7). The string `builtin/<name>` resolves
   to a compiled-in template; any other value is a path to a user
   schema/mapping document.
-- **Each source has its own commit-group, ack, and backpressure
-  config.** Different signals have different volume profiles; sharing a
-  pool would couple them.
-- **Sinks declare retry and concurrency at the sink level.** The
+- **The sink declares retry and concurrency at the sink level.** The
   runtime applies them; sink plugins do not implement their own retry
   loops.
+- **If different sources need different physical tables in the same
+  sink, that is a sink/schema-mapping concern**, not a generic
+  runtime route. The sink config can carry an explicit
+  `source_mappings` / `tables` / `schema_ref_by_source` structure;
+  this is a sink-side feature, not a runtime trait.
 
 ### Pluggability Levels
 
@@ -1173,41 +1197,44 @@ Sinks decide which coordinate columns to materialize. The runtime
 provides them as `SourceCoordinateColumns` parallel to records; the
 sink projects them according to its target schema.
 
-### Multi-Source, Multi-Target Service
+### Multi-Source, Single-Sink Service
 
-The runtime hosts N sources × M sinks in one process. The invariants
+The runtime hosts N sources -> 1 sink in one process. The invariants
 across sources:
 
 - **Each source has its own `AckCoordinator`** and its own ack
   frontier. A failure in one source must not advance another source's
-  Buffer ack.
-- **Sinks may be shared across sources** (one Iceberg writer connection
-  pool can serve many sources). The sink applies per-source budgets so
-  one hot source does not starve a low-volume source.
-- **One source feeding two sinks (fanout)** is the v1 target.
-- **Two sources feeding the same sink table** is allowed but adds a
+  Buffer ack. Multi-source ack isolation is a Phase 5 correctness
+  test.
+- **The configured sink is shared across sources.** The sink writer
+  pool applies source-aware fairness so one hot source does not
+  permanently starve a low-volume source. The first cut is bounded
+  per-source queues feeding a shared sink semaphore; weighted
+  fairness can be revisited later if the bench surfaces a need.
+- **Two sources feeding the same target table** is allowed but adds a
   dedupe-key constraint inherited from RFC 0001's "Future:
-  Config-Driven Multi-Source Ingestors": if two sources share a target
-  table, the table's dedupe key must include `_odb_manifest_path` (or
-  the equivalent for non-ClickHouse sinks). The config validator
-  enforces this.
-- **Process readiness fails** when any required source halts. Optional
-  sources can be marked `optional: true` in config and their failure
-  reports as degraded, not failed. v1 ships without `optional`; it is
-  named here so the validator can adopt it later without churn.
+  Config-Driven Multi-Source Ingestors": if two sources share a
+  target table, the table's dedupe key must include `_odb_manifest_path`
+  or `source_id` (or the equivalent for non-ClickHouse sinks). The
+  config validator enforces this.
+- **Process readiness fails** when any required source halts. v1 fails
+  readiness on any source halt. Optional sources can be marked
+  `optional: true` in a future revision; named here so the validator
+  can adopt it later without churn.
 
 ### Operational Surface
 
-- **Dry-run** (per source): full pipeline, including decode, route, and
-  sink planning, but `Sink::write` is replaced with a no-op that
-  returns success without side effects, and `ack_through` is skipped.
-  Carry-over from RFC 0001. Toggling dry-run requires a process
-  restart for the same reason as RFC 0001.
-- **Graceful shutdown**: drain all in-flight commit groups, write
-  through every sink, advance and flush ack frontiers, exit. The
-  runtime owns shutdown propagation through `tokio_util::CancellationToken`.
-- **Hard crash recovery**: source resumes from the last *flushed* ack
-  frontier; replay is idempotent at sinks that implement
+- **Dry-run** (per source): full pipeline, including decode and the
+  sink's plan/serialize step, but `Sink::write` is replaced with a
+  no-op that returns success without side effects, and `ack_through`
+  is skipped. Carry-over from RFC 0001. Toggling dry-run requires a
+  process restart for the same reason as RFC 0001.
+- **Graceful shutdown**: drain all in-flight per-source commit groups,
+  write through the configured sink, advance and flush each source's
+  ack frontier, exit. The runtime owns shutdown propagation through
+  `tokio_util::CancellationToken`.
+- **Hard crash recovery**: each source resumes from its last *flushed*
+  ack frontier; replay is idempotent at sinks that implement
   `check_committed`, and dedupable at sinks that do not.
 
 ### Failure Modes
@@ -1225,15 +1252,10 @@ Inherited and generalized from RFC 0001:
   range. Operator either fixes the underlying issue or, with explicit
   config, advances the source past the bad range and accepts data
   loss for that range.
-- **Partial fanout failure (one sink fatal, others healthy)**: the
-  pending range stays incomplete; the ack frontier does not advance;
-  the runtime halts because there is no clean way to ack only some
-  sinks' commits. v1 chooses safety over availability here.
-  v2 may add per-sink "skip-and-record" modes, but they require an
-  operator-facing data-loss policy.
 - **AckCoordinator inconsistent state** (a programming bug, e.g.
-  duplicate route assignment): treated as fatal. The runtime never
-  papers over a coordinator invariant violation.
+  a duplicate `register_pending` for an already-pending range):
+  treated as fatal. The runtime never papers over a coordinator
+  invariant violation.
 
 ## Alternatives Considered
 
@@ -1247,11 +1269,13 @@ than splitting the crate now.
 
 ### Use Raw OTLP Protobuf as the Cross-Sink Unit
 
-The runtime could carry source bytes through to every sink and let each
-sink decode independently. Rejected for fanout: every sink would
-re-decode the same bytes, OTLP tree flattening is non-trivial, and the
-runtime would not be able to size commit groups by row count or apply
-schema-aware backpressure.
+The runtime could carry source bytes through to the sink and let the
+sink decode them. Rejected because every sink implementation would
+re-decode the same bytes, OTLP tree flattening is non-trivial, and
+the runtime would not be able to size commit groups by row count or
+apply schema-aware backpressure. The cost is borne even more sharply
+when the same decoded shape is reused across sink types in
+duplicated-queue deployments — every service decodes from scratch.
 
 ### Use `Vec<RowValue>` as the Cross-Sink Unit
 
@@ -1267,20 +1291,46 @@ the runtime-wide unit because:
 The runtime keeps `RowValue` as an internal detail of the ClickHouse
 sink instead.
 
+### Same-Process Multi-Sink Fanout
+
+Considered: one runtime service hosts multiple sinks (e.g. ClickHouse
+and Iceberg) and routes the same source data to both, ack-ing only
+when both have committed. Rejected because:
+
+- **Independent sinks should not share process fate.** A slow or
+  fatal sink would block ack for unrelated sinks.
+- **Partial success requires a complex operator-facing data-loss
+  policy.** "One sink halts, others healthy" turns into either
+  whole-runtime halt (loses availability for the healthy sink) or
+  per-sink skip-and-record (silent data loss without an explicit
+  policy).
+- **Backpressure incentives invert.** A shared byte budget that
+  multiplies across sinks penalizes multi-sink runs; tracking
+  per-sink completion adds runtime state for a feature most
+  deployments don't want.
+
+The cleaner deployment is producer-side queue duplication plus
+isolated single-sink runtime services, one per sink. Each service has
+its own ack frontier, memory budget, retry loop, and process
+liveness. Independent failure stays independent.
+
 ### Per-Sink Ack Frontiers (One AckCoordinator per Sink)
 
-Considered: each sink advances its own Buffer ack. Rejected because
-Buffer has one active consumer per manifest (epoch fenced). The "one
-ack frontier per source" invariant matches the underlying contract
-exactly. Sink-level frontiers would require a separate per-sink
-checkpoint store and a reconciliation algorithm to derive the source
-ack frontier, which is the multi-checkpoint complexity RFC 0001
-explicitly rejected for the Kafka connector design.
+Considered: in a hypothetical multi-sink runtime, each sink advances
+its own Buffer ack. Rejected because Buffer has one active consumer
+per manifest (epoch fenced); per-sink frontiers would require a
+separate per-sink checkpoint store and a reconciliation algorithm to
+derive the source ack frontier, which is the multi-checkpoint
+complexity RFC 0001 explicitly rejected for the Kafka connector
+design. This alternative is moot under the rev-6 single-sink scope:
+ack frontiers are per-source against the single configured sink. The
+section is kept for context because it is the argument against
+re-introducing same-process fanout in a later revision.
 
 ### WASM-First Plugin Boundary
 
-Defer. The hot path is decode → route → commit-group → sink write. A
-WASM boundary on that path is premature optimization for an
+Defer. The hot path is decode → commit-group → sink-plan → sink write.
+A WASM boundary on that path is premature optimization for an
 extensibility story that natively-linked plugin crates already cover.
 Once the native path is benchmarked, WASM is a candidate for transforms
 that are off the hottest path (e.g. attribute enrichment).
@@ -1291,31 +1341,43 @@ Rejected. Rust has no stable ABI; a dylib boundary in the record path
 forces serialization at the boundary, which negates the point of native
 plugins. WASM or subprocess plugins are better long-term answers.
 
-### Push the Ack Coordinator Into Each Sink
+### Push the Ack Coordinator Into the Sink
 
-Sinks could call `source.ack_through` themselves. Rejected because:
+The sink could call `source.ack_through` itself. Rejected because:
 
-- It would couple every sink to the source's manifest API (today
+- It would couple the sink to the source's manifest API (today
   Buffer; tomorrow possibly Kafka or file scan).
-- Fanout becomes: every sink races to ack independently. Either we
-  ack-on-first (lose data on the slower sink) or we add coordination
-  back. The runtime is the natural coordination point.
+- Multiple sources sharing one sink writer would each need to plumb
+  their own ack callback through the sink, fragmenting the contract
+  the sink has to honor. The runtime is the natural coordination
+  point — it owns the per-source `AckCoordinator` and the source
+  reader, the sink owns its idempotent commit semantics.
 
 ## Future Improvements
 
 These do not require changing the trait shapes in this RFC.
 
-- **Per-entry signal routing within a single source**: relax v1's
+- **Per-entry signal dispatch within a single source**: relax v1's
   homogeneous-envelope requirement. Already supported by the
   `Decoder::accepts` shape.
 - **Optional sources / per-source readiness** in the config validator
   and the metrics surface.
-- **Per-sink "skip-and-record" mode** for partial-fanout fatal failure,
-  with an operator-facing data-loss policy.
+- **Sink-side schema mapping for multi-source -> multi-table**: when
+  one sink should land different sources in different physical
+  tables, encode the mapping in the sink config (e.g.
+  `source_mappings`, `schema_ref_by_source`). This is sink/schema
+  work, not a generic runtime route.
 - **Arrow-only DecodedRecords** after Phase 9, removing the typed
   fallback for OTLP logs.
 - **WASM plugins** for off-hot-path transforms (attribute enrichment,
   schema migrations, filter rules).
+- **Deployment tooling for duplicate producer outputs** when one
+  upstream stream must feed multiple sinks. This is an
+  `opendata-go` / Helm / operator concern, not a runtime trait
+  change.
+- **Optional multi-sink runtime** can be reconsidered only with
+  explicit isolation guarantees and a documented per-sink
+  data-loss policy.
 - **Dynamic source registration** for sources that are not declared
   in the YAML config (e.g. discovered manifests, multi-tenant
   routing).
@@ -1342,22 +1404,27 @@ Phase-aligned with the impl plan.
 - Behavior is equivalent: same metrics names, same dry-run semantics,
   same rows landed in ClickHouse for the same input.
 
-### Phase 5 Exit (Ack Coordinator and Correctness Harness)
+### Phase 5 Exit (Ack Coordinator and Single-Sink Correctness Harness)
 
-- A fake source and fake sinks (success, retryable failure, permanent
-  failure, slow, slower) reproduce every crash-point and partial-fanout
-  scenario in the design doc.
-- Property tests demonstrate the fanout invariant under randomized
-  completion orders.
+- A fake source and a fake (single) sink (success, retryable failure,
+  permanent failure, slow, ambiguous) reproduce every crash-point in
+  the design doc.
+- Tests demonstrate the single-sink ack invariant under
+  out-of-order range completion, retry, `MaybeCommitted` resolution,
+  and replay.
+- Multi-source ack isolation: one source's committed range never
+  advances another source's frontier.
 - `check_committed` contract tests for at least one concrete sink
   (ClickHouse stub OK; Iceberg follows in Phase 9).
 
-### Phase 6 Exit (Pipelined Runtime)
+### Phase 6 Exit (Pipelined Runtime Under Concurrency)
 
-- Fetch, decode, and write workers run concurrently; all stage queue
-  and inflight metrics are exposed.
-- A target slowdown injection pauses source pulls within one
+- Fetch, decode, and write workers run concurrently across multiple
+  sources; all stage queue and inflight metrics are exposed.
+- A sink slowdown injection pauses source pulls within one
   commit-group window; recovery resumes without unbounded memory growth.
+- The shared sink writer pool applies source fairness so a hot source
+  does not permanently starve a low-volume source.
 - Phase 5 correctness tests still pass under concurrency knobs greater
   than 1.
 
@@ -1368,14 +1435,26 @@ Phase-aligned with the impl plan.
 - Arrow vs. typed benchmark numbers are recorded with workload shape,
   hardware, and config.
 
-### Phase 9 Exit (Iceberg Sink, Two-Sink Fanout)
+### Phase 9 Exit (Standalone Iceberg Sink Service)
 
-- One Buffer source feeds ClickHouse and Iceberg in the same process.
+- One Buffer source feeds an Iceberg-configured runtime service
+  end-to-end. ClickHouse is not required to be present in the same
+  process.
 - Crash-after-Iceberg-commit-before-ack is verified idempotent on
   replay (`check_committed` returns `Committed`, no duplicate Parquet
   file is written).
-- The ack coordinator advances only after both sinks commit (or
-  verify).
+- The ack coordinator advances only after the Iceberg sink commits
+  (or verifies).
+
+### Phase 10 Exit (Multi-Source Single-Sink E2E)
+
+- Multiple Buffer sources feed one runtime service into a single
+  configured sink (e.g. ClickHouse). Per-source ack frontiers and
+  bounded backpressure both hold under load.
+- Optional deployment proof: the same upstream stream is duplicated
+  into two queues and consumed by two isolated runtime services
+  (e.g. one ClickHouse, one Iceberg) — each service is a single-sink
+  service with its own ack frontier.
 
 ## Revision History
 
@@ -1386,3 +1465,4 @@ Phase-aligned with the impl plan.
 | 2026-05-07 (rev 3) | Phase 0 gate reconciliation. (a) Split `SourceReader` into `SourceReader: Send + 'static` (manifest owner, `&mut self` next_descriptors / ack_through / flush_acks) and `SourceFetchHandle: Send + Sync` (cloneable, concurrency-safe `fetch`). The earlier draft claimed `fetch(&self)` was concurrent on a `Send`-only trait, which did not match RFC 0003's `&mut self` `fetch_descriptor`. The new shape mirrors RFC 0003. (b) Updated the Buffer source-reader implementation section to describe `BufferSourceReader` + `BufferSourceFetchHandle` and to call `ConsumerFetchHandle::fetch` (RFC 0003 rev 2), not the stale `Consumer::fetch_descriptor(&self)`. (c) Reworded the `Sink::write` contract: dropped "partial success is the sink's problem to clean up" (too strong for ClickHouse / Iceberg); replaced with a three-rule contract — `Ok(_)` means full route-level commit, retry of the same `SinkCommit` must be idempotent, `check_committed` reflects route-level (not internal-chunk) commit. The runtime does not require atomic-with-rollback. |
 | 2026-05-07 (rev 4) | `Sink::write` rustdoc reworded from "Commit one (range, route) atomically" to "Commit one route-level unit ..." and explicitly references the idempotent-retry contract. The "atomically" wording revived the rolled-back-state interpretation that rev 3's surrounding prose had walked back. |
 | 2026-05-07 (rev 5) | AckCoordinator narrative reworded to drop "atomic per (range, route)" — both the state-transition step (#2) and the "Why route-level tracking is sufficient" callout now say "`Ok(_)` means the full route-level commit is complete and retry of the same `SinkCommit` is idempotent." Pure wording fix; the contract has been route-level + idempotent-retry since rev 3. |
+| 2026-05-08 (rev 6) | **Scope changed from same-process multi-sink fanout to multi-source / single-sink runtime service.** A runtime service hosts N sources -> 1 sink. Independent sinks are isolated through producer-side duplicate queues and separate runtime processes. `Router`, `RouteId`, `RouteAssignment`, `SinkCommit.route`, `IdempotencyScope.route`, and `SinkCommit.record_indices` are removed from the core runtime contract (the per-record `SourceCoordinateColumns.record_indices` column stays — that is the OTel within-entry record index). `SinkCommit` is keyed by `{source, sink}`; `IdempotencyScope` keys by `sink` (not `route`); `IdempotencyKey` shape is `{source}:{sink}:{low}-{high}:{schema_version}:{chunking_fingerprint}`. `AckCoordinator` is per-source with one sink-commit bit per range (`register_pending` / `mark_committed` / `frontier`); out-of-order range completion is handled by tracking pending ranges and never advancing the contiguous frontier over a hole. `MaybeCommitted` handling is unchanged. Configuration uses singular `sink:`; validator rejects multi-sink config. Multi-source section renamed to "Multi-Source, Single-Sink Service"; backpressure model gains source fairness on the shared sink writer pool. Metrics relabeled (`runtime_source_*`, `runtime_sink_*`, `runtime_sink_commits_total{source,sink,result}`). Phase 9 is a standalone Iceberg runtime service (no co-host with ClickHouse); Phase 10 is multi-source / single-sink e2e plus an optional duplicated-queue deployment proof. New "Same-Process Multi-Sink Fanout" alternative explains why the previous shape was rejected. |
