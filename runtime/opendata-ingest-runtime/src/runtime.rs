@@ -14,14 +14,21 @@
 //! 3. Validate per-entry envelopes against the configured envelope.
 //! 4. Run the [`Decoder`].
 //! 5. For each [`DecodedBatch`] the decoder produces, register the
-//!    pending range with [`AckCoordinator`], construct a
-//!    [`SinkCommit`] with an [`IdempotencyKey`], call
-//!    [`Sink::write`], and mark the range committed. `MaybeCommitted`
-//!    triggers a [`Sink::check_committed`] lookup before retry per
-//!    RFC 0002 rev 6.
+//!    pending range with the per-source `AckCoordinator` looked up
+//!    via [`AckCoordinators`], construct a [`SinkCommit`] with an
+//!    [`IdempotencyKey`], call [`Sink::write`], `mark_committed`,
+//!    then `advance_frontier`. `MaybeCommitted` triggers a
+//!    [`Sink::check_committed`] lookup before retry per RFC 0002
+//!    rev 6.
 //! 6. Advance the Buffer ack frontier via
-//!    [`BufferSource::ack_through`] and flush per the configured
-//!    [`AckFlushPolicy`].
+//!    [`BufferSource::ack_through`] using the coordinator's
+//!    `frontier()` and flush per the configured [`AckFlushPolicy`].
+//!
+//! Phase 5 expands the Phase 4 contiguous-frontier stub into the
+//! full per-source pending-range state machine + registry
+//! ([`AckCoordinators`]); see
+//! `plans/odb-high-throughput/phase05-ack-correctness-design.md`
+//! rev 6 for the invariant taxonomy.
 //!
 //! Dry-run mode skips the sink write and the ack/flush; the
 //! coordinator's in-memory frontier still advances so the
@@ -35,7 +42,7 @@ use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
 
-use crate::ack_coordinator::AckCoordinator;
+use crate::ack_coordinator::AckCoordinators;
 use crate::decoded_batch::{DecodedBatch, DecodedRecords};
 use crate::decoder::Decoder;
 use crate::envelope::{
@@ -111,13 +118,23 @@ pub struct RuntimeProgress {
     pub records_written: u64,
     pub last_decoded_sequence: Option<u64>,
     pub last_acked_sequence: Option<u64>,
+    /// Number of registered-but-not-yet-committed ranges across
+    /// all sources hosted by this runtime. Phase 5 ships a single
+    /// source; the value is a snapshot of the lone coordinator's
+    /// `pending_count` after each loop iteration.
+    pub pending_ranges_total: usize,
 }
 
 pub struct Runtime {
     source: BufferSource,
     decoder: Arc<dyn Decoder>,
     sink: Arc<dyn Sink>,
-    ack_coordinator: AckCoordinator,
+    /// Phase 5 registry of per-source ack coordinators. Today's
+    /// runtime is single-source so the registry holds exactly one
+    /// entry, keyed by `source.id()`. Phase 6 multi-source wiring
+    /// will populate N entries; the orchestration code already
+    /// looks up by source id.
+    coordinators: AckCoordinators,
     idempotency: Arc<dyn IdempotencyContract>,
     options: RuntimeOptions,
     groups_since_flush: u32,
@@ -195,11 +212,14 @@ impl Runtime {
                 progress.records_written = progress.records_written.saturating_add(rows);
                 progress.source_ranges_committed =
                     progress.source_ranges_committed.saturating_add(1);
+                let source_id = self.source.id().clone();
                 if !self.options.dry_run
-                    && let Some(frontier) = self.ack_coordinator.frontier()
+                    && let Some(coord) = self.coordinators.get(&source_id)
+                    && let Some(frontier) = coord.frontier()
                 {
                     progress.last_acked_sequence = Some(frontier);
                 }
+                progress.pending_ranges_total = self.coordinators.pending_total();
                 let _ = self.progress_tx.send(progress);
             }
         }
@@ -248,18 +268,33 @@ impl Runtime {
                 DecodedRecords::Typed(t) => t.record_count() as u64,
             };
 
-            self.ack_coordinator.register_pending(low, high)?;
+            let coord = self.coordinators.get_mut(&source_id).ok_or_else(|| {
+                RuntimeError::Ack(format!(
+                    "no coordinator registered for source {source_id} (Runtime::build must register every source)",
+                ))
+            })?;
+            coord.register_pending(low, high)?;
 
             if self.options.dry_run {
                 debug!(low, high, rows = row_count, "dry-run: skipping sink write");
-                self.ack_coordinator.mark_committed(low, high)?;
+                coord.mark_committed(low, high)?;
+                coord.advance_frontier();
                 rows_written = rows_written.saturating_add(row_count);
                 continue;
             }
 
-            let commit = self.build_commit(source_id, low, high, db);
+            // `write_with_retry` borrows `&self` (read-only), so
+            // drop the &mut on `coord` for the duration of the
+            // await. We re-acquire after the write returns to
+            // call `mark_committed` + `advance_frontier`.
+            let commit = self.build_commit(source_id.clone(), low, high, db);
             let result = self.write_with_retry(commit).await?;
-            self.ack_coordinator.mark_committed(low, high)?;
+            let coord = self
+                .coordinators
+                .get_mut(&source_id)
+                .expect("coordinator presence checked above; entry is not removed during write");
+            coord.mark_committed(low, high)?;
+            coord.advance_frontier();
             // Authoritative count from the sink, not the decoded
             // record count: in non-dry-run mode the sink owns row
             // accounting (and its own row-drop guard — see
@@ -268,18 +303,22 @@ impl Runtime {
             rows_written = rows_written.saturating_add(result.rows_written);
         }
 
-        if !self.options.dry_run
-            && let Some(frontier) = self.ack_coordinator.frontier()
-        {
-            self.source.ack_through(frontier).await?;
-            self.groups_since_flush = self.groups_since_flush.saturating_add(1);
-            let should_flush = match self.options.ack_flush_policy {
-                AckFlushPolicy::EveryCommitGroup => true,
-                AckFlushPolicy::EveryN { n } => self.groups_since_flush >= n.max(1),
-            };
-            if should_flush {
-                self.source.flush_acks().await?;
-                self.groups_since_flush = 0;
+        if !self.options.dry_run {
+            let frontier = self
+                .coordinators
+                .get(self.source.id())
+                .and_then(|c| c.frontier());
+            if let Some(frontier) = frontier {
+                self.source.ack_through(frontier).await?;
+                self.groups_since_flush = self.groups_since_flush.saturating_add(1);
+                let should_flush = match self.options.ack_flush_policy {
+                    AckFlushPolicy::EveryCommitGroup => true,
+                    AckFlushPolicy::EveryN { n } => self.groups_since_flush >= n.max(1),
+                };
+                if should_flush {
+                    self.source.flush_acks().await?;
+                    self.groups_since_flush = 0;
+                }
             }
         }
 
@@ -402,13 +441,14 @@ impl RuntimeBuilder {
         let idempotency = self
             .idempotency
             .unwrap_or_else(|| Arc::new(DefaultIdempotencyContract));
-        let ack_coordinator = AckCoordinator::new(source.id().clone());
+        let mut coordinators = AckCoordinators::new();
+        coordinators.register_source(source.id().clone(), source.last_acked_sequence())?;
         let (progress_tx, progress_rx) = watch::channel(RuntimeProgress::default());
         Ok(Runtime {
             source,
             decoder,
             sink,
-            ack_coordinator,
+            coordinators,
             idempotency,
             options: self.options,
             groups_since_flush: 0,
