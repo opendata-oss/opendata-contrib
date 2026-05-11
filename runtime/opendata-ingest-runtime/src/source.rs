@@ -201,6 +201,16 @@ pub struct BufferSource {
     manifest_path: String,
     cached: Arc<Mutex<HashMap<u64, SourceBatch>>>,
     last_acked: Option<u64>,
+    /// First sequence ever returned by `next_descriptors`. Used by
+    /// `ack_through` to anchor the ack range when the consumer is
+    /// resumed mid-stream (i.e. `last_acked` starts as `None` because
+    /// the caller didn't pass a `last_acked_sequence` to
+    /// `BufferSource::new` but the first batch's sequence is far
+    /// from 0). Without this, the first `ack_through(N)` would loop
+    /// `0..=N` and issue N+1 fake `Consumer::ack` calls for
+    /// sequences this source never handed out — see Phase 4 review
+    /// HIGH-1.
+    first_seen: Option<u64>,
 }
 
 impl BufferSource {
@@ -219,6 +229,7 @@ impl BufferSource {
             manifest_path: manifest_path.into(),
             cached: Arc::new(Mutex::new(HashMap::new())),
             last_acked: last_acked_sequence,
+            first_seen: None,
         }
     }
 
@@ -254,6 +265,9 @@ impl BufferSource {
             match self.consumer.next_batch().await {
                 Ok(Some(batch)) => {
                     let sequence = batch.sequence;
+                    if self.first_seen.is_none() {
+                        self.first_seen = Some(sequence);
+                    }
                     let location = batch.location.clone();
                     let per_range_metadata = batch
                         .metadata
@@ -295,10 +309,24 @@ impl BufferSource {
     /// Advance the durable ack frontier through (and including)
     /// `sequence`. `buffer::Consumer::ack` requires strict in-order,
     /// one-at-a-time acks in v0.2.0, so this loops over
-    /// `(last_acked+1)..=sequence`. Phase 6 swaps in
+    /// `start..=sequence`. `start` is `last_acked + 1` if anything
+    /// has been acked, else the first sequence the source ever
+    /// handed out via `next_descriptors` — never `0` unconditionally.
+    /// The latter rule prevents a stampede of fake acks on resume
+    /// when the producer has already written far past sequence 0
+    /// (see Phase 4 review HIGH-1). Phase 6 swaps the loop for
     /// `Consumer::ack_through(seq)` once RFC 0003 ships.
     pub async fn ack_through(&mut self, sequence: u64) -> RuntimeResult<()> {
-        let start = self.last_acked.map(|s| s.saturating_add(1)).unwrap_or(0);
+        let start = match self.last_acked {
+            Some(s) => s.saturating_add(1),
+            // No prior ack on this source. Anchor at the first
+            // sequence we've actually seen via `next_descriptors`;
+            // if `ack_through` is called before any descriptor was
+            // handed out (a caller bug), fall back to acking just
+            // `sequence` so we don't fabricate acks for sequences
+            // we never observed.
+            None => self.first_seen.unwrap_or(sequence),
+        };
         for seq in start..=sequence {
             self.consumer
                 .ack(seq)

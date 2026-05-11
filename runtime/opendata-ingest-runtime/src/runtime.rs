@@ -43,7 +43,7 @@ use crate::envelope::{
 };
 use crate::error::{RuntimeError, RuntimeResult};
 use crate::idempotency::{DefaultIdempotencyContract, IdempotencyContract, IdempotencyScope};
-use crate::sink::{CommitStatus, Sink, SinkCommit, SinkCommitFailure};
+use crate::sink::{CommitStatus, Sink, SinkCommit, SinkCommitFailure, SinkCommitResult};
 use crate::source::{BufferSource, SourceBatch, SourceBudget};
 
 /// How often the runtime calls [`BufferSource::flush_acks`] after
@@ -220,6 +220,23 @@ impl Runtime {
         validate_consistent(&envelopes, &self.options.configured_envelope)
             .map_err(|e| RuntimeError::Decoder(Box::new(e)))?;
 
+        // Fail closed when the decoder doesn't accept the configured
+        // envelope. `validate_consistent` already proved every entry's
+        // envelope matches the runtime config; `accepts` is the
+        // decoder-plugin's own gate. RFC 0002 rev 6 §`Decoder` makes
+        // this the runtime's responsibility to enforce.
+        if let Some(envelope) = envelopes.first()
+            && !self.decoder.accepts(envelope)
+        {
+            return Err(RuntimeError::Decoder(
+                format!(
+                    "decoder rejected configured envelope: version={} signal_type={:?} encoding={:?}",
+                    envelope.version, envelope.signal_type, envelope.encoding,
+                )
+                .into(),
+            ));
+        }
+
         let decoded = self.decoder.decode(batch)?;
         let mut rows_written = 0u64;
 
@@ -241,9 +258,14 @@ impl Runtime {
             }
 
             let commit = self.build_commit(source_id, low, high, db);
-            self.write_with_retry(commit).await?;
+            let result = self.write_with_retry(commit).await?;
             self.ack_coordinator.mark_committed(low, high)?;
-            rows_written = rows_written.saturating_add(row_count);
+            // Authoritative count from the sink, not the decoded
+            // record count: in non-dry-run mode the sink owns row
+            // accounting (and its own row-drop guard — see
+            // ClickHouseSink). progress.records_written reflects what
+            // was actually written.
+            rows_written = rows_written.saturating_add(result.rows_written);
         }
 
         if !self.options.dry_run
@@ -290,11 +312,11 @@ impl Runtime {
         }
     }
 
-    async fn write_with_retry(&self, commit: SinkCommit) -> RuntimeResult<()> {
+    async fn write_with_retry(&self, commit: SinkCommit) -> RuntimeResult<SinkCommitResult> {
         let mut attempt = 0u32;
         loop {
             match self.sink.write(commit.clone()).await {
-                Ok(_) => return Ok(()),
+                Ok(result) => return Ok(result),
                 Err(SinkCommitFailure::Fatal(e)) => return Err(RuntimeError::Sink(e)),
                 Err(SinkCommitFailure::NotCommitted(e)) => {
                     if attempt >= self.options.max_retry_attempts {
@@ -305,7 +327,17 @@ impl Runtime {
                 }
                 Err(SinkCommitFailure::MaybeCommitted(e)) => {
                     match self.sink.check_committed(&commit.idempotency_key).await? {
-                        CommitStatus::Committed => return Ok(()),
+                        CommitStatus::Committed => {
+                            // The sink confirmed an earlier attempt
+                            // committed; we don't get a fresh
+                            // SinkCommitResult, but the range is
+                            // durably written. Return a zero-row
+                            // result so the runtime's
+                            // progress.records_written doesn't
+                            // double-count an already-acked range on
+                            // replay.
+                            return Ok(SinkCommitResult::default());
+                        }
                         // RFC 0002 rev 6: treat Unknown like
                         // NotCommitted; rely on sink-level dedupe.
                         CommitStatus::NotCommitted | CommitStatus::Unknown => {

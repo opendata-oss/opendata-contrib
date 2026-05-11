@@ -79,11 +79,28 @@ impl TypedRecords for FakeRecords {
 /// Fake decoder: produces one `DecodedBatch` per `SourceBatch` whose
 /// `record_count == entry_count`. Doesn't actually parse the
 /// payload; just shapes a batch the runtime can carry to the sink.
-struct FakeDecoder;
+/// `accepts_anything` lets a test toggle the `Decoder::accepts` gate
+/// without rebuilding the whole struct.
+struct FakeDecoder {
+    accepts_anything: bool,
+}
+
+impl FakeDecoder {
+    fn permissive() -> Self {
+        Self {
+            accepts_anything: true,
+        }
+    }
+    fn rejecting() -> Self {
+        Self {
+            accepts_anything: false,
+        }
+    }
+}
 
 impl Decoder for FakeDecoder {
     fn accepts(&self, _envelope: &MetadataEnvelope) -> bool {
-        true
+        self.accepts_anything
     }
 
     fn decode(&self, batch: SourceBatch) -> RuntimeResult<Vec<DecodedBatch>> {
@@ -213,6 +230,194 @@ fn options(dry_run: bool) -> RuntimeOptions {
     }
 }
 
+/// Phase 4 review HIGH-1 regression. A `BufferSource` constructed
+/// with `last_acked_sequence: None` and a producer that has already
+/// advanced past sequence 0 should NOT replay `Consumer::ack(0)..
+/// =Consumer::ack(N)` on the first `ack_through(N)` call. Anchor the
+/// ack range at the first sequence the source actually handed out.
+///
+/// The test drains 3 batches with one `BufferSource`, drops it, then
+/// produces one more batch (sequence 3) and constructs a fresh
+/// `BufferSource` with `last_acked: None`. The fresh source's first
+/// `next_descriptors` returns sequence 3; the fixed `ack_through(3)`
+/// calls `Consumer::ack(3)` exactly once. The bug would have called
+/// `ack(0), ack(1), ack(2), ack(3)` against a consumer that already
+/// dequeued 0..2 — silently advancing through fabricated sequences.
+#[tokio::test]
+async fn ack_through_anchors_at_first_seen_after_resume() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let manifest_path = "ingest/test/resume-ack/manifest";
+    let data_prefix = "ingest/test/resume-ack/data";
+
+    let producer_config = buffer::ProducerConfig {
+        object_store: ObjectStoreConfig::InMemory,
+        data_path_prefix: data_prefix.into(),
+        manifest_path: manifest_path.into(),
+        flush_interval: Duration::from_secs(24 * 3600),
+        flush_size_bytes: 64 * 1024 * 1024,
+        max_buffered_inputs: 1000,
+        batch_compression: buffer::CompressionType::None,
+    };
+    let producer = buffer::Producer::with_object_store(
+        producer_config,
+        Arc::clone(&store),
+        Arc::new(SystemClock),
+    )
+    .expect("producer");
+
+    for i in 0..3 {
+        producer
+            .produce(
+                vec![Bytes::from(format!("batch-{i}").into_bytes())],
+                logs_envelope(),
+            )
+            .await
+            .expect("produce");
+        producer.flush().await.expect("flush");
+    }
+
+    let consumer_config = buffer::ConsumerConfig {
+        object_store: ObjectStoreConfig::InMemory,
+        manifest_path: manifest_path.into(),
+        data_path_prefix: data_prefix.into(),
+        gc_interval: Duration::from_secs(60),
+        gc_grace_period: Duration::from_secs(60),
+    };
+    let consumer1 =
+        buffer::Consumer::with_object_store(consumer_config.clone(), Arc::clone(&store), None)
+            .await
+            .expect("consumer1");
+    let mut source1 = BufferSource::new(consumer1, "buffer", manifest_path, None);
+
+    for expected in 0..3u64 {
+        let descs = source1
+            .next_descriptors(1, Default::default())
+            .await
+            .expect("next_descriptors");
+        assert_eq!(descs.len(), 1);
+        assert_eq!(descs[0].sequence, expected);
+        let _ = source1
+            .fetch_handle()
+            .fetch(descs[0].clone())
+            .await
+            .expect("fetch");
+        source1
+            .ack_through(descs[0].sequence)
+            .await
+            .expect("ack_through");
+    }
+    source1.flush_acks().await.expect("flush_acks");
+    assert_eq!(source1.last_acked_sequence(), Some(2));
+    drop(source1);
+
+    producer
+        .produce(vec![Bytes::from_static(b"after-resume")], logs_envelope())
+        .await
+        .expect("produce 4");
+    producer.flush().await.expect("flush 4");
+
+    let consumer2 =
+        buffer::Consumer::with_object_store(consumer_config, Arc::clone(&store), Some(2))
+            .await
+            .expect("consumer2");
+    // The point of HIGH-1 is the `last_acked_sequence: None` case.
+    // Even though the consumer above is constructed with `Some(2)`
+    // (a real restart would persist that durably), the
+    // BufferSource is intentionally constructed with `None` to
+    // simulate the binary's current main.rs wiring.
+    let mut source2 = BufferSource::new(consumer2, "buffer", manifest_path, None);
+    assert_eq!(source2.last_acked_sequence(), None);
+
+    let descs = source2
+        .next_descriptors(1, Default::default())
+        .await
+        .expect("next_descriptors after resume");
+    assert_eq!(descs.len(), 1);
+    assert_eq!(
+        descs[0].sequence, 3,
+        "fresh consumer with last_acked=Some(2) resumes at 3"
+    );
+    let _ = source2
+        .fetch_handle()
+        .fetch(descs[0].clone())
+        .await
+        .expect("fetch after resume");
+
+    // Before the HIGH-1 fix, this called Consumer::ack(0), ack(1),
+    // ack(2), ack(3) — Consumer::ack(0) is accepted by buffer
+    // v0.2.0's first-ack-is-unrestricted rule, then ack(1) and
+    // ack(2) succeed (sequential), but they're fabricated acks
+    // for sequences this source never observed. The fix anchors
+    // at first_seen=3 and issues a single ack(3).
+    source2
+        .ack_through(3)
+        .await
+        .expect("ack_through must not fabricate acks for unseen sequences");
+    source2.flush_acks().await.expect("flush after resume");
+    assert_eq!(source2.last_acked_sequence(), Some(3));
+
+    producer.close().await.expect("close producer");
+}
+
+/// Phase 4 review MED-5 regression. Runtime must call
+/// `Decoder::accepts(envelope)` and fail closed when it returns
+/// false. Per RFC 0002 rev 6 §`Decoder`, the runtime enforces the
+/// plugin boundary by gating decode on accepts.
+#[tokio::test]
+async fn runtime_fails_closed_when_decoder_rejects_envelope() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let fixture = fixture(
+        Arc::clone(&store),
+        "ingest/test/decoder-rejects/manifest",
+        "ingest/test/decoder-rejects/data",
+    )
+    .await;
+    let Fixture { producer, source } = fixture;
+
+    producer
+        .produce(vec![Bytes::from_static(b"payload")], logs_envelope())
+        .await
+        .expect("produce");
+    producer.flush().await.expect("flush");
+
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let sink = FakeSink {
+        id: SinkId::from("fake"),
+        captured: Arc::clone(&captured),
+    };
+
+    let runtime = Runtime::builder()
+        .add_source(source)
+        .add_decoder(FakeDecoder::rejecting())
+        .set_sink(sink)
+        .with_options(options(false))
+        .build()
+        .expect("build");
+
+    let shutdown = CancellationToken::new();
+    let runtime_shutdown = shutdown.clone();
+    let handle = tokio::spawn(async move { runtime.run(runtime_shutdown).await });
+
+    // The runtime should error out within a poll interval as soon as
+    // it reads the first batch.
+    let join = timeout(Duration::from_secs(5), handle)
+        .await
+        .expect("runtime should exit after rejecting the envelope")
+        .expect("runtime task join");
+    let err = join.expect_err("decoder rejection must surface as RuntimeError");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("decoder rejected configured envelope"),
+        "unexpected error: {msg}"
+    );
+    let _ = shutdown;
+
+    // Sink must never be called.
+    assert!(captured.lock().unwrap().is_empty());
+
+    producer.close().await.expect("close producer");
+}
+
 #[tokio::test]
 async fn buffer_source_returns_descriptors_after_producer_flush() {
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
@@ -290,7 +495,7 @@ async fn dry_run_advances_progress_and_skips_sink() {
 
     let runtime = Runtime::builder()
         .add_source(source)
-        .add_decoder(FakeDecoder)
+        .add_decoder(FakeDecoder::permissive())
         .set_sink(sink)
         .with_options(options(true))
         .build()
@@ -367,7 +572,7 @@ async fn live_mode_writes_to_sink_and_advances_ack_frontier() {
 
     let runtime = Runtime::builder()
         .add_source(source)
-        .add_decoder(FakeDecoder)
+        .add_decoder(FakeDecoder::permissive())
         .set_sink(sink)
         .with_options(options(false))
         .build()
