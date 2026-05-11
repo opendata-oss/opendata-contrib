@@ -22,15 +22,13 @@ use std::time::Duration;
 use bytes::Bytes;
 use opendata_ingest_runtime::envelope::{ConfiguredEnvelope, PayloadEncoding, SignalType};
 use opendata_ingest_runtime::runtime::{AckFlushPolicy, Runtime, RuntimeOptions};
-use opendata_ingest_runtime::sink::{CommitStatus, SinkId};
 use slatedb::object_store::ObjectStore;
 use slatedb::object_store::memory::InMemory;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
 use support::{
-    FakeDecoder, FakeSink, ProgrammableSink, ScriptedWrite, buffer_source_on_store,
-    in_memory_buffer_source, logs_envelope,
+    FakeDecoder, FakeSink, buffer_source_on_store, in_memory_buffer_source, logs_envelope,
 };
 
 fn options(dry_run: bool) -> RuntimeOptions {
@@ -383,174 +381,9 @@ async fn live_mode_writes_to_sink_and_advances_ack_frontier() {
     fx.producer.close().await.expect("close producer");
 }
 
-/// Phase 4 review (round 2) coverage gap. The runtime branches on
-/// `SinkCommitFailure::MaybeCommitted` by calling
-/// `Sink::check_committed`; if the sink reports `Committed`, the
-/// runtime must NOT issue a second `write` and the ack frontier
-/// must still advance.
-#[tokio::test]
-async fn runtime_treats_maybe_committed_then_committed_as_success() {
-    let fx = in_memory_buffer_source(
-        "ingest/test/maybe-committed-then-committed/manifest",
-        "ingest/test/maybe-committed-then-committed/data",
-    )
-    .await;
-
-    fx.producer
-        .produce(vec![Bytes::from_static(b"payload")], logs_envelope())
-        .await
-        .expect("produce");
-    fx.producer.flush().await.expect("flush");
-
-    let sink = ProgrammableSink::new(
-        SinkId::from("programmable"),
-        vec![ScriptedWrite::MaybeCommitted {
-            message: "ambiguous insert; prior attempt may have committed".into(),
-        }],
-        CommitStatus::Committed,
-    );
-    let write_calls = Arc::clone(&sink.write_calls);
-    let check_calls = Arc::clone(&sink.check_committed_calls);
-
-    let mut opts = options(false);
-    opts.max_retry_attempts = 3;
-    let runtime = Runtime::builder()
-        .add_source(fx.source)
-        .add_decoder(FakeDecoder::permissive())
-        .set_sink(sink)
-        .with_options(opts)
-        .build()
-        .expect("build");
-    let mut progress_rx = runtime.progress();
-
-    let shutdown = CancellationToken::new();
-    let runtime_shutdown = shutdown.clone();
-    let handle = tokio::spawn(async move { runtime.run(runtime_shutdown).await });
-
-    let p = timeout(Duration::from_secs(5), async {
-        loop {
-            progress_rx
-                .changed()
-                .await
-                .expect("progress channel closed");
-            let p = *progress_rx.borrow();
-            if p.last_acked_sequence == Some(0) {
-                return p;
-            }
-        }
-    })
-    .await
-    .expect("ack frontier never advanced");
-
-    assert_eq!(
-        p.last_acked_sequence,
-        Some(0),
-        "ack frontier must advance once check_committed → Committed"
-    );
-
-    shutdown.cancel();
-    handle
-        .await
-        .expect("runtime task join")
-        .expect("runtime exited cleanly");
-
-    let writes = write_calls.lock().unwrap().clone();
-    let checks = check_calls.lock().unwrap().clone();
-    assert_eq!(
-        writes.len(),
-        1,
-        "runtime must NOT retry write after Committed; got writes={writes:?}"
-    );
-    assert_eq!(
-        checks.len(),
-        1,
-        "runtime must call check_committed exactly once for the MaybeCommitted; got checks={checks:?}"
-    );
-
-    fx.producer.close().await.expect("close producer");
-}
-
-/// Phase 4 review (round 2) coverage gap. When `check_committed`
-/// returns `Unknown` (the ClickHouse default), the runtime
-/// treats Unknown like NotCommitted and retries the write.
-#[tokio::test]
-async fn runtime_retries_write_after_maybe_committed_when_check_returns_unknown() {
-    let fx = in_memory_buffer_source(
-        "ingest/test/maybe-committed-then-unknown/manifest",
-        "ingest/test/maybe-committed-then-unknown/data",
-    )
-    .await;
-
-    fx.producer
-        .produce(vec![Bytes::from_static(b"payload")], logs_envelope())
-        .await
-        .expect("produce");
-    fx.producer.flush().await.expect("flush");
-
-    let sink = ProgrammableSink::new(
-        SinkId::from("programmable"),
-        vec![
-            ScriptedWrite::MaybeCommitted {
-                message: "ambiguous insert".into(),
-            },
-            ScriptedWrite::Ok { rows_written: 1 },
-        ],
-        CommitStatus::Unknown,
-    );
-    let write_calls = Arc::clone(&sink.write_calls);
-    let check_calls = Arc::clone(&sink.check_committed_calls);
-
-    let mut opts = options(false);
-    opts.max_retry_attempts = 3;
-    let runtime = Runtime::builder()
-        .add_source(fx.source)
-        .add_decoder(FakeDecoder::permissive())
-        .set_sink(sink)
-        .with_options(opts)
-        .build()
-        .expect("build");
-    let mut progress_rx = runtime.progress();
-
-    let shutdown = CancellationToken::new();
-    let runtime_shutdown = shutdown.clone();
-    let handle = tokio::spawn(async move { runtime.run(runtime_shutdown).await });
-
-    let p = timeout(Duration::from_secs(5), async {
-        loop {
-            progress_rx
-                .changed()
-                .await
-                .expect("progress channel closed");
-            let p = *progress_rx.borrow();
-            if p.last_acked_sequence == Some(0) {
-                return p;
-            }
-        }
-    })
-    .await
-    .expect("ack frontier never advanced");
-
-    assert_eq!(p.last_acked_sequence, Some(0));
-    assert_eq!(p.records_written, 1);
-
-    shutdown.cancel();
-    handle
-        .await
-        .expect("runtime task join")
-        .expect("runtime exited cleanly");
-
-    let writes = write_calls.lock().unwrap().clone();
-    let checks = check_calls.lock().unwrap().clone();
-    assert_eq!(
-        writes.len(),
-        2,
-        "runtime must retry write once after Unknown; got writes={writes:?}"
-    );
-    assert_eq!(
-        checks.len(),
-        1,
-        "runtime must call check_committed exactly once for the MaybeCommitted; got checks={checks:?}"
-    );
-
-    fx.producer.close().await.expect("close producer");
-}
+// The two `MaybeCommitted` round-trip tests
+// (`runtime_treats_maybe_committed_then_committed_as_success` +
+// `runtime_retries_write_after_maybe_committed_when_check_returns_unknown`)
+// previously lived here from Phase 4 review round 2 (commit
+// 6d28604). Phase 5.4 moves them to `tests/ack_correctness.rs`
+// alongside the rest of the INV-MAYBE-COMMITTED-RESOLVES tests.

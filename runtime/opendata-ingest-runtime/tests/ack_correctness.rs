@@ -209,3 +209,266 @@ async fn runtime_does_not_ack_when_sink_returns_fatal() {
     let _ = shutdown;
     fx.producer.close().await.expect("close producer");
 }
+
+/// INV-MAYBE-COMMITTED-RESOLVES (Committed branch). Moved from
+/// `tests/runtime_compat.rs` where it landed in Phase 4 review
+/// round 2 (commit `6d28604`); the harness now lives alongside
+/// the other ack-correctness tests.
+///
+/// `Sink::write` returns `MaybeCommitted`; `check_committed`
+/// reports `Committed`. The runtime must mark the range
+/// committed without re-issuing `write`.
+#[tokio::test]
+async fn runtime_treats_maybe_committed_then_committed_as_success() {
+    let fx = in_memory_buffer_source(
+        "ingest/test/maybe-committed-then-committed/manifest",
+        "ingest/test/maybe-committed-then-committed/data",
+    )
+    .await;
+    fx.producer
+        .produce(vec![Bytes::from_static(b"payload")], logs_envelope())
+        .await
+        .expect("produce");
+    fx.producer.flush().await.expect("flush");
+
+    let sink = ProgrammableSink::new(
+        SinkId::from("programmable"),
+        vec![ScriptedWrite::MaybeCommitted {
+            message: "ambiguous insert; prior attempt may have committed".into(),
+        }],
+        CommitStatus::Committed,
+    );
+    let write_calls = Arc::clone(&sink.write_calls);
+    let check_calls = Arc::clone(&sink.check_committed_calls);
+
+    let runtime = Runtime::builder()
+        .add_source(fx.source)
+        .add_decoder(FakeDecoder::permissive())
+        .set_sink(sink)
+        .with_options(live_options())
+        .build()
+        .expect("build");
+    let mut progress_rx = runtime.progress();
+
+    let shutdown = CancellationToken::new();
+    let runtime_shutdown = shutdown.clone();
+    let handle = tokio::spawn(async move { runtime.run(runtime_shutdown).await });
+
+    let p = timeout(Duration::from_secs(5), async {
+        loop {
+            progress_rx
+                .changed()
+                .await
+                .expect("progress channel closed");
+            let p = *progress_rx.borrow();
+            if p.last_acked_sequence == Some(0) {
+                return p;
+            }
+        }
+    })
+    .await
+    .expect("ack frontier never advanced");
+
+    assert_eq!(p.last_acked_sequence, Some(0));
+
+    shutdown.cancel();
+    handle
+        .await
+        .expect("runtime task join")
+        .expect("runtime exited cleanly");
+
+    let writes = write_calls.lock().unwrap().clone();
+    let checks = check_calls.lock().unwrap().clone();
+    assert_eq!(
+        writes.len(),
+        1,
+        "runtime must NOT retry write after Committed; got writes={writes:?}"
+    );
+    assert_eq!(
+        checks.len(),
+        1,
+        "runtime must call check_committed exactly once; got checks={checks:?}"
+    );
+
+    fx.producer.close().await.expect("close producer");
+}
+
+/// INV-MAYBE-COMMITTED-RESOLVES (Unknown branch). Moved from
+/// `tests/runtime_compat.rs` (Phase 4 review round 2 commit
+/// `6d28604`).
+///
+/// `Sink::write` returns `MaybeCommitted`; `check_committed`
+/// reports `Unknown` (the ClickHouse default — the short-window
+/// dedupe token has expired by the time the runtime asks).
+/// Runtime treats `Unknown` like `NotCommitted` for the retry
+/// decision and re-issues `write`; on `Ok`, ack frontier
+/// advances.
+#[tokio::test]
+async fn runtime_retries_write_after_maybe_committed_when_check_returns_unknown() {
+    let fx = in_memory_buffer_source(
+        "ingest/test/maybe-committed-then-unknown/manifest",
+        "ingest/test/maybe-committed-then-unknown/data",
+    )
+    .await;
+    fx.producer
+        .produce(vec![Bytes::from_static(b"payload")], logs_envelope())
+        .await
+        .expect("produce");
+    fx.producer.flush().await.expect("flush");
+
+    let sink = ProgrammableSink::new(
+        SinkId::from("programmable"),
+        vec![
+            ScriptedWrite::MaybeCommitted {
+                message: "ambiguous insert".into(),
+            },
+            ScriptedWrite::Ok { rows_written: 1 },
+        ],
+        CommitStatus::Unknown,
+    );
+    let write_calls = Arc::clone(&sink.write_calls);
+    let check_calls = Arc::clone(&sink.check_committed_calls);
+
+    let runtime = Runtime::builder()
+        .add_source(fx.source)
+        .add_decoder(FakeDecoder::permissive())
+        .set_sink(sink)
+        .with_options(live_options())
+        .build()
+        .expect("build");
+    let mut progress_rx = runtime.progress();
+
+    let shutdown = CancellationToken::new();
+    let runtime_shutdown = shutdown.clone();
+    let handle = tokio::spawn(async move { runtime.run(runtime_shutdown).await });
+
+    let p = timeout(Duration::from_secs(5), async {
+        loop {
+            progress_rx
+                .changed()
+                .await
+                .expect("progress channel closed");
+            let p = *progress_rx.borrow();
+            if p.last_acked_sequence == Some(0) {
+                return p;
+            }
+        }
+    })
+    .await
+    .expect("ack frontier never advanced");
+
+    assert_eq!(p.last_acked_sequence, Some(0));
+    assert_eq!(p.records_written, 1);
+
+    shutdown.cancel();
+    handle
+        .await
+        .expect("runtime task join")
+        .expect("runtime exited cleanly");
+
+    let writes = write_calls.lock().unwrap().clone();
+    let checks = check_calls.lock().unwrap().clone();
+    assert_eq!(
+        writes.len(),
+        2,
+        "runtime must retry write once after Unknown; got writes={writes:?}"
+    );
+    assert_eq!(
+        checks.len(),
+        1,
+        "runtime must call check_committed exactly once; got checks={checks:?}"
+    );
+
+    fx.producer.close().await.expect("close producer");
+}
+
+/// INV-RETRY-BUDGET-HALTS. When `max_retry_attempts` is
+/// exhausted on a `NotCommitted` path, the runtime returns
+/// `RuntimeError::Sink(_)` and the ack frontier does not
+/// advance through the failing range.
+///
+/// Script: 4 NotCommitted responses with `max_retry_attempts =
+/// 2`. The runtime issues the first write, then retries up to
+/// 2 more times (3 writes total — initial + 2 retries), then
+/// bubbles the error.
+#[tokio::test]
+async fn runtime_retry_budget_exhaustion_does_not_ack_failing_range() {
+    let fx = in_memory_buffer_source(
+        "ingest/test/retry-budget-exhaustion/manifest",
+        "ingest/test/retry-budget-exhaustion/data",
+    )
+    .await;
+    fx.producer
+        .produce(vec![Bytes::from_static(b"payload")], logs_envelope())
+        .await
+        .expect("produce");
+    fx.producer.flush().await.expect("flush");
+
+    let sink = ProgrammableSink::new(
+        SinkId::from("programmable"),
+        vec![
+            ScriptedWrite::NotCommitted {
+                message: "1".into(),
+            },
+            ScriptedWrite::NotCommitted {
+                message: "2".into(),
+            },
+            ScriptedWrite::NotCommitted {
+                message: "3".into(),
+            },
+            ScriptedWrite::NotCommitted {
+                message: "4".into(),
+            },
+        ],
+        CommitStatus::Unknown,
+    );
+    let write_calls = Arc::clone(&sink.write_calls);
+
+    let mut opts = live_options();
+    opts.max_retry_attempts = 2;
+    let runtime = Runtime::builder()
+        .add_source(fx.source)
+        .add_decoder(FakeDecoder::permissive())
+        .set_sink(sink)
+        .with_options(opts)
+        .build()
+        .expect("build");
+    let mut progress_rx = runtime.progress();
+
+    let shutdown = CancellationToken::new();
+    let runtime_shutdown = shutdown.clone();
+    let handle = tokio::spawn(async move { runtime.run(runtime_shutdown).await });
+
+    let join = timeout(Duration::from_secs(5), handle)
+        .await
+        .expect("runtime should exit on retry-budget exhaustion")
+        .expect("runtime task join");
+    let err = join.expect_err("retry-budget exhaustion must surface as RuntimeError");
+    assert!(
+        matches!(err, RuntimeError::Sink(_)),
+        "expected RuntimeError::Sink, got {err:?}"
+    );
+
+    // Ack frontier never advanced.
+    let final_progress = *progress_rx.borrow_and_update();
+    assert_eq!(
+        final_progress.last_acked_sequence, None,
+        "ack frontier must not advance when retries exhaust"
+    );
+
+    // Initial attempt + 2 retries = 3 writes total.
+    let writes = write_calls.lock().unwrap().clone();
+    assert_eq!(
+        writes.len(),
+        3,
+        "initial write + max_retry_attempts=2 retries = 3 writes; got writes={writes:?}"
+    );
+    // All target the same sequence with the same idempotency
+    // key (INV-SINK-RETRY-IDEMPOTENT).
+    assert!(writes.iter().all(|w| w.high_sequence == 0));
+    let key = &writes[0].idempotency_key;
+    assert!(writes.iter().all(|w| &w.idempotency_key == key));
+
+    let _ = shutdown;
+    fx.producer.close().await.expect("close producer");
+}
