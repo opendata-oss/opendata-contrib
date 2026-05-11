@@ -7,7 +7,7 @@ use thiserror::Error;
 pub type RuntimeResult<T> = Result<T, RuntimeError>;
 
 /// Boxed error type used inside [`crate::sink::SinkCommitFailure`]
-/// per RFC 0002 rev 5 §`Sink`.
+/// per RFC 0002 rev 6 §`Sink`.
 pub type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
 #[derive(Debug, Error)]
@@ -17,9 +17,6 @@ pub enum RuntimeError {
 
     #[error("decoder: {0}")]
     Decoder(BoxError),
-
-    #[error("router: {0}")]
-    Router(BoxError),
 
     #[error("sink: {0}")]
     Sink(BoxError),

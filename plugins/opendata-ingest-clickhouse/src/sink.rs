@@ -2,10 +2,10 @@
 //!
 //! Phase 4.4b shim that wraps the existing
 //! [`OtlpLogsClickHouseAdapter::plan`] +
-//! [`ClickHouseWriter::execute_all`] path. RFC 0002 rev 5 contract:
+//! [`ClickHouseWriter::execute_all`] path. RFC 0002 rev 6 contract:
 //!
-//! - `Ok(_)` means the full route-level commit (every chunk for
-//!   the range × this route) is durable.
+//! - `Ok(_)` means the full source-range commit (every chunk for
+//!   the range) is durable.
 //! - Retry of the same `SinkCommit` is idempotent: the adapter
 //!   produces deterministic chunks keyed off `(low_sequence,
 //!   high_sequence, chunk_index)`, and ClickHouse dedupes via
@@ -16,7 +16,7 @@
 //!   [`Sink::check_committed`] before deciding whether to retry.
 //!   `check_committed` returns `Unknown` (the short-window
 //!   ClickHouse insert dedupe token has expired by the time the
-//!   runtime asks); per RFC 0002 rev 5 the runtime treats
+//!   runtime asks); per RFC 0002 rev 6 the runtime treats
 //!   `Unknown` like `NotCommitted` and retries, with table-level
 //!   dedupe as the long-window backstop.
 
@@ -24,9 +24,9 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use opendata_ingest_otel::logs::{DecodedLogRecord, TypedDecodedLogs};
+use opendata_ingest_otel::logs::TypedDecodedLogs;
 use opendata_ingest_runtime::commit_group::{CommitGroupBatch, RecordSize};
-use opendata_ingest_runtime::decoded_batch::DecodedRecords;
+use opendata_ingest_runtime::decoded_batch::{DecodedBatch, DecodedRecords};
 use opendata_ingest_runtime::error::{RuntimeError, RuntimeResult};
 use opendata_ingest_runtime::idempotency::IdempotencyKey;
 use opendata_ingest_runtime::sink::{
@@ -79,13 +79,13 @@ impl Sink for ClickHouseSink {
     }
 
     async fn write(&self, commit: SinkCommit) -> Result<SinkCommitResult, SinkCommitFailure> {
-        let SinkCommit {
+        let SinkCommit { batch, .. } = commit;
+        let DecodedBatch {
             low_sequence,
             high_sequence,
             records,
-            record_indices,
             ..
-        } = commit;
+        } = batch;
 
         let DecodedRecords::Typed(typed) = records;
         let logs = typed
@@ -99,24 +99,7 @@ impl Sink for ClickHouseSink {
                 ))
             })?;
 
-        let selected: Vec<DecodedLogRecord> = match record_indices.as_deref() {
-            Some(indices) => indices
-                .iter()
-                .map(|&i| {
-                    logs.records()
-                        .get(i as usize)
-                        .cloned()
-                        .ok_or_else(|| {
-                            fatal(format!(
-                                "ClickHouseSink: record_indices contains out-of-range index {i} (records.len() = {})",
-                                logs.records().len()
-                            ))
-                        })
-                })
-                .collect::<Result<Vec<_>, _>>()?,
-            None => logs.records().to_vec(),
-        };
-
+        let selected = logs.records().to_vec();
         let bytes: usize = selected.iter().map(|r| r.approx_size_bytes()).sum();
         let group = CommitGroupBatch {
             records: selected,

@@ -1,22 +1,22 @@
 //! Per-source ack coordinator skeleton.
 //!
-//! Phase 4.2 ships a single-route skeleton with `mark_route_committed`
-//! only — fanout count of exactly 1 (one route per source, mirroring
-//! the current ClickHouse logs path). Phase 5 expands this into the
-//! full state machine (RFC 0002 rev 5 §Per-Source Ack Coordinator):
-//! pending-range tracking, multi-route fanout, replay-on-restart via
-//! `check_committed`, the documented flush policy.
+//! Phase 4.4c-0 aligns this to the RFC 0002 rev 6 single-sink
+//! surface: `register_pending(range)` / `mark_committed(range)` /
+//! `frontier()`. The Phase 4 implementation tracks a single
+//! contiguous frontier (matching the current ClickHouse logs flow,
+//! which writes ranges in order). Phase 5 expands the coordinator
+//! into the full pending-ranges + out-of-order completion +
+//! multi-source isolation state machine RFC 0002 rev 6 §Per-Source
+//! Ack Coordinator describes.
 
 use crate::error::{RuntimeError, RuntimeResult};
-use crate::router::RouteId;
 use crate::source::SourceId;
 
 pub struct AckCoordinator {
     source: SourceId,
-    /// Highest sequence whose required routes have all committed.
-    /// `None` until the first route commit lands. Phase 5 replaces
-    /// this with the per-range, per-route map RFC 0002 rev 5
-    /// describes.
+    /// Highest sequence whose configured sink has committed. `None`
+    /// until the first commit lands. Phase 5 replaces this with the
+    /// per-range pending map RFC 0002 rev 6 describes.
     acked_frontier: Option<u64>,
 }
 
@@ -36,16 +36,27 @@ impl AckCoordinator {
         self.acked_frontier
     }
 
-    /// Mark a route committed for the given sequence range. Phase
-    /// 4.2 supports exactly one route per source; multi-route
-    /// fanout (RFC 0002 rev 5 fanout invariant) lands in Phase 5.
-    /// Calls must arrive in monotonic-high order.
-    pub fn mark_route_committed(
+    /// Register a sequence range that has entered the pipeline.
+    /// Phase 4 treats register/commit as a single ordered pair — the
+    /// pipeline is serial, so ranges complete in the order they
+    /// register. Phase 5 replaces this with a pending-range map that
+    /// tolerates out-of-order completion. v1 callers can call this
+    /// for documentation purposes; the Phase 4 frontier advance
+    /// happens entirely inside `mark_committed`.
+    pub fn register_pending(
         &mut self,
-        _route: &RouteId,
         _low_sequence: u64,
-        high_sequence: u64,
+        _high_sequence: u64,
     ) -> RuntimeResult<()> {
+        Ok(())
+    }
+
+    /// Mark the configured sink as having committed the given
+    /// sequence range. Phase 4 requires calls to arrive in monotonic
+    /// `high_sequence` order (the serial pipeline guarantees this);
+    /// Phase 5 tolerates out-of-order completion and only advances
+    /// the contiguous frontier.
+    pub fn mark_committed(&mut self, _low_sequence: u64, high_sequence: u64) -> RuntimeResult<()> {
         if let Some(prev) = self.acked_frontier
             && high_sequence <= prev
         {

@@ -1,4 +1,4 @@
-//! Runtime stage metric name skeleton (RFC 0002 rev 5
+//! Runtime stage metric name skeleton (RFC 0002 rev 6
 //! §Backpressure Model > required metrics).
 //!
 //! Phase 4.2 ships only the canonical metric names plus the label
@@ -12,7 +12,7 @@ pub const STAGE_LATENCY_SECONDS: &str = "runtime_stage_latency_seconds";
 pub const ACK_FRONTIER: &str = "runtime_ack_frontier";
 pub const PENDING_RANGES: &str = "runtime_pending_ranges";
 pub const BACKPRESSURE_REASON: &str = "runtime_backpressure_reason";
-pub const ROUTE_COMMITS_TOTAL: &str = "runtime_route_commits_total";
+pub const SINK_COMMITS_TOTAL: &str = "runtime_sink_commits_total";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BackpressureReason {
@@ -36,14 +36,14 @@ impl BackpressureReason {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum RouteCommitResult {
+pub enum SinkCommitOutcome {
     Committed,
     VerifiedAlreadyCommitted,
     FailedRetryable,
     FailedFatal,
 }
 
-impl RouteCommitResult {
+impl SinkCommitOutcome {
     pub fn as_label(self) -> &'static str {
         match self {
             Self::Committed => "committed",

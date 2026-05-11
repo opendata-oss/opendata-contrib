@@ -1,10 +1,10 @@
-//! Decoded record carrier (RFC 0002 rev 5 §`DecodedBatch`).
+//! Decoded record carrier (RFC 0002 rev 6 §`DecodedBatch`).
 //!
 //! Phase 4.2 ships only the `Typed` variant of `DecodedRecords`; the
 //! `Arrow` variant lands in Phase 7 alongside the columnar
-//! prototype. Records and source-coordinate columns are
-//! reference-counted so multi-route fanout is O(1) Arc clones with
-//! no record copies.
+//! prototype. Records are reference-counted (`Arc<dyn TypedRecords>`)
+//! to keep the typed trait object cheap to move across runtime
+//! stages.
 
 use std::any::Any;
 use std::fmt;
@@ -16,7 +16,7 @@ use crate::source::SourceId;
 /// Schema descriptor exposed by typed records. Phase 7 fleshes this
 /// out alongside the schema/mapping document; Phase 4.2 carries an
 /// opaque name + version pair so trait shapes line up with RFC 0002
-/// rev 5.
+/// rev 6.
 #[derive(Debug, Clone)]
 pub struct TypedSchema {
     pub name: String,
@@ -32,7 +32,7 @@ pub trait TypedRecords: Send + Sync {
 }
 
 /// Phase 4.2 ships only the `Typed` variant. The `Arrow` variant
-/// (RFC 0002 rev 5) lands in Phase 7 alongside the columnar
+/// (RFC 0002 rev 6) lands in Phase 7 alongside the columnar
 /// prototype; once benched, Phase 9 retires `Typed` for OTLP logs.
 #[derive(Clone)]
 pub enum DecodedRecords {
@@ -55,7 +55,7 @@ impl fmt::Debug for DecodedRecords {
 
 /// Source-coordinate columns parallel to records (one entry per
 /// record). Sinks project the subset they materialize into target
-/// system columns (RFC 0002 rev 5 §System Columns and Source
+/// system columns (RFC 0002 rev 6 §System Columns and Source
 /// Coordinates).
 #[derive(Debug, Clone)]
 pub struct SourceCoordinateColumns {

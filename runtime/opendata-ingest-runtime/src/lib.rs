@@ -1,13 +1,12 @@
 //! Sink-neutral ingest runtime.
 //!
-//! Phase 4.2 lands the trait skeletons (`SourceReader`,
-//! `SourceFetchHandle`, `Decoder`, `Router`, `Sink`,
-//! `IdempotencyContract`, `AckCoordinator`) per RFC 0002 rev 5 + the
-//! Phase 4 design doc
-//! `plans/odb-high-throughput/phase04-runtime-extraction-design.md`.
-//! Concrete implementations (`BufferSourceReader`, `OtlpLogsDecoder`,
-//! `ClickHouseSink`) and the orchestration loop land in Phases 4.3
-//! and 4.4.
+//! Phase 4.2 landed the trait skeletons; Phase 4.4c-0 aligned the
+//! crate to RFC 0002 rev 6 (single-sink scope) + rev 8 (concrete
+//! source side). Public trait surface today: `Decoder`, `Sink`,
+//! `IdempotencyContract`. The source side is concrete: the runtime
+//! owns a `BufferSource` + `Clone` `BufferSourceFetchHandle` (lands
+//! in Phase 4.4c). Concrete sink implementations
+//! (`ClickHouseSink`, etc.) live in their own plugin crates.
 //!
 //! Trait methods that v1 cannot reach return
 //! [`error::RuntimeError::Unsupported`]; per the design doc rev 2
@@ -21,6 +20,5 @@ pub mod envelope;
 pub mod error;
 pub mod idempotency;
 pub mod metrics;
-pub mod router;
 pub mod sink;
 pub mod source;

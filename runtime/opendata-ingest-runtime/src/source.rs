@@ -1,17 +1,17 @@
-//! Source side of the runtime contract.
+//! Source-side data types for the runtime.
 //!
-//! `SourceReader` and `SourceFetchHandle` mirror RFC 0003's
-//! `Consumer` / `ConsumerFetchHandle` split: the manifest owner is
-//! `Send + 'static` and mutates ack state through `&mut self`; the
-//! fetch handle is `Send + Sync` and clones across N parallel fetch
-//! workers. Concrete `BufferSourceReader` / `BufferSourceFetchHandle`
-//! impls land in Phase 4.3.
+//! For v1 (RFC 0002 rev 8), the source side is concrete — the
+//! runtime owns a `BufferSource` + `Clone` `BufferSourceFetchHandle`
+//! that wrap `buffer::Consumer` and `buffer::ConsumerFetchHandle`
+//! (RFC 0003). `BufferSource` lands in Phase 4.4c; this file holds
+//! the sink-neutral data types those structs produce
+//! (`SourceId`, `SourceBatchDescriptor`, `SourceBatch`, `SourceEntry`,
+//! `SourceBudget`, `SourceRangeMetadata`) and the
+//! `split_into_raw_entries` materialization helper that converts a
+//! `buffer::ConsumedBatch` into a `SourceBatch`.
 
-use async_trait::async_trait;
 use bytes::Bytes;
 use std::fmt;
-
-use crate::error::RuntimeResult;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SourceId(pub String);
@@ -46,8 +46,8 @@ pub struct SourceRangeMetadata {
 
 /// Backpressure budget the source poller is allowed to consume on a
 /// single `next_descriptors` call. Phase 6 wires reservations end to
-/// end (RFC 0002 rev 5 §Backpressure Model > Byte Budget Accounting);
-/// Phase 4.2 only carries the type so trait shapes match.
+/// end (RFC 0002 rev 6 §Backpressure Model > Byte Budget Accounting);
+/// Phase 4 only carries the type so the call shape matches.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SourceBudget {
     pub bytes_remaining: u64,
@@ -61,7 +61,7 @@ pub struct SourceBatchDescriptor {
     pub location: String,
     pub per_range_metadata: Vec<SourceRangeMetadata>,
     /// Object size in bytes when the source can supply it without an
-    /// extra round trip. Buffer sources pass through
+    /// extra round trip. `BufferSource` passes through
     /// `BatchDescriptor.object_bytes` (RFC 0003), which is `None`
     /// until the manifest format extension lands; the runtime's
     /// budget accounting falls back to
@@ -89,62 +89,6 @@ pub struct SourceBatch {
     pub entries: Vec<SourceEntry>,
 }
 
-/// Manifest-owner side of a source. Mutates ack state, so all
-/// non-`fetch_handle` methods take `&mut self`. The runtime owns one
-/// `SourceReader` per source and drives it from the descriptor
-/// poller and the ack coordinator.
-#[async_trait]
-pub trait SourceReader: Send + 'static {
-    /// Stable identifier for this source; used in metric labels and
-    /// idempotency keys.
-    fn id(&self) -> &SourceId;
-
-    /// Fetch up to `max` new descriptors past the current cursor.
-    /// Must not mutate the durable ack frontier. Returning fewer
-    /// than `max` is allowed and signals "no more visible right
-    /// now"; the runtime sleeps and retries.
-    async fn next_descriptors(
-        &mut self,
-        max: usize,
-        budget: SourceBudget,
-    ) -> RuntimeResult<Vec<SourceBatchDescriptor>>;
-
-    /// Construct a cloneable handle for fetching descriptors
-    /// concurrently. Construction is O(1); the handle holds shared
-    /// references to whatever the source needs (object store
-    /// handle, HTTP client, etc.) and no manifest state.
-    fn fetch_handle(&self) -> Box<dyn SourceFetchHandle>;
-
-    /// Advance the durable ack frontier through (and including)
-    /// `sequence`. Implementations honor the in-order requirement
-    /// of the underlying source; the runtime guarantees monotonic
-    /// advance.
-    async fn ack_through(&mut self, sequence: u64) -> RuntimeResult<()>;
-
-    /// Force the underlying source's durable checkpoint. The
-    /// runtime calls this on flush boundaries.
-    async fn flush_acks(&mut self) -> RuntimeResult<()>;
-}
-
-/// Cloneable, concurrency-safe fetch primitive. The runtime calls
-/// `fetch` from N workers in parallel against distinct descriptors.
-/// Implementations must not touch manifest or ack state here.
-#[async_trait]
-pub trait SourceFetchHandle: Send + Sync {
-    async fn fetch(&self, descriptor: SourceBatchDescriptor) -> RuntimeResult<SourceBatch>;
-
-    /// Object-safe clone. The default `Clone` derive does not work
-    /// across `dyn Trait`; implementations return a new boxed
-    /// handle.
-    fn clone_box(&self) -> Box<dyn SourceFetchHandle>;
-}
-
-impl Clone for Box<dyn SourceFetchHandle> {
-    fn clone(&self) -> Self {
-        self.clone_box()
-    }
-}
-
 /// Apply the per-range metadata items in a `buffer::ConsumedBatch` to
 /// each record index, producing a flat list of [`SourceEntry`]s.
 ///
@@ -154,9 +98,10 @@ impl Clone for Box<dyn SourceFetchHandle> {
 /// Ranges are emitted in order, so we can scan in lockstep with the
 /// entries.
 ///
-/// Phase 4.3 moves this from `clickhouse-ingestor::source`. The
-/// `BufferSourceFetchHandle` impl in Phase 4.4 calls this to convert
-/// the underlying `buffer::ConsumedBatch` into a [`SourceBatch`].
+/// Phase 4.3 moved this from `clickhouse-ingestor::source`. The
+/// `BufferSourceFetchHandle::fetch` impl in Phase 4.4 calls this to
+/// convert each underlying `buffer::ConsumedBatch` into a
+/// [`SourceBatch`].
 pub fn split_into_raw_entries(
     batch: buffer::ConsumedBatch,
     source: SourceId,

@@ -1,9 +1,9 @@
-//! Sink trait (RFC 0002 rev 5 §`Sink`).
+//! Sink trait (RFC 0002 rev 6 §`Sink`).
 //!
-//! `Sink::write` is the route-level commit unit: one call covers the
-//! entire (source range, route) pair. `Ok(_)` means the full
-//! commit is durable; retry of the same `SinkCommit` must be
-//! idempotent. The runtime branches on `SinkCommitFailure`:
+//! `Sink::write` is the source-range commit unit: one call covers
+//! one source sequence range for the configured sink. `Ok(_)` means
+//! the full commit is durable; retry of the same `SinkCommit` must
+//! be idempotent. The runtime branches on `SinkCommitFailure`:
 //! `MaybeCommitted` triggers a `check_committed` lookup before
 //! retry; `NotCommitted` retries directly; `Fatal` halts. That
 //! resolution is wired in the orchestrator (Phase 4.4 `runtime.rs`);
@@ -11,12 +11,10 @@
 
 use async_trait::async_trait;
 use std::fmt;
-use std::sync::Arc;
 
-use crate::decoded_batch::{DecodedRecords, SourceCoordinateColumns};
+use crate::decoded_batch::DecodedBatch;
 use crate::error::{BoxError, RuntimeResult};
-use crate::idempotency::{IdempotencyKey, SchemaVersion};
-use crate::router::RouteId;
+use crate::idempotency::IdempotencyKey;
 use crate::source::SourceId;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -41,7 +39,7 @@ impl From<&str> for SinkId {
 }
 
 /// Maximum bytes-in-flight the runtime should hold for this sink
-/// before pausing upstream pulls (RFC 0002 rev 5 §Backpressure
+/// before pausing upstream pulls (RFC 0002 rev 6 §Backpressure
 /// Model). Phase 6 wires it; Phase 4.2 carries the type.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SinkBudget {
@@ -49,23 +47,23 @@ pub struct SinkBudget {
     pub max_concurrent_commits: u32,
 }
 
+/// One source-range commit unit for the configured sink (RFC 0002
+/// rev 6). The runtime issues exactly one `Sink::write(commit)` per
+/// `(source, low..=high)` range at a time; `Ok(_)` means the entire
+/// range committed, and retry of the same `SinkCommit` is idempotent.
+///
+/// `source`, `low_sequence`, and `high_sequence` mirror `batch`'s
+/// own fields for sink-side ergonomics (logging, metrics) so sinks
+/// don't have to reach into the batch for routine attributes. The
+/// runtime guarantees the duplicated fields stay consistent.
 #[derive(Debug)]
 pub struct SinkCommit {
     pub source: SourceId,
-    pub route: RouteId,
+    pub sink: SinkId,
     pub low_sequence: u64,
     pub high_sequence: u64,
-    pub schema_version: SchemaVersion,
+    pub batch: DecodedBatch,
     pub idempotency_key: IdempotencyKey,
-    /// O(1) Arc clone of the decoder's output. Multiple
-    /// `SinkCommit`s for the same range (one per route) all share
-    /// the same underlying records.
-    pub records: DecodedRecords,
-    /// Same: shared via Arc across all routes for this range.
-    pub source_columns: Arc<SourceCoordinateColumns>,
-    /// If the route assignment selected a record subset, the
-    /// indices into `records`. `None` means "every record."
-    pub record_indices: Option<Arc<Vec<u32>>>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -131,12 +129,11 @@ pub trait Sink: Send + Sync + 'static {
 
     fn write_budget(&self) -> SinkBudget;
 
-    /// Commit one route-level unit (the whole `SinkCommit` for one
-    /// range × one route). Returns `Ok` only when the full commit
-    /// is durable per RFC 0002 rev 5; returns the appropriate
-    /// `SinkCommitFailure` variant otherwise. The runtime is
-    /// allowed to retry the same `SinkCommit` after a non-fatal
-    /// failure; implementations must keep retry idempotent.
+    /// Commit one source-range unit for the configured sink. Returns
+    /// `Ok` only when the full commit is durable per RFC 0002 rev 6;
+    /// returns the appropriate `SinkCommitFailure` variant otherwise.
+    /// The runtime is allowed to retry the same `SinkCommit` after a
+    /// non-fatal failure; implementations must keep retry idempotent.
     async fn write(&self, commit: SinkCommit) -> Result<SinkCommitResult, SinkCommitFailure>;
 
     /// Inspect prior commit state for a given idempotency key. The

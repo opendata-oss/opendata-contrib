@@ -1,14 +1,14 @@
-//! Idempotency key construction (RFC 0002 rev 5 §`IdempotencyContract`).
+//! Idempotency key construction (RFC 0002 rev 6 §`IdempotencyContract`).
 //!
-//! The runtime-level key identifies a single (source range, route)
-//! commit. Sinks that internally chunk (ClickHouse insert chunks,
-//! Iceberg Parquet files) construct their own per-chunk identifiers
-//! by appending a sink-internal index — that suffix is the sink's
-//! concern, not the runtime's.
+//! The runtime-level key identifies a single source-range commit
+//! against the configured sink. Sinks that internally chunk
+//! (ClickHouse insert chunks, Iceberg Parquet files) construct their
+//! own per-chunk identifiers by appending a sink-internal index —
+//! that suffix is the sink's concern, not the runtime's.
 
 use std::fmt;
 
-use crate::router::RouteId;
+use crate::sink::SinkId;
 use crate::source::SourceId;
 
 /// Schema version handed to sinks for idempotency-key construction
@@ -35,7 +35,7 @@ impl fmt::Display for IdempotencyKey {
 #[derive(Debug, Clone, Copy)]
 pub struct IdempotencyScope<'a> {
     pub source: &'a SourceId,
-    pub route: &'a RouteId,
+    pub sink: &'a SinkId,
     pub low_sequence: u64,
     pub high_sequence: u64,
     pub schema_version: SchemaVersion,
@@ -52,8 +52,8 @@ pub trait IdempotencyContract: Send + Sync {
     fn key(&self, scope: IdempotencyScope<'_>) -> IdempotencyKey;
 }
 
-/// RFC 0002 rev 5 default key shape:
-/// `{source}:{route}:{low}-{high}:{schema_version}:{chunking_fingerprint:016x}`.
+/// RFC 0002 rev 6 default key shape:
+/// `{source}:{sink}:{low}-{high}:{schema_version}:{chunking_fingerprint:016x}`.
 pub struct DefaultIdempotencyContract;
 
 impl IdempotencyContract for DefaultIdempotencyContract {
@@ -61,7 +61,7 @@ impl IdempotencyContract for DefaultIdempotencyContract {
         IdempotencyKey(format!(
             "{}:{}:{}-{}:{}:{:016x}",
             scope.source,
-            scope.route,
+            scope.sink,
             scope.low_sequence,
             scope.high_sequence,
             scope.schema_version,
