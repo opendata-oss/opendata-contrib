@@ -214,6 +214,90 @@ async fn fixture(store: Arc<dyn ObjectStore>, manifest_path: &str, data_prefix: 
     Fixture { producer, source }
 }
 
+/// Scripted response from `ProgrammableSink::write`. The test pushes a
+/// queue of these and the sink pops one per `write` call. The full
+/// variant set is exposed so future tests (Phase 5 correctness
+/// harness) can script every `SinkCommitFailure` shape.
+#[derive(Clone)]
+#[allow(dead_code)]
+enum ScriptedWrite {
+    Ok { rows_written: u64 },
+    MaybeCommitted { message: String },
+    NotCommitted { message: String },
+    Fatal { message: String },
+}
+
+/// Sink that consumes a scripted sequence of `write` responses and
+/// returns a configured `check_committed` answer. Records every
+/// `write` call and every `check_committed` call so a test can
+/// assert the runtime's `MaybeCommitted → check_committed → retry`
+/// protocol.
+#[derive(Clone)]
+struct ProgrammableSink {
+    id: SinkId,
+    write_script: Arc<Mutex<std::collections::VecDeque<ScriptedWrite>>>,
+    write_calls: Arc<Mutex<Vec<u64>>>,
+    check_committed_response: CommitStatus,
+    check_committed_calls: Arc<Mutex<Vec<String>>>,
+}
+
+impl ProgrammableSink {
+    fn new(
+        id: impl Into<SinkId>,
+        script: Vec<ScriptedWrite>,
+        check_committed_response: CommitStatus,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            write_script: Arc::new(Mutex::new(script.into())),
+            write_calls: Arc::new(Mutex::new(Vec::new())),
+            check_committed_response,
+            check_committed_calls: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+}
+
+#[async_trait]
+impl Sink for ProgrammableSink {
+    fn id(&self) -> &SinkId {
+        &self.id
+    }
+    fn write_budget(&self) -> SinkBudget {
+        SinkBudget::default()
+    }
+    async fn write(&self, commit: SinkCommit) -> Result<SinkCommitResult, SinkCommitFailure> {
+        self.write_calls.lock().unwrap().push(commit.high_sequence);
+        let next = self
+            .write_script
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or(ScriptedWrite::Fatal {
+                message: "ProgrammableSink: script exhausted".into(),
+            });
+        match next {
+            ScriptedWrite::Ok { rows_written } => Ok(SinkCommitResult {
+                bytes_written: 0,
+                rows_written,
+            }),
+            ScriptedWrite::MaybeCommitted { message } => {
+                Err(SinkCommitFailure::MaybeCommitted(message.into()))
+            }
+            ScriptedWrite::NotCommitted { message } => {
+                Err(SinkCommitFailure::NotCommitted(message.into()))
+            }
+            ScriptedWrite::Fatal { message } => Err(SinkCommitFailure::Fatal(message.into())),
+        }
+    }
+    async fn check_committed(&self, key: &IdempotencyKey) -> RuntimeResult<CommitStatus> {
+        self.check_committed_calls
+            .lock()
+            .unwrap()
+            .push(key.to_string());
+        Ok::<CommitStatus, RuntimeError>(self.check_committed_response)
+    }
+}
+
 fn options(dry_run: bool) -> RuntimeOptions {
     RuntimeOptions {
         configured_envelope: ConfiguredEnvelope {
@@ -622,6 +706,195 @@ async fn live_mode_writes_to_sink_and_advances_ack_frontier() {
         let expected_key = format!("buffer:fake-sink:{i}-{i}:1:0000000000000000");
         assert_eq!(c.idempotency_key, expected_key);
     }
+
+    producer.close().await.expect("close producer");
+}
+
+/// Phase 4 review (round 2) coverage gap. The runtime branches on
+/// `SinkCommitFailure::MaybeCommitted` by calling
+/// `Sink::check_committed`; if the sink reports `Committed`, the
+/// runtime must NOT issue a second `write` and the ack frontier
+/// must still advance. Verifies the RFC 0002 rev 6 §`Sink` rule
+/// that an ambiguous prior write whose commit is later confirmed
+/// is treated as a successful commit.
+#[tokio::test]
+async fn runtime_treats_maybe_committed_then_committed_as_success() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let fixture = fixture(
+        Arc::clone(&store),
+        "ingest/test/maybe-committed-then-committed/manifest",
+        "ingest/test/maybe-committed-then-committed/data",
+    )
+    .await;
+    let Fixture { producer, source } = fixture;
+
+    producer
+        .produce(vec![Bytes::from_static(b"payload")], logs_envelope())
+        .await
+        .expect("produce");
+    producer.flush().await.expect("flush");
+
+    let sink = ProgrammableSink::new(
+        "programmable",
+        vec![ScriptedWrite::MaybeCommitted {
+            message: "ambiguous insert; prior attempt may have committed".into(),
+        }],
+        CommitStatus::Committed,
+    );
+    let write_calls = Arc::clone(&sink.write_calls);
+    let check_calls = Arc::clone(&sink.check_committed_calls);
+
+    let mut opts = options(false);
+    // Allow at most one retry so the test surfaces a failure if the
+    // runtime ignores the Committed signal and retries the write.
+    opts.max_retry_attempts = 3;
+    let runtime = Runtime::builder()
+        .add_source(source)
+        .add_decoder(FakeDecoder::permissive())
+        .set_sink(sink)
+        .with_options(opts)
+        .build()
+        .expect("build");
+    let mut progress_rx = runtime.progress();
+
+    let shutdown = CancellationToken::new();
+    let runtime_shutdown = shutdown.clone();
+    let handle = tokio::spawn(async move { runtime.run(runtime_shutdown).await });
+
+    let p = timeout(Duration::from_secs(5), async {
+        loop {
+            progress_rx
+                .changed()
+                .await
+                .expect("progress channel closed");
+            let p = *progress_rx.borrow();
+            if p.last_acked_sequence == Some(0) {
+                return p;
+            }
+        }
+    })
+    .await
+    .expect("ack frontier never advanced");
+
+    assert_eq!(
+        p.last_acked_sequence,
+        Some(0),
+        "ack frontier must advance once check_committed → Committed"
+    );
+
+    shutdown.cancel();
+    handle
+        .await
+        .expect("runtime task join")
+        .expect("runtime exited cleanly");
+
+    let writes = write_calls.lock().unwrap().clone();
+    let checks = check_calls.lock().unwrap().clone();
+    assert_eq!(
+        writes.len(),
+        1,
+        "runtime must NOT retry write after Committed; got writes={writes:?}"
+    );
+    assert_eq!(
+        checks.len(),
+        1,
+        "runtime must call check_committed exactly once for the MaybeCommitted; got checks={checks:?}"
+    );
+
+    producer.close().await.expect("close producer");
+}
+
+/// Phase 4 review (round 2) coverage gap. The other half of the
+/// MaybeCommitted protocol: when `check_committed` returns
+/// `Unknown` (the ClickHouse default — its short-window dedupe
+/// token has expired by the time the runtime asks), the runtime
+/// treats Unknown like NotCommitted and retries the write. RFC
+/// 0002 rev 6 §`Sink::SinkCommitFailure`: "treats Unknown like
+/// NotCommitted for retry; relies on table-level dedupe".
+#[tokio::test]
+async fn runtime_retries_write_after_maybe_committed_when_check_returns_unknown() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let fixture = fixture(
+        Arc::clone(&store),
+        "ingest/test/maybe-committed-then-unknown/manifest",
+        "ingest/test/maybe-committed-then-unknown/data",
+    )
+    .await;
+    let Fixture { producer, source } = fixture;
+
+    producer
+        .produce(vec![Bytes::from_static(b"payload")], logs_envelope())
+        .await
+        .expect("produce");
+    producer.flush().await.expect("flush");
+
+    let sink = ProgrammableSink::new(
+        "programmable",
+        vec![
+            ScriptedWrite::MaybeCommitted {
+                message: "ambiguous insert".into(),
+            },
+            ScriptedWrite::Ok { rows_written: 1 },
+        ],
+        CommitStatus::Unknown,
+    );
+    let write_calls = Arc::clone(&sink.write_calls);
+    let check_calls = Arc::clone(&sink.check_committed_calls);
+
+    let mut opts = options(false);
+    opts.max_retry_attempts = 3;
+    let runtime = Runtime::builder()
+        .add_source(source)
+        .add_decoder(FakeDecoder::permissive())
+        .set_sink(sink)
+        .with_options(opts)
+        .build()
+        .expect("build");
+    let mut progress_rx = runtime.progress();
+
+    let shutdown = CancellationToken::new();
+    let runtime_shutdown = shutdown.clone();
+    let handle = tokio::spawn(async move { runtime.run(runtime_shutdown).await });
+
+    let p = timeout(Duration::from_secs(5), async {
+        loop {
+            progress_rx
+                .changed()
+                .await
+                .expect("progress channel closed");
+            let p = *progress_rx.borrow();
+            if p.last_acked_sequence == Some(0) {
+                return p;
+            }
+        }
+    })
+    .await
+    .expect("ack frontier never advanced");
+
+    assert_eq!(p.last_acked_sequence, Some(0));
+    // The Ok response carried rows_written=1; runtime should pick it
+    // up from the SinkCommitResult after the retry, not from the
+    // decoded count.
+    assert_eq!(p.records_written, 1);
+
+    shutdown.cancel();
+    handle
+        .await
+        .expect("runtime task join")
+        .expect("runtime exited cleanly");
+
+    let writes = write_calls.lock().unwrap().clone();
+    let checks = check_calls.lock().unwrap().clone();
+    assert_eq!(
+        writes.len(),
+        2,
+        "runtime must retry write once after Unknown; got writes={writes:?}"
+    );
+    assert_eq!(
+        checks.len(),
+        1,
+        "runtime must call check_committed exactly once for the MaybeCommitted; got checks={checks:?}"
+    );
 
     producer.close().await.expect("close producer");
 }
