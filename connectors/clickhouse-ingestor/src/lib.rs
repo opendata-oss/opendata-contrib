@@ -1,43 +1,43 @@
-//! `clickhouse-ingestor` — reusable Rust runtime that consumes OpenData
-//! Buffer batches and writes them into ClickHouse.
+//! `clickhouse-ingestor` — binary crate that wires the sink-neutral
+//! `opendata-ingest-runtime` runtime to the OTel logs decoder and the
+//! ClickHouse sink plugin.
 //!
-//! Layered following RFC 0003:
+//! Phase 4 refactored the runtime out of this crate; the binary now
+//! constructs:
 //!
 //! ```text
-//! BufferConsumerRuntime
-//!   -> MetadataEnvelopeDecoder    (per-entry envelope parsing)
-//!   -> SignalDecoder              (e.g. OtlpLogsDecoder)
-//!   -> CommitGroup                (coalesce records across batches)
-//!   -> Adapter                    (e.g. OtlpLogsClickHouseAdapter)
-//!      -> Vec<InsertChunk>        (deterministic chunking, per-chunk token)
-//!   -> ClickHouseWriter           (sync inserts, classified retry)
-//!   -> AckController              (range ack, flush)
+//! Runtime::builder()
+//!     .add_source(BufferSource::new(buffer::Consumer, ...))
+//!     .add_decoder(OtlpLogsDecoder::new())        // opendata-ingest-otel
+//!     .set_sink(ClickHouseSink::new(...))         // opendata-ingest-clickhouse
+//!     .with_options(...)
+//!     .build()?
+//!     .run(shutdown_token).await
 //! ```
 //!
-//! Phase 4.3 moved source-batch / envelope / commit-group concepts into
-//! `opendata-ingest-runtime`. Phase 4.4a moves the OTLP logs decoder
-//! into `opendata-ingest-otel` and the ClickHouse adapter + writer into
-//! `opendata-ingest-clickhouse`. They are re-exported under their
-//! existing top-level paths so the binary, integration tests, and any
-//! external dependent on the alpha keep their imports stable through
-//! Phase 4. Phase 4.4c rewires the binary onto `Runtime::builder` and
-//! retires the transitional `SignalDecoder` trait + `BufferConsumerRuntime`.
+//! This crate keeps the binary's wiring: config loading, metrics
+//! recorder install, signal handling, metrics HTTP server. The
+//! re-exports below let the existing integration tests
+//! (`tests/clickhouse_round_trip.rs`) import legacy names
+//! (`OtlpLogsClickHouseAdapter`, `ClickHouseWriter`,
+//! `OtlpLogsDecoder`, `DecodedLogRecord`, `InsertChunk`, etc.)
+//! through `clickhouse_ingestor::` so the rewrite is import-only
+//! when the tests get ported.
 
-pub mod ack;
 pub mod bench;
 pub mod config;
 pub mod error;
 pub mod metrics;
 pub mod metrics_server;
-pub mod runtime;
-pub mod signal;
 
 pub use opendata_ingest_clickhouse::{adapter, writer};
+pub use opendata_ingest_otel::logs as signal;
 pub use opendata_ingest_runtime::{commit_group, envelope, source};
 
-pub use ack::{AckController, AckFlushPolicy};
 pub use adapter::logs::{LogsAdapterConfig, OtlpLogsClickHouseAdapter, logs_table_ddl};
-pub use adapter::{Adapter, ClickHouseSettings, InsertChunk, RowValue};
+pub use adapter::{
+    Adapter, AdapterError, AdapterResult, ClickHouseSettings, InsertChunk, RowValue,
+};
 pub use commit_group::{CommitGroup, CommitGroupBatch, CommitGroupThresholds};
 pub use config::IngestorConfig;
 pub use envelope::{
@@ -45,9 +45,9 @@ pub use envelope::{
     decode_envelopes, validate_consistent,
 };
 pub use error::{IngestorError, IngestorResult};
-pub use runtime::{BufferConsumerRuntime, RuntimeOptions};
+pub use opendata_ingest_clickhouse::ClickHouseSink;
 pub use signal::{
-    DecodedLogRecord, DecodedLogs, OtlpLogsDecoder, SignalDecoder, SourceCoordinates,
+    DecodedLogRecord, DecodedLogs, OtelDecodeError, OtlpLogsDecoder, SourceCoordinates,
 };
 pub use source::{SourceBatch, SourceEntry, split_into_raw_entries};
 pub use writer::{ClickHouseWriter, WriterError, WriterErrorClass};

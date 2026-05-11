@@ -48,11 +48,11 @@ use figment::Figment;
 use figment::providers::{Env, Format, Yaml};
 use serde::{Deserialize, Serialize};
 
-use crate::ack::AckFlushPolicy;
 use crate::adapter::logs::LogsAdapterConfig;
 use crate::commit_group::CommitGroupThresholds;
 use crate::error::{IngestorError, IngestorResult};
 use crate::writer::WriterConfig;
+use opendata_ingest_runtime::runtime::AckFlushPolicy;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IngestorConfig {

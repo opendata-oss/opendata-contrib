@@ -22,10 +22,7 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use clap::Parser;
 use clickhouse_ingestor::metrics_server;
-use clickhouse_ingestor::{
-    AckFlushPolicy as LegacyAckFlushPolicy, ClickHouseWriter, IngestorConfig,
-    OtlpLogsClickHouseAdapter,
-};
+use clickhouse_ingestor::{ClickHouseWriter, IngestorConfig, OtlpLogsClickHouseAdapter};
 use metrics_exporter_prometheus::PrometheusBuilder;
 use opendata_ingest_clickhouse::ClickHouseSink;
 use opendata_ingest_otel::logs::OtlpLogsDecoder;
@@ -136,10 +133,7 @@ async fn main() -> Result<()> {
             signal_type: SignalType::Logs,
             encoding: PayloadEncoding::OtlpProtobuf,
         },
-        ack_flush_policy: match cfg.ack_flush_policy() {
-            LegacyAckFlushPolicy::EveryCommitGroup => AckFlushPolicy::EveryCommitGroup,
-            LegacyAckFlushPolicy::EveryN { n } => AckFlushPolicy::EveryN { n },
-        },
+        ack_flush_policy: cfg.ack_flush_policy(),
         dry_run: cfg.runtime.dry_run,
         poll_interval: std::time::Duration::from_millis(cfg.runtime.poll_interval_ms),
         max_descriptors_per_poll: 1,

@@ -1,17 +1,14 @@
-//! Top-level error type for the ingestor pipeline.
+//! Top-level error type for the ingestor binary's wiring code.
 //!
-//! Layer-specific error types (envelope, signal decoder, adapter, writer)
-//! all flow into [`IngestorError`] so the runtime loop can dispatch on a
-//! single error shape.
+//! Phase 4 retired the in-tree runtime; this error enum used to be
+//! the dispatch point for the serial runtime loop. After 4.4e it
+//! shrinks to just the variants the config loader and integration
+//! tests still spell.
 
-use opendata_ingest_clickhouse::AdapterError;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum IngestorError {
-    #[error("buffer error: {0}")]
-    Buffer(#[from] buffer::Error),
-
     #[error("metadata envelope: {0}")]
     Envelope(#[from] crate::envelope::EnvelopeError),
 
@@ -32,12 +29,6 @@ pub enum IngestorError {
 
     #[error("{0}")]
     Other(String),
-}
-
-impl From<AdapterError> for IngestorError {
-    fn from(e: AdapterError) -> Self {
-        IngestorError::Adapter(e.to_string())
-    }
 }
 
 pub type IngestorResult<T> = Result<T, IngestorError>;
