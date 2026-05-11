@@ -886,3 +886,186 @@ async fn replay_after_crash_after_commit_before_flush_idempotently_completes() {
 
     fx.producer.close().await.expect("close producer");
 }
+
+/// Crash semantics (3): crash mid-`MaybeCommitted` resolution.
+///
+/// `Sink::write` returns `MaybeCommitted`; the runtime enters
+/// the resolution path and calls `Sink::check_committed`. The
+/// gate (`block_until_released(also_gate_write: false)`) parks
+/// the runtime inside `check_committed`. The test awaits
+/// `wait_for_entry().await` and calls `JoinHandle::abort()`.
+///
+/// No in-memory state about the MaybeCommitted attempt is
+/// persisted across the crash (design Q1 decision). On replay,
+/// the runtime re-issues `write` against the fresh sink which
+/// is scripted `[Ok]`. The sink's idempotency contract
+/// (INV-SINK-RETRY-IDEMPOTENT) is what keeps durable state
+/// correct in production; here we observe it through the
+/// captured IdempotencyKey on both attempts.
+#[tokio::test]
+async fn replay_after_maybe_committed_unresolved_resolves_via_check_committed_on_restart() {
+    let manifest_path = "ingest/test/maybe-committed-crash/manifest";
+    let data_prefix = "ingest/test/maybe-committed-crash/data";
+
+    let fx = in_memory_buffer_source(manifest_path, data_prefix).await;
+    let store = Arc::clone(&fx.store);
+    fx.producer
+        .produce(vec![Bytes::from_static(b"payload")], logs_envelope())
+        .await
+        .expect("produce");
+    fx.producer.flush().await.expect("flush");
+
+    // ----- Runtime A: write → MaybeCommitted → parked in check_committed. -----
+    let sink_a = ProgrammableSink::new(
+        SinkId::from("programmable"),
+        vec![ScriptedWrite::MaybeCommitted {
+            message: "ambiguous".into(),
+        }],
+        CommitStatus::Unknown,
+    );
+    let writes_a = Arc::clone(&sink_a.write_calls);
+    let check_calls_a = Arc::clone(&sink_a.check_committed_calls);
+    let block = sink_a.block_until_released(false);
+
+    let runtime_a = Runtime::builder()
+        .add_source(fx.source)
+        .add_decoder(FakeDecoder::permissive())
+        .set_sink(sink_a)
+        .with_options(live_options())
+        .build()
+        .expect("build A");
+
+    let handle_a = tokio::spawn(async move {
+        let _ = runtime_a.run(CancellationToken::new()).await;
+    });
+
+    timeout(Duration::from_secs(5), block.wait_for_entry())
+        .await
+        .expect("A never parked at check_committed gate");
+    assert_eq!(
+        block.entered_count(),
+        1,
+        "check_committed must have been called exactly once before abort"
+    );
+
+    handle_a.abort();
+    let _ = handle_a.await;
+    drop(block); // release no-op (A is gone)
+
+    // Sanity: A's sink saw exactly one write + one
+    // check_committed call before the abort.
+    assert_eq!(writes_a.lock().unwrap().len(), 1);
+    assert_eq!(check_calls_a.lock().unwrap().len(), 1);
+    let key_a = writes_a.lock().unwrap()[0].idempotency_key.clone();
+
+    // ----- Runtime B: replay on same store. -----
+    let source_b =
+        buffer_source_on_store(Arc::clone(&store), manifest_path, data_prefix, None).await;
+    let sink_b = ProgrammableSink::new(
+        SinkId::from("programmable"),
+        vec![ScriptedWrite::Ok { rows_written: 1 }],
+        CommitStatus::Unknown,
+    );
+    let writes_b = Arc::clone(&sink_b.write_calls);
+
+    let runtime_b = Runtime::builder()
+        .add_source(source_b)
+        .add_decoder(FakeDecoder::permissive())
+        .set_sink(sink_b)
+        .with_options(live_options())
+        .build()
+        .expect("build B");
+    let mut progress_b = runtime_b.progress();
+
+    let shutdown_b = CancellationToken::new();
+    let shutdown_b_run = shutdown_b.clone();
+    let handle_b = tokio::spawn(async move { runtime_b.run(shutdown_b_run).await });
+
+    timeout(Duration::from_secs(5), async {
+        loop {
+            progress_b.changed().await.expect("progress");
+            if progress_b.borrow().last_acked_sequence == Some(0) {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("B never advanced ack frontier");
+
+    shutdown_b.cancel();
+    handle_b
+        .await
+        .expect("B task join")
+        .expect("B exited cleanly");
+
+    let writes_b_snapshot = writes_b.lock().unwrap().clone();
+    assert_eq!(writes_b_snapshot.len(), 1);
+    assert_eq!(writes_b_snapshot[0].high_sequence, 0);
+    assert_eq!(
+        writes_b_snapshot[0].idempotency_key, key_a,
+        "INV-SINK-RETRY-IDEMPOTENT: replay reuses A's key"
+    );
+
+    fx.producer.close().await.expect("close producer");
+}
+
+/// INV-MULTISOURCE-ISOLATION end-to-end at the registry level.
+/// Phase 5's `Runtime` is single-source, so this test drives
+/// `AckCoordinators` directly with a synthetic register/commit
+/// driver. Phase 6 row 6.7 will rerun the equivalent assertion
+/// through a multi-source `Runtime`.
+#[tokio::test]
+async fn multi_source_runtime_ack_isolation() {
+    use opendata_ingest_runtime::ack_coordinator::AckCoordinators;
+    use opendata_ingest_runtime::source::SourceId;
+
+    let source_a = SourceId::from("source-a");
+    let source_b = SourceId::from("source-b");
+
+    let mut reg = AckCoordinators::new();
+    reg.register_source(source_a.clone(), None).unwrap();
+    reg.register_source(source_b.clone(), None).unwrap();
+
+    // Drive source A through ranges 0..=2.
+    let a = reg.get_mut(&source_a).unwrap();
+    for i in 0..=2u64 {
+        a.register_pending(i, i).unwrap();
+        a.mark_committed(i, i).unwrap();
+        a.advance_frontier();
+    }
+    assert_eq!(reg.get(&source_a).unwrap().frontier(), Some(2));
+
+    // Source B has not seen anything yet.
+    assert_eq!(reg.get(&source_b).unwrap().frontier(), None);
+    assert_eq!(reg.get(&source_b).unwrap().pending_count(), 0);
+
+    // Drive source B through ranges 100..=101 (out-of-order
+    // commit: 101 first, then 100 — exercise that A's frontier
+    // is unaffected even when B is partially complete).
+    let b = reg.get_mut(&source_b).unwrap();
+    b.register_pending(100, 100).unwrap();
+    b.register_pending(101, 101).unwrap();
+    b.mark_committed(101, 101).unwrap();
+    b.advance_frontier();
+    // B's frontier waits on 100; A's frontier is unchanged.
+    assert_eq!(reg.get(&source_b).unwrap().frontier(), None);
+    assert_eq!(
+        reg.get(&source_a).unwrap().frontier(),
+        Some(2),
+        "B's partial completion must not regress or change A's frontier"
+    );
+
+    // Fill B's hole.
+    let b = reg.get_mut(&source_b).unwrap();
+    b.mark_committed(100, 100).unwrap();
+    b.advance_frontier();
+    assert_eq!(reg.get(&source_b).unwrap().frontier(), Some(101));
+    // A is still where it was.
+    assert_eq!(reg.get(&source_a).unwrap().frontier(), Some(2));
+
+    // Aggregate accounting.
+    assert_eq!(reg.pending_total(), 0);
+    let frontiers: Vec<(String, Option<u64>)> =
+        reg.frontiers().map(|(id, f)| (id.to_string(), f)).collect();
+    assert_eq!(frontiers.len(), 2);
+}
