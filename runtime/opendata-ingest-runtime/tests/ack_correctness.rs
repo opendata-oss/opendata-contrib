@@ -22,7 +22,8 @@ use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
 use support::{
-    FakeDecoder, ProgrammableSink, ScriptedWrite, in_memory_buffer_source, logs_envelope,
+    FakeDecoder, ProgrammableSink, ScriptedWrite, buffer_source_on_store, in_memory_buffer_source,
+    logs_envelope,
 };
 
 fn live_options() -> RuntimeOptions {
@@ -471,4 +472,168 @@ async fn runtime_retry_budget_exhaustion_does_not_ack_failing_range() {
 
     let _ = shutdown;
     fx.producer.close().await.expect("close producer");
+}
+
+/// INV-FENCE-ABORTS-DURABLE-ACK. When the underlying
+/// `buffer::Consumer` returns `buffer::Error::Fenced` from a
+/// manifest-modifying call (`ack`, `flush`, `next_batch`),
+/// `BufferSource` surfaces it as `RuntimeError::Source(_)`,
+/// the runtime task exits, and **no durable Buffer manifest
+/// update is advanced by the fenced runtime**. Replay through
+/// the new (un-fenced) consumer is idempotent via
+/// INV-SINK-RETRY-IDEMPOTENT.
+///
+/// Choreography (rev 6 §Test Plan > Runtime integration tests
+/// row for this test). Every `Consumer::with_object_store` calls
+/// `initialize()` which fences any prior consumer, so we use a
+/// SINGLE replacement consumer B that both bumps the epoch
+/// (fencing A) AND drives replay. The durable-state proof is in
+/// the replay runtime's own behavior — `sink_b.write_calls[0]`
+/// for sequence 0 + matching `IdempotencyKey` across A's and B's
+/// commits. No out-of-band `next_descriptors` call on
+/// `BufferSource(B)`: that would dequeue sequence 0 from B's
+/// cursor and the replay runtime would never see it.
+#[tokio::test]
+async fn runtime_fence_aborts_durable_ack_with_source_error() {
+    let manifest_path = "ingest/test/fence-abort/manifest";
+    let data_prefix = "ingest/test/fence-abort/data";
+
+    // Set up the in-memory store + producer + Consumer A's
+    // BufferSource. The store stays alive for B's BufferSource.
+    let fx_a = in_memory_buffer_source(manifest_path, data_prefix).await;
+    let store = Arc::clone(&fx_a.store);
+    fx_a.producer
+        .produce(vec![Bytes::from_static(b"payload")], logs_envelope())
+        .await
+        .expect("produce");
+    fx_a.producer.flush().await.expect("flush");
+
+    // Gate A's first Sink::write. The gate stays engaged
+    // until `block` is dropped.
+    let sink_a = ProgrammableSink::new(
+        SinkId::from("programmable"),
+        vec![ScriptedWrite::Ok { rows_written: 1 }],
+        CommitStatus::Unknown,
+    );
+    let writes_a = Arc::clone(&sink_a.write_calls);
+    let block = sink_a.block_until_released(true);
+
+    let runtime_a = Runtime::builder()
+        .add_source(fx_a.source)
+        .add_decoder(FakeDecoder::permissive())
+        .set_sink(sink_a)
+        .with_options(live_options())
+        .build()
+        .expect("build runtime A");
+
+    let shutdown_a = CancellationToken::new();
+    let shutdown_a_run = shutdown_a.clone();
+    let handle_a = tokio::spawn(async move { runtime_a.run(shutdown_a_run).await });
+
+    // Wait until A is parked at the sink gate. The sink fires
+    // `entered.notify_one()` AFTER incrementing entered_count,
+    // so the count is guaranteed ≥ 1 once this resolves.
+    timeout(Duration::from_secs(5), block.wait_for_entry())
+        .await
+        .expect("A never parked at sink gate");
+    assert!(block.entered_count() >= 1);
+
+    // While A is parked, construct B against the same manifest.
+    // B's `Consumer::initialize()` bumps the epoch and silently
+    // fences A (A doesn't learn until its next manifest call).
+    let source_b =
+        buffer_source_on_store(Arc::clone(&store), manifest_path, data_prefix, None).await;
+    // Non-consuming in-memory wrapper read — does not touch the
+    // consumer cursor.
+    assert_eq!(source_b.last_acked_sequence(), None);
+
+    // Release A. A's Sink::write returns Ok; the runtime calls
+    // mark_committed, advance_frontier, then ack_through(0)
+    // which trips on Error::Fenced.
+    drop(block);
+    let join_a = timeout(Duration::from_secs(5), handle_a)
+        .await
+        .expect("A never exited")
+        .expect("A task join");
+    let err_a = join_a.expect_err("fence must surface as RuntimeError");
+    assert!(
+        matches!(err_a, RuntimeError::Source(_)),
+        "expected RuntimeError::Source on fence, got {err_a:?}"
+    );
+    let _ = shutdown_a;
+
+    // A's sink saw exactly one write (the gated one) targeting
+    // sequence 0. Capture its idempotency key for the replay
+    // comparison.
+    let writes_a_snapshot = writes_a.lock().unwrap().clone();
+    assert_eq!(writes_a_snapshot.len(), 1);
+    assert_eq!(writes_a_snapshot[0].high_sequence, 0);
+    let key_a = writes_a_snapshot[0].idempotency_key.clone();
+
+    // Build the replay runtime on B with a fresh ProgrammableSink
+    // scripted Ok. The replay runtime's first next_descriptors
+    // call hits Consumer B's `next_batch`, which dequeues
+    // sequence 0 from the durable manifest. If the manifest had
+    // advanced past 0 due to A's fenced ack, B would get None
+    // and the replay would hang on the poll loop.
+    let sink_b = ProgrammableSink::new(
+        SinkId::from("programmable"),
+        vec![ScriptedWrite::Ok { rows_written: 1 }],
+        CommitStatus::Unknown,
+    );
+    let writes_b = Arc::clone(&sink_b.write_calls);
+
+    let runtime_b = Runtime::builder()
+        .add_source(source_b)
+        .add_decoder(FakeDecoder::permissive())
+        .set_sink(sink_b)
+        .with_options(live_options())
+        .build()
+        .expect("build runtime B");
+    let mut progress_b = runtime_b.progress();
+
+    let shutdown_b = CancellationToken::new();
+    let shutdown_b_run = shutdown_b.clone();
+    let handle_b = tokio::spawn(async move { runtime_b.run(shutdown_b_run).await });
+
+    let p = timeout(Duration::from_secs(5), async {
+        loop {
+            progress_b
+                .changed()
+                .await
+                .expect("progress channel closed");
+            let p = *progress_b.borrow();
+            if p.last_acked_sequence == Some(0) {
+                return p;
+            }
+        }
+    })
+    .await
+    .expect("B never advanced ack frontier — durable manifest may have been wrongly advanced by fenced A");
+
+    assert_eq!(p.last_acked_sequence, Some(0));
+
+    shutdown_b.cancel();
+    handle_b
+        .await
+        .expect("B task join")
+        .expect("B exited cleanly");
+
+    let writes_b_snapshot = writes_b.lock().unwrap().clone();
+    assert_eq!(
+        writes_b_snapshot.len(),
+        1,
+        "B must replay sequence 0 exactly once; got writes={writes_b_snapshot:?}"
+    );
+    assert_eq!(
+        writes_b_snapshot[0].high_sequence, 0,
+        "B must replay sequence 0 (manifest unadvanced); got {writes_b_snapshot:?}"
+    );
+    // INV-SINK-RETRY-IDEMPOTENT: B's commit shares A's key.
+    assert_eq!(
+        writes_b_snapshot[0].idempotency_key, key_a,
+        "B's replay must reuse A's IdempotencyKey for INV-SINK-RETRY-IDEMPOTENT"
+    );
+
+    fx_a.producer.close().await.expect("close producer");
 }
