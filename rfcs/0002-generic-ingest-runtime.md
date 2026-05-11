@@ -22,10 +22,15 @@ producer-side queue duplication plus two isolated runtime processes.
 Independent sinks should not share a runtime ack frontier, memory budget,
 retry loop, or process liveness.
 
-The runtime is built around four trait boundaries: `SourceReader`, `Decoder`,
-`Sink`, and `IdempotencyContract`. The pipeline is staged with bounded queues
-and a shared in-flight byte budget, so a slow or failing sink pauses upstream
-work without unbounded memory growth. For each source, Buffer ack advances
+The runtime is built around three plugin trait boundaries — `Decoder`,
+`Sink`, and `IdempotencyContract` — plus a concrete `BufferSource` on the
+source side. For v1, the source side is not a trait: Heracles has one
+source type (OpenData Buffer), and a trait surface would be near 1:1 with
+`buffer::Consumer` / `ConsumerFetchHandle` with no second caller to
+justify it. See "Source Side: Concrete `BufferSource` for v1" and
+"Alternatives: Re-introduce a `SourceReader` Trait Now". The pipeline is
+staged with bounded queues and a shared in-flight byte budget, so a slow
+or failing sink pauses upstream work without unbounded memory growth. For each source, Buffer ack advances
 only when the configured sink has durably committed the corresponding source
 sequence range, or has verified that the range was already committed by an
 earlier attempt.
@@ -268,7 +273,7 @@ What is generic vs. plugin:
 
 | Layer | Owner |
 |---|---|
-| Source descriptor poller, fetch workers, decompression | Runtime (per source plugin shape) |
+| Source descriptor poller, fetch workers, decompression | Runtime (`BufferSource` concrete for v1) |
 | Per-entry envelope materialization (RFC 0001 `RawEntry`) | Runtime |
 | Signal decoder | Plugin (`Decoder`) |
 | Per-source commit group, deterministic chunking | Runtime |
@@ -291,59 +296,65 @@ trait.
 All trait names below are placeholders the implementation may rename;
 the invariants are the contract.
 
-#### `SourceReader` and `SourceFetchHandle`
+#### Source Side: Concrete `BufferSource` for v1
 
-The source side splits into two traits, mirroring RFC 0003's
-`Consumer` / `ConsumerFetchHandle` shape. The runtime owns one
-`SourceReader` per source (`&mut self` for descriptor poll and ack)
-and clones an N-way `SourceFetchHandle` into fetch worker tasks.
+The runtime owns a concrete `BufferSource` per configured source.
+There is no source-side trait surface in v1: Heracles has one source
+type (OpenData Buffer), and a trait surface would be near 1:1 with
+`buffer::Consumer` / `ConsumerFetchHandle` (RFC 0003) with no second
+caller to justify it. See "Re-introduce a `SourceReader` Trait Now"
+under Alternatives Considered for the trade-off.
+
+`BufferSource` wraps `buffer::Consumer` (manifest owner, `&mut self`)
+and exposes a paired `BufferSourceFetchHandle` (cloneable,
+`Send + Sync + 'static`) that wraps `buffer::ConsumerFetchHandle`. The
+split mirrors RFC 0003: the owner mutates manifest cursors and the
+durable ack frontier under `&mut self`; the handle is cloned into N
+fetch worker tasks under `&self`.
 
 ```rust
-#[async_trait::async_trait]
-pub trait SourceReader: Send + 'static {
-    /// Stable identifier for this source; used in metric labels and
-    /// idempotency keys.
-    fn id(&self) -> &SourceId;
+pub struct BufferSource {
+    id: SourceId,
+    consumer: buffer::Consumer,
+    fetch_handle: BufferSourceFetchHandle,
+}
+
+impl BufferSource {
+    pub fn id(&self) -> &SourceId;
 
     /// Fetch up to `max` new descriptors past the current cursor.
-    /// Must not mutate the durable ack frontier. Returning fewer than
-    /// `max` is allowed and signals "no more visible right now"; the
-    /// runtime will sleep and retry.
-    async fn next_descriptors(&mut self, max: usize, budget: SourceBudget)
+    /// Does not mutate the durable ack frontier. Returning fewer
+    /// than `max` is allowed and signals "no more visible right
+    /// now"; the runtime sleeps and retries.
+    pub async fn next_descriptors(&mut self, max: usize, budget: SourceBudget)
         -> RuntimeResult<Vec<SourceBatchDescriptor>>;
 
-    /// Construct a cloneable handle for fetching descriptors
-    /// concurrently. Construction is O(1); the handle holds shared
-    /// references to whatever the source needs (object store handle,
-    /// HTTP client, etc.) and no manifest state.
-    fn fetch_handle(&self) -> Box<dyn SourceFetchHandle>;
+    /// Cloneable fetch primitive for parallel workers. O(1) clone;
+    /// the handle holds an `Arc<dyn ObjectStore>` and no manifest
+    /// state.
+    pub fn fetch_handle(&self) -> BufferSourceFetchHandle;
 
     /// Advance the durable ack frontier through (and including)
-    /// `sequence`. Implementations are responsible for the in-order
-    /// requirement of the underlying source; the runtime guarantees
-    /// monotonic advance.
-    async fn ack_through(&mut self, sequence: u64) -> RuntimeResult<()>;
+    /// `sequence`. Buffer's in-order ack requirement; the runtime
+    /// guarantees monotonic advance.
+    pub async fn ack_through(&mut self, sequence: u64) -> RuntimeResult<()>;
 
-    /// Force the underlying source's durable checkpoint. The runtime
-    /// calls this on flush boundaries.
-    async fn flush_acks(&mut self) -> RuntimeResult<()>;
+    /// Force the underlying Buffer consumer's durable checkpoint.
+    /// Called on flush boundaries.
+    pub async fn flush_acks(&mut self) -> RuntimeResult<()>;
 }
 
-/// Cloneable, concurrency-safe fetch primitive. The runtime calls
-/// `fetch` from N workers in parallel against distinct descriptors.
-/// Implementations must not touch manifest or ack state here.
-#[async_trait::async_trait]
-pub trait SourceFetchHandle: Send + Sync {
-    async fn fetch(&self, descriptor: SourceBatchDescriptor)
+#[derive(Clone)]
+pub struct BufferSourceFetchHandle {
+    inner: buffer::ConsumerFetchHandle,
+}
+
+impl BufferSourceFetchHandle {
+    /// Fetch a descriptor's data object. Safe to call concurrently
+    /// from N worker tasks against distinct descriptors. Never
+    /// mutates manifest or ack state.
+    pub async fn fetch(&self, descriptor: SourceBatchDescriptor)
         -> RuntimeResult<SourceBatch>;
-
-    /// Object-safe clone. The default `Clone` derive does not work
-    /// across `dyn Trait`; implementations return a new boxed handle.
-    fn clone_box(&self) -> Box<dyn SourceFetchHandle>;
-}
-
-impl Clone for Box<dyn SourceFetchHandle> {
-    fn clone(&self) -> Self { self.clone_box() }
 }
 
 pub struct SourceBatchDescriptor {
@@ -352,13 +363,12 @@ pub struct SourceBatchDescriptor {
     pub location: String,
     pub per_range_metadata: Vec<SourceRangeMetadata>,
     /// Object size in bytes, when the source can supply it without an
-    /// extra round trip. The Buffer source reader passes this through
-    /// from `BatchDescriptor.object_bytes` (RFC 0003), which is
-    /// `None` until the manifest format carries object size as a
-    /// follow-up. When `None`, the runtime's byte-budget accounting
-    /// uses the configured `source.estimated_max_batch_bytes` as a
-    /// pessimistic reservation; see "Backpressure Model > Byte
-    /// Budget Accounting" below.
+    /// extra round trip. `BufferSource` passes this through from
+    /// `BatchDescriptor.object_bytes` (RFC 0003), which is `None`
+    /// until the manifest format carries object size as a follow-up.
+    /// When `None`, the runtime's byte-budget accounting uses the
+    /// configured `source.estimated_max_batch_bytes` as a pessimistic
+    /// reservation; see "Backpressure Model > Byte Budget Accounting".
     pub object_bytes: Option<u64>,
 }
 
@@ -378,25 +388,40 @@ pub struct SourceEntry {
 }
 ```
 
-`SourceBatch` is a renamed superset of RFC 0001's `RawBufferBatch`. The
-Buffer implementation of `SourceReader` shells out to
-`buffer::Consumer::next_descriptors` / `Consumer::ack_through` /
-`Consumer::flush` for the manifest-owner methods, and to
-`buffer::ConsumerFetchHandle::fetch` (RFC 0003) inside its
-`SourceFetchHandle`. It reuses the existing `split_into_raw_entries`
-materialization to convert each `buffer::ConsumedBatch` into a
-`SourceBatch`.
+`SourceBatch` is a renamed superset of RFC 0001's `RawBufferBatch`.
+`BufferSource::next_descriptors` calls
+`buffer::Consumer::next_descriptors(max)` and filters returned
+descriptors against `budget.bytes_remaining`. `fetch_handle()` returns
+a cheap clone. `ack_through` and `flush_acks` are pass-throughs to
+`Consumer::ack_through` / `Consumer::flush`.
+`BufferSourceFetchHandle::fetch` calls `ConsumerFetchHandle::fetch`
+(RFC 0003) and runs `split_into_raw_entries` to produce a `SourceBatch`.
 
-The two-trait split is what keeps `SourceReader` itself only `Send`
-(it owns mutable manifest state) while `SourceFetchHandle: Send +
-Sync` lets fetch workers run concurrently. `SourceReader::fetch_handle`
-returns a fresh boxed handle; the runtime clones it into N workers
-via `Box<dyn SourceFetchHandle>`'s `Clone` impl.
+The data types above (`SourceId`, `SourceBatchDescriptor`,
+`SourceBatch`, `SourceEntry`, `SourceBudget`, `SourceRangeMetadata`)
+stay sink-neutral in the runtime crate. They carry runtime-only
+fields — `SourceId` for idempotency keys and metric labels;
+`manifest_path` for the `_odb_manifest_path` system column;
+pre-flattened `per_range_metadata` parallel to entries — that the
+underlying buffer types don't.
 
-The traits are async to keep the door open for non-Buffer sources
-later (Kafka, file scan, direct OTLP push). Adding sources should
-not require runtime changes; they only need to honor in-order acks
-within a source and provide a concurrency-safe fetch handle.
+If RFC 0003 of opendata-buffer is not yet released, `BufferSource`
+falls back to a serial path that calls `Consumer::next_batch` and
+emits a single descriptor whose location is the just-fetched batch.
+`BufferSourceFetchHandle::fetch` then pops from an internal
+sequence-keyed cache of pre-fetched batches. This compatibility path
+is required only during Phase 4 (extraction); Phase 6 lifts it once
+the read-ahead consumer ships.
+
+For test fakes (Phase 5 correctness harness), the runtime crate
+introduces a `#[cfg(test)]` source seam — production callers stay on
+the concrete `BufferSource`. Phase 5.0 picks the shape (small trait
+under `#[cfg(test)]` vs. a `Source` enum vs. handcrafted fixtures).
+
+If/when a non-Buffer source lands (Kafka direct, OTLP HTTP push,
+file scan), reintroducing a `SourceReader` trait is a local change
+inside the runtime crate. Sinks and the correctness harness do not
+depend on the source shape, so the cost of waiting is bounded.
 
 #### `Decoder`
 
@@ -805,8 +830,8 @@ The state transitions are:
 3. **Frontier advances** to the highest contiguous committed sequence
    from the current `acked_frontier`. The coordinator never advances
    over a hole.
-4. **Flush** calls `SourceReader::ack_through(frontier)` and then
-   `SourceReader::flush_acks` per the configured `AckFlushPolicy`
+4. **Flush** calls `BufferSource::ack_through(frontier)` and then
+   `BufferSource::flush_acks` per the configured `AckFlushPolicy`
    (default: every commit group, mirroring RFC 0001).
 
 > **Why a single-bit per range is sufficient.** Earlier drafts of this
@@ -975,45 +1000,12 @@ the migration stalls and we revisit the runtime contract.
 
 ### Source Reader: Buffer Implementation
 
-`opendata-ingest-runtime` ships one source reader,
-`BufferSourceReader`, that wraps `buffer::Consumer` plus a paired
-`BufferSourceFetchHandle` that wraps `buffer::ConsumerFetchHandle`
-(RFC 0003).
-
-`BufferSourceReader` (manifest owner, `&mut self`):
-
-- `next_descriptors(max, budget)` calls
-  `Consumer::next_descriptors(max)` and rejects descriptors past
-  `budget.bytes_remaining` to keep the source under
-  `source.max_inflight_bytes`. Each returned `SourceBatchDescriptor`
-  carries `object_bytes` straight through from
-  `BatchDescriptor.object_bytes` (RFC 0003), which is `None` until
-  the manifest format extension lands; the runtime then falls back to
-  `source.estimated_max_batch_bytes` for budget reservation.
-- `fetch_handle()` returns `Box::new(BufferSourceFetchHandle {
-  inner: consumer.fetch_handle() })`.
-- `ack_through(seq)` calls `Consumer::ack_through(seq)`.
-- `flush_acks` calls `Consumer::flush()`.
-
-`BufferSourceFetchHandle` (cloneable fetcher, `&self`):
-
-- `fetch(descriptor)` calls
-  `ConsumerFetchHandle::fetch(buffer_descriptor)` (the underlying
-  `buffer::BatchDescriptor`, reconstructed from `SourceBatchDescriptor`),
-  receives a `buffer::ConsumedBatch`, and runs `split_into_raw_entries`
-  to produce a `SourceBatch`.
-- `clone_box()` clones the inner `ConsumerFetchHandle` (which is `Clone`)
-  and returns a new `Box<dyn SourceFetchHandle>`.
-
-`split_into_raw_entries` (today in `clickhouse-ingestor::source`) is
-pulled into the runtime crate so it can be reused by future sources
-that surface per-range metadata in the same shape.
-
-If RFC 0003 of opendata-buffer is not yet released, the runtime can
-fall back to a serial path that calls `Consumer::next_batch` and
-emits a single descriptor whose location is the just-fetched batch.
-This compatibility path is required only during Phase 4
-(extraction) and removed in Phase 6 (pipelining).
+See "Source Side: Concrete `BufferSource` for v1" under Trait Surface.
+That section is the canonical description of `BufferSource` and
+`BufferSourceFetchHandle`, including the RFC 0003 read-ahead path,
+the serial-`next_batch` fallback used during Phase 4, and the
+`split_into_raw_entries` materialization. There is no separate trait
+implementation to describe — the source side is concrete for v1.
 
 ### Decoder: v1 Defaults
 
@@ -1353,6 +1345,27 @@ The sink could call `source.ack_through` itself. Rejected because:
   point — it owns the per-source `AckCoordinator` and the source
   reader, the sink owns its idempotent commit semantics.
 
+### Re-introduce a `SourceReader` Trait Now
+
+Considered: define `SourceReader` / `SourceFetchHandle` as production
+traits and route the runtime through `Box<dyn SourceReader>` to keep
+the door open for non-Buffer sources (Kafka direct, OTLP HTTP push,
+file scan). Rejected for v1 because:
+
+- There is one source impl (`BufferSource`) and no second source on
+  the roadmap.
+- The trait methods would be near 1:1 over `buffer::Consumer` /
+  `ConsumerFetchHandle`, costing API-surface maintenance for an
+  option we may never exercise.
+- Test fakes use a `#[cfg(test)]` seam inside the runtime crate;
+  production callers stay concrete.
+
+Reintroduction, if and when a second source materializes, is a local
+change inside the runtime crate. The data types
+(`SourceBatchDescriptor`, `SourceBatch`, `SourceEntry`) are
+source-shape-agnostic and stay; sinks and the correctness harness
+don't depend on the source shape. The cost of waiting is bounded.
+
 ## Future Improvements
 
 These do not require changing the trait shapes in this RFC.
@@ -1386,8 +1399,14 @@ These do not require changing the trait shapes in this RFC.
   scope.
 - **Replay tooling**: operator-directed replay from a chosen sequence
   inside Buffer's retained range. RFC 0001 defers this; the runtime
-  inherits the deferral and exposes the seam (`SourceReader` already
+  inherits the deferral and exposes the seam (`BufferSource` already
   takes an initial sequence on construction).
+- **Reintroduce a `SourceReader` trait** if/when a non-Buffer source
+  lands (Kafka direct, OTLP HTTP push, file scan). See "Re-introduce
+  a `SourceReader` Trait Now" in Alternatives Considered. The runtime
+  data types (`SourceBatchDescriptor`, `SourceBatch`, `SourceEntry`)
+  are source-shape-agnostic, so this is a local change inside the
+  runtime crate.
 
 ## Validation Criteria
 
@@ -1465,4 +1484,6 @@ Phase-aligned with the impl plan.
 | 2026-05-07 (rev 3) | Phase 0 gate reconciliation. (a) Split `SourceReader` into `SourceReader: Send + 'static` (manifest owner, `&mut self` next_descriptors / ack_through / flush_acks) and `SourceFetchHandle: Send + Sync` (cloneable, concurrency-safe `fetch`). The earlier draft claimed `fetch(&self)` was concurrent on a `Send`-only trait, which did not match RFC 0003's `&mut self` `fetch_descriptor`. The new shape mirrors RFC 0003. (b) Updated the Buffer source-reader implementation section to describe `BufferSourceReader` + `BufferSourceFetchHandle` and to call `ConsumerFetchHandle::fetch` (RFC 0003 rev 2), not the stale `Consumer::fetch_descriptor(&self)`. (c) Reworded the `Sink::write` contract: dropped "partial success is the sink's problem to clean up" (too strong for ClickHouse / Iceberg); replaced with a three-rule contract — `Ok(_)` means full route-level commit, retry of the same `SinkCommit` must be idempotent, `check_committed` reflects route-level (not internal-chunk) commit. The runtime does not require atomic-with-rollback. |
 | 2026-05-07 (rev 4) | `Sink::write` rustdoc reworded from "Commit one (range, route) atomically" to "Commit one route-level unit ..." and explicitly references the idempotent-retry contract. The "atomically" wording revived the rolled-back-state interpretation that rev 3's surrounding prose had walked back. |
 | 2026-05-07 (rev 5) | AckCoordinator narrative reworded to drop "atomic per (range, route)" — both the state-transition step (#2) and the "Why route-level tracking is sufficient" callout now say "`Ok(_)` means the full route-level commit is complete and retry of the same `SinkCommit` is idempotent." Pure wording fix; the contract has been route-level + idempotent-retry since rev 3. |
+| 2026-05-11 (rev 7) | Added "Replace `SourceReader` / `SourceFetchHandle` with a Concrete `BufferSource`" to Alternatives Considered, and a matching Future Improvements bullet. The source-side trait surface stays for Phase 4/5; the simplification is queued as a deferred follow-up to be re-evaluated after Phase 6 once the concurrency / budgeting layer is locked. Default lean is collapse, given the absence of multi-source plans. No trait or contract change in this revision. |
+| 2026-05-11 (rev 8) | **Source side collapses to concrete `BufferSource` for v1.** Promoting rev 7's deferred alternative to the default path: there is no second source on the roadmap, and the trait methods would be near 1:1 over `buffer::Consumer` / `ConsumerFetchHandle`. `SourceReader` / `SourceFetchHandle` are removed from the core runtime contract; the runtime owns a concrete `BufferSource` with a paired `Clone` `BufferSourceFetchHandle`. The data types (`SourceId`, `SourceBatchDescriptor`, `SourceBatch`, `SourceEntry`, `SourceBudget`, `SourceRangeMetadata`) and `split_into_raw_entries` stay in the runtime crate, sink-neutral. The architecture diagram and the generic-vs-plugin table now name `BufferSource` as runtime-owned. Test fakes (Phase 5 correctness harness) use a `#[cfg(test)]` seam inside the runtime crate; production callers stay concrete. The Alternatives entry is inverted to "Re-introduce a `SourceReader` Trait Now" (rejected for v1; reintroduction is a local change if a second source materializes); the Future Improvements bullet is inverted to point at reintroduction rather than collapse. No behavior change. Sink, decoder, idempotency, and ack-coordinator contracts are unchanged. |
 | 2026-05-08 (rev 6) | **Scope changed from same-process multi-sink fanout to multi-source / single-sink runtime service.** A runtime service hosts N sources -> 1 sink. Independent sinks are isolated through producer-side duplicate queues and separate runtime processes. `Router`, `RouteId`, `RouteAssignment`, `SinkCommit.route`, `IdempotencyScope.route`, and `SinkCommit.record_indices` are removed from the core runtime contract (the per-record `SourceCoordinateColumns.record_indices` column stays — that is the OTel within-entry record index). `SinkCommit` is keyed by `{source, sink}`; `IdempotencyScope` keys by `sink` (not `route`); `IdempotencyKey` shape is `{source}:{sink}:{low}-{high}:{schema_version}:{chunking_fingerprint}`. `AckCoordinator` is per-source with one sink-commit bit per range (`register_pending` / `mark_committed` / `frontier`); out-of-order range completion is handled by tracking pending ranges and never advancing the contiguous frontier over a hole. `MaybeCommitted` handling is unchanged. Configuration uses singular `sink:`; validator rejects multi-sink config. Multi-source section renamed to "Multi-Source, Single-Sink Service"; backpressure model gains source fairness on the shared sink writer pool. Metrics relabeled (`runtime_source_*`, `runtime_sink_*`, `runtime_sink_commits_total{source,sink,result}`). Phase 9 is a standalone Iceberg runtime service (no co-host with ClickHouse); Phase 10 is multi-source / single-sink e2e plus an optional duplicated-queue deployment proof. New "Same-Process Multi-Sink Fanout" alternative explains why the previous shape was rejected. |
