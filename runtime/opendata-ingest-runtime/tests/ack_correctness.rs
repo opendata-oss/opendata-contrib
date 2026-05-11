@@ -637,3 +637,252 @@ async fn runtime_fence_aborts_durable_ack_with_source_error() {
 
     fx_a.producer.close().await.expect("close producer");
 }
+
+/// Crash semantics (1): crash before `Sink::write` returns.
+///
+/// `ProgrammableSink::block_until_released(also_gate_write: true)`
+/// holds the first `write` indefinitely. Once the sink is
+/// parked (`wait_for_entry().await` resolves), the test calls
+/// `JoinHandle::abort()` — a hard-crash simulation, not
+/// `shutdown.cancel()` which would not abort the awaited
+/// `write` and would also trigger a graceful `flush_acks` on
+/// exit. The durable manifest is untouched because
+/// `mark_committed` never ran.
+///
+/// A fresh `Runtime` constructed against the same in-memory
+/// `ObjectStore` builds Consumer B (which fences the dropped
+/// Consumer A — irrelevant, A is gone), receives sequence 0
+/// on `next_descriptors`, and writes it through a fresh sink
+/// scripted `[Ok]`.
+#[tokio::test]
+async fn replay_after_crash_before_sink_write_reissues_write_and_acks() {
+    let manifest_path = "ingest/test/crash-before-write/manifest";
+    let data_prefix = "ingest/test/crash-before-write/data";
+
+    let fx = in_memory_buffer_source(manifest_path, data_prefix).await;
+    let store = Arc::clone(&fx.store);
+    fx.producer
+        .produce(vec![Bytes::from_static(b"payload")], logs_envelope())
+        .await
+        .expect("produce");
+    fx.producer.flush().await.expect("flush");
+
+    // ----- Runtime A: park at sink gate, abort the task. -----
+    let sink_a = ProgrammableSink::new(
+        SinkId::from("programmable"),
+        vec![ScriptedWrite::Ok { rows_written: 1 }], // never delivered
+        CommitStatus::Unknown,
+    );
+    let writes_a = Arc::clone(&sink_a.write_calls);
+    let block = sink_a.block_until_released(true);
+
+    let runtime_a = Runtime::builder()
+        .add_source(fx.source)
+        .add_decoder(FakeDecoder::permissive())
+        .set_sink(sink_a)
+        .with_options(live_options())
+        .build()
+        .expect("build A");
+
+    let handle_a = tokio::spawn(async move {
+        let _ = runtime_a.run(CancellationToken::new()).await;
+    });
+
+    timeout(Duration::from_secs(5), block.wait_for_entry())
+        .await
+        .expect("A never parked at sink gate");
+
+    // Hard crash. The task is dropped mid-await; the sink call
+    // is never resumed and `mark_committed` never runs.
+    handle_a.abort();
+    let _ = handle_a.await; // observes cancellation
+    drop(block); // releases gate (no-op now; A is gone)
+
+    // A's sink saw exactly one write entry (the parked one),
+    // but the runtime never advanced past it.
+    let writes_a_snapshot = writes_a.lock().unwrap().clone();
+    assert_eq!(writes_a_snapshot.len(), 1);
+    let key_a = writes_a_snapshot[0].idempotency_key.clone();
+
+    // ----- Runtime B: replay on same store. -----
+    let source_b =
+        buffer_source_on_store(Arc::clone(&store), manifest_path, data_prefix, None).await;
+    let sink_b = ProgrammableSink::new(
+        SinkId::from("programmable"),
+        vec![ScriptedWrite::Ok { rows_written: 1 }],
+        CommitStatus::Unknown,
+    );
+    let writes_b = Arc::clone(&sink_b.write_calls);
+
+    let runtime_b = Runtime::builder()
+        .add_source(source_b)
+        .add_decoder(FakeDecoder::permissive())
+        .set_sink(sink_b)
+        .with_options(live_options())
+        .build()
+        .expect("build B");
+    let mut progress_b = runtime_b.progress();
+
+    let shutdown_b = CancellationToken::new();
+    let shutdown_b_run = shutdown_b.clone();
+    let handle_b = tokio::spawn(async move { runtime_b.run(shutdown_b_run).await });
+
+    timeout(Duration::from_secs(5), async {
+        loop {
+            progress_b.changed().await.expect("progress");
+            if progress_b.borrow().last_acked_sequence == Some(0) {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("B never advanced ack frontier");
+
+    shutdown_b.cancel();
+    handle_b
+        .await
+        .expect("B task join")
+        .expect("B exited cleanly");
+
+    let writes_b_snapshot = writes_b.lock().unwrap().clone();
+    assert_eq!(writes_b_snapshot.len(), 1);
+    assert_eq!(writes_b_snapshot[0].high_sequence, 0);
+    assert_eq!(
+        writes_b_snapshot[0].idempotency_key, key_a,
+        "INV-SINK-RETRY-IDEMPOTENT: replay reuses A's key"
+    );
+
+    fx.producer.close().await.expect("close producer");
+}
+
+/// Crash semantics (2): crash after `Sink::write` returns
+/// `Ok` but before the durable manifest update lands.
+///
+/// `AckFlushPolicy::EveryN { n: 1000 }` defers `flush_acks` so
+/// it never runs during the test. The runtime commits range 0,
+/// advances the in-memory frontier, calls `ack_through(0)`
+/// (which mutates only the in-memory consumer cursor, not the
+/// durable manifest), then loops back to `next_descriptors`.
+/// The progress channel publishes `last_acked_sequence ==
+/// Some(0)`; the test awaits that signal and calls
+/// `handle.abort()` BEFORE any flush boundary. The durable
+/// manifest is therefore at its pre-crash state.
+///
+/// A fresh `Runtime` constructed against the same
+/// `ObjectStore` receives sequence 0 on `next_descriptors`
+/// again; the replay sink scripts `[Ok]`; INV-SINK-RETRY-
+/// IDEMPOTENT keeps durable state correct on the duplicate
+/// write.
+#[tokio::test]
+async fn replay_after_crash_after_commit_before_flush_idempotently_completes() {
+    let manifest_path = "ingest/test/crash-after-commit/manifest";
+    let data_prefix = "ingest/test/crash-after-commit/data";
+
+    let fx = in_memory_buffer_source(manifest_path, data_prefix).await;
+    let store = Arc::clone(&fx.store);
+    fx.producer
+        .produce(vec![Bytes::from_static(b"payload")], logs_envelope())
+        .await
+        .expect("produce");
+    fx.producer.flush().await.expect("flush");
+
+    // ----- Runtime A: commit + advance in-memory, abort before flush. -----
+    let sink_a = ProgrammableSink::new(
+        SinkId::from("programmable"),
+        vec![ScriptedWrite::Ok { rows_written: 1 }],
+        CommitStatus::Unknown,
+    );
+    let writes_a = Arc::clone(&sink_a.write_calls);
+
+    let mut opts_a = live_options();
+    opts_a.ack_flush_policy = AckFlushPolicy::EveryN { n: 1000 };
+    let runtime_a = Runtime::builder()
+        .add_source(fx.source)
+        .add_decoder(FakeDecoder::permissive())
+        .set_sink(sink_a)
+        .with_options(opts_a)
+        .build()
+        .expect("build A");
+    let mut progress_a = runtime_a.progress();
+
+    let handle_a = tokio::spawn(async move {
+        let _ = runtime_a.run(CancellationToken::new()).await;
+    });
+
+    timeout(Duration::from_secs(5), async {
+        loop {
+            progress_a.changed().await.expect("progress");
+            if progress_a.borrow().last_acked_sequence == Some(0) {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("A never advanced in-memory frontier");
+
+    // Hard crash before any flush boundary. The in-memory
+    // ack_through(0) ran; the durable flush_acks did not.
+    handle_a.abort();
+    let _ = handle_a.await;
+
+    let writes_a_snapshot = writes_a.lock().unwrap().clone();
+    assert_eq!(writes_a_snapshot.len(), 1);
+    let key_a = writes_a_snapshot[0].idempotency_key.clone();
+
+    // ----- Runtime B: replay on same store. -----
+    let source_b =
+        buffer_source_on_store(Arc::clone(&store), manifest_path, data_prefix, None).await;
+    let sink_b = ProgrammableSink::new(
+        SinkId::from("programmable"),
+        vec![ScriptedWrite::Ok { rows_written: 1 }],
+        CommitStatus::Unknown,
+    );
+    let writes_b = Arc::clone(&sink_b.write_calls);
+
+    let runtime_b = Runtime::builder()
+        .add_source(source_b)
+        .add_decoder(FakeDecoder::permissive())
+        .set_sink(sink_b)
+        .with_options(live_options())
+        .build()
+        .expect("build B");
+    let mut progress_b = runtime_b.progress();
+
+    let shutdown_b = CancellationToken::new();
+    let shutdown_b_run = shutdown_b.clone();
+    let handle_b = tokio::spawn(async move { runtime_b.run(shutdown_b_run).await });
+
+    timeout(Duration::from_secs(5), async {
+        loop {
+            progress_b.changed().await.expect("progress");
+            if progress_b.borrow().last_acked_sequence == Some(0) {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("B never advanced ack frontier — durable manifest may have wrongly persisted A's ack");
+
+    shutdown_b.cancel();
+    handle_b
+        .await
+        .expect("B task join")
+        .expect("B exited cleanly");
+
+    let writes_b_snapshot = writes_b.lock().unwrap().clone();
+    assert_eq!(
+        writes_b_snapshot.len(),
+        1,
+        "B must replay sequence 0 once; got writes={writes_b_snapshot:?}"
+    );
+    assert_eq!(
+        writes_b_snapshot[0].high_sequence, 0,
+        "B must replay sequence 0 (durable manifest unadvanced past A's pre-crash state)"
+    );
+    assert_eq!(
+        writes_b_snapshot[0].idempotency_key, key_a,
+        "INV-SINK-RETRY-IDEMPOTENT: replay reuses A's key"
+    );
+
+    fx.producer.close().await.expect("close producer");
+}
