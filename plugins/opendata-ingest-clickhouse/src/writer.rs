@@ -31,6 +31,14 @@ pub enum WriterErrorClass {
     /// Schema mismatch, 4xx other than 429. The runtime should halt and
     /// surface the error to an operator.
     NonRetryable,
+    /// The writer exhausted its internal retry budget on a string of
+    /// retryable failures. ClickHouse may or may not have committed
+    /// during one of those attempts (timeout after request body sent,
+    /// 5xx after server-side commit, connection drop after the 200 OK
+    /// was generated). Surface to the sink as `MaybeCommitted` so the
+    /// runtime can call `check_committed` before retrying — per RFC
+    /// 0002 rev 6 §`Sink`.
+    RetryBudgetExhausted,
 }
 
 #[derive(Debug, Error)]
@@ -39,6 +47,11 @@ pub enum WriterError {
     Retryable { message: String },
     #[error("clickhouse insert failed (non-retryable): {message}")]
     NonRetryable { message: String },
+    /// Tag attached to a retryable error after `max_attempts` was hit.
+    /// Distinct from `NonRetryable` so the sink can promote it to
+    /// `SinkCommitFailure::MaybeCommitted` instead of `Fatal`.
+    #[error("clickhouse insert failed (retry budget exhausted): {message}")]
+    RetryBudgetExhausted { message: String },
     #[error("serialization error: {0}")]
     Serialization(String),
 }
@@ -47,6 +60,7 @@ impl WriterError {
     pub fn class(&self) -> WriterErrorClass {
         match self {
             WriterError::Retryable { .. } => WriterErrorClass::Retryable,
+            WriterError::RetryBudgetExhausted { .. } => WriterErrorClass::RetryBudgetExhausted,
             WriterError::NonRetryable { .. } | WriterError::Serialization(_) => {
                 WriterErrorClass::NonRetryable
             }
@@ -169,14 +183,16 @@ impl ClickHouseWriter {
                         backoff = backoff.saturating_mul(2);
                     }
                     WriterErrorClass::Retryable => {
-                        return Err(WriterError::NonRetryable {
+                        return Err(WriterError::RetryBudgetExhausted {
                             message: format!(
                                 "retry budget ({}) exhausted: {err}",
                                 self.config.max_attempts
                             ),
                         });
                     }
-                    WriterErrorClass::NonRetryable => return Err(err),
+                    WriterErrorClass::RetryBudgetExhausted | WriterErrorClass::NonRetryable => {
+                        return Err(err);
+                    }
                 },
             }
         }
@@ -423,6 +439,67 @@ mod tests {
     fn classify_status_400_is_non_retryable() {
         let err = classify_status(400, "bad request");
         assert_eq!(err.class(), WriterErrorClass::NonRetryable);
+    }
+
+    /// Phase 4 review HIGH-2 regression. After the writer exhausts
+    /// its internal retry budget on a string of retryable failures
+    /// the error must classify as `RetryBudgetExhausted`, not
+    /// `NonRetryable` — otherwise `ClickHouseSink` promotes it to
+    /// `Fatal` and the runtime's `check_committed → retry` path is
+    /// dead for ambiguous-commit scenarios.
+    #[test]
+    fn retry_budget_exhausted_classifies_distinctly() {
+        let err = WriterError::RetryBudgetExhausted {
+            message: "retry budget (3) exhausted: timeout".into(),
+        };
+        assert_eq!(err.class(), WriterErrorClass::RetryBudgetExhausted);
+        // And `RetryBudgetExhausted` is distinct from `NonRetryable`
+        // so the sink can branch.
+        assert_ne!(
+            WriterErrorClass::RetryBudgetExhausted,
+            WriterErrorClass::NonRetryable
+        );
+    }
+
+    /// HIGH-2 end-to-end at the writer level: `execute_chunk` with
+    /// `max_attempts: 1` against an unreachable endpoint must return
+    /// `RetryBudgetExhausted`. (The first attempt fails retryably
+    /// with a connect error; the loop sees `attempt < max_attempts`
+    /// is false and falls into the exhausted branch.)
+    #[tokio::test]
+    async fn execute_chunk_returns_retry_budget_exhausted_after_one_attempt() {
+        let writer = ClickHouseWriter::new(WriterConfig {
+            // Closed port on localhost; reqwest returns a connect
+            // error immediately, which `classify_reqwest` flags as
+            // retryable.
+            endpoint: "http://127.0.0.1:1".into(),
+            user: "default".into(),
+            password: String::new(),
+            request_timeout: Duration::from_millis(100),
+            max_attempts: 1,
+            initial_backoff: Duration::from_millis(1),
+        });
+        // Minimum viable chunk: one row, one column. The body
+        // never reaches the network because the connect fails.
+        let chunk = InsertChunk {
+            database: "test".into(),
+            table: "logs".into(),
+            columns: vec!["body"],
+            rows: vec![vec![RowValue::String("hello".into())]],
+            idempotency_token: "test-token".into(),
+            chunk_index: 0,
+            observability_labels: Vec::new(),
+            settings: ClickHouseSettings::default(),
+        };
+        let err = writer
+            .execute_chunk(&chunk)
+            .await
+            .expect_err("connect failure with max_attempts=1 must surface an error");
+        assert_eq!(
+            err.class(),
+            WriterErrorClass::RetryBudgetExhausted,
+            "got {err:?}"
+        );
     }
 
     #[test]
