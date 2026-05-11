@@ -56,7 +56,7 @@ pub struct SinkBudget {
 /// own fields for sink-side ergonomics (logging, metrics) so sinks
 /// don't have to reach into the batch for routine attributes. The
 /// runtime guarantees the duplicated fields stay consistent.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SinkCommit {
     pub source: SourceId,
     pub sink: SinkId,

@@ -20,5 +20,6 @@ pub mod envelope;
 pub mod error;
 pub mod idempotency;
 pub mod metrics;
+pub mod runtime;
 pub mod sink;
 pub mod source;

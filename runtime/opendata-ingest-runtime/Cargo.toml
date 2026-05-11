@@ -16,3 +16,10 @@ buffer = { workspace = true }
 bytes = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+common = { workspace = true }
+slatedb = { workspace = true }

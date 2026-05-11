@@ -2196,8 +2196,13 @@ dependencies = [
  "async-trait",
  "bytes",
  "opendata-buffer",
+ "opendata-common",
  "serde",
+ "slatedb",
  "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tracing",
 ]
 
 [[package]]
