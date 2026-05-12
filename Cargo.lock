@@ -2193,6 +2193,7 @@ dependencies = [
  "async-channel",
  "async-trait",
  "bytes",
+ "metrics",
  "opendata-buffer",
  "opendata-common",
  "serde",

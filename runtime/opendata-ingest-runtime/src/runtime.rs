@@ -1,15 +1,16 @@
-//! Pipelined runtime: per-source actor + bounded internal worker.
+//! Pipelined runtime: per-source actor + bounded fetch/decode/sink workers.
 //!
-//! Phase 6 row 6.1 introduces the actor + channel scaffolding that
-//! later rows fan out into N fetch / M decode workers and the
-//! shared sink writer pool. The 6.1 topology is intentionally
-//! minimal:
+//! Row 6.1 stood up the actor + channel scaffolding with a single
+//! internal worker. Row 6.2 splits the fetch stage into N parallel
+//! workers driven by `source_defaults.fetch_concurrency`; the decode +
+//! sink stages remain serial (row 6.3 fans out decode workers; row
+//! 6.4 lifts the sink write into a shared pool).
 //!
 //! ```text
-//!   per-source actor                         internal worker
-//!   ────────────────                         ───────────────
-//!   admission arm  ──[AdmittedDescriptor]──▶ fetch + decode + sink
-//!   completion arm ◀──[WriteCompletion]──── (1 task; serial)
+//!   per-source actor                  fetch pool (N tasks)        decode + sink worker
+//!   ────────────────                  ────────────────────        ────────────────────
+//!   admission arm  ─[Admitted]──▶ (async_channel: MPMC) ──▶ [Fetched] ──▶ decode + write_with_retry
+//!   completion arm ◀──────────────[WriteCompletion]────────────────────
 //! ```
 //!
 //! The actor owns `&mut BufferSource` and `&mut AckCoordinator`;
@@ -68,9 +69,29 @@ use crate::error::{RuntimeError, RuntimeResult};
 use crate::identity::{CommitIdentity, SequenceRange};
 use crate::sink::{CommitStatus, Sink, SinkCommit, SinkCommitFailure, SinkCommitResult, SinkId};
 use crate::source::{
-    BufferSource, BufferSourceFetchHandle, SourceBatchDescriptor, SourceBudget, SourceId,
+    BufferSource, BufferSourceFetchHandle, SourceBatch, SourceBatchDescriptor, SourceBudget,
+    SourceId,
 };
 use crate::source_budget::{ByteReservation, SourceByteBudget};
+
+/// Test instrumentation: record each `(source_id, sequence)` pair the
+/// per-source actor passes to
+/// [`AckCoordinator::register_pending`](crate::ack_coordinator::AckCoordinator::register_pending)
+/// in its admission arm, in admission order. Pins
+/// INV-ADMISSION-CONTIGUOUS under parallel fetch (row 6.2). Plain
+/// `pub` — gating it behind `#[cfg(test)]` would hide it from
+/// integration tests under `tests/`, which link against the runtime
+/// crate as a published library and do not see test-only items.
+pub type AdmissionRecorder = Arc<std::sync::Mutex<Vec<(SourceId, u64)>>>;
+
+/// Test instrumentation: inject artificial latency at the fetch
+/// stage so a test can stress the actor's admission ordering under
+/// uneven fetch completion times (row 6.2 §Test Plan
+/// `pipeline_register_pending_called_in_admission_order`). The
+/// closure receives the descriptor's `buffer_sequence` and returns
+/// the `Duration` the fetch worker should sleep before invoking
+/// `BufferSourceFetchHandle::fetch`. Not used in production.
+pub type TestFetchDelayFn = Arc<dyn Fn(u64) -> Duration + Send + Sync>;
 
 // =========================================================================
 // Public configuration types
@@ -284,6 +305,18 @@ struct AdmittedDescriptor {
     batch_permit: tokio::sync::OwnedSemaphorePermit,
 }
 
+/// Output of a fetch worker. The reservation + batch_permit travel
+/// with the unit through decode + sink; they drop when the decode
+/// worker emits a `WriteCompletion` (success or fatal).
+struct FetchedBatch {
+    source_batch: SourceBatch,
+    reservation: ByteReservation,
+    batch_permit: tokio::sync::OwnedSemaphorePermit,
+    /// Original descriptor sequence — used by the decode worker to
+    /// validate the decoded range matches what admission registered.
+    admitted_sequence: u64,
+}
+
 /// Worker → actor completion message.
 enum WriteCompletion {
     Committed(CommittedReport),
@@ -312,6 +345,8 @@ pub struct Runtime {
     options: RuntimeOptions,
     progress_tx: watch::Sender<RuntimeProgress>,
     progress_rx: watch::Receiver<RuntimeProgress>,
+    admission_recorder: Option<AdmissionRecorder>,
+    test_fetch_delay: Option<TestFetchDelayFn>,
 }
 
 pub struct RuntimeBuilder {
@@ -319,6 +354,8 @@ pub struct RuntimeBuilder {
     decoder: Option<Arc<dyn Decoder>>,
     sink: Option<Arc<dyn Sink>>,
     options: RuntimeOptions,
+    admission_recorder: Option<AdmissionRecorder>,
+    test_fetch_delay: Option<TestFetchDelayFn>,
 }
 
 impl Runtime {
@@ -328,6 +365,8 @@ impl Runtime {
             decoder: None,
             sink: None,
             options: RuntimeOptions::default(),
+            admission_recorder: None,
+            test_fetch_delay: None,
         }
     }
 
@@ -342,7 +381,7 @@ impl Runtime {
     }
 
     /// Run until cancellation. On `shutdown.cancelled()` admission
-    /// stops, the in-flight unit drains, the durable ack frontier is
+    /// stops, the in-flight units drain, the durable ack frontier is
     /// flushed, and the function returns `Ok(())`. Any pipeline /
     /// sink / source error halts the runtime with the corresponding
     /// `RuntimeError`.
@@ -355,6 +394,8 @@ impl Runtime {
             options,
             progress_tx,
             progress_rx: _progress_rx,
+            admission_recorder,
+            test_fetch_delay,
         } = self;
 
         info!(
@@ -367,32 +408,59 @@ impl Runtime {
         let source_id = source.id().clone();
         let sink_id = sink.id().clone();
         let bp = options.backpressure_for(&source_id);
+        let fetch_concurrency = bp.fetch_concurrency.max(1) as usize;
+        // Channel depths follow the per-source batch-count axis so
+        // backpressure stays purely on `batch_semaphore` (the
+        // per-source budget actor + the slot semaphore are the
+        // gates; the channels themselves are just hand-off
+        // queues). Match Phase 6 design §Internal channel types.
+        let channel_depth = bp.max_inflight_batches.max(1) as usize;
 
         // Per-source byte budget + batch-slot semaphore. Both feed
         // backpressure on the actor's admission arm.
         let budget = SourceByteBudget::new(source_id.clone(), bp.max_inflight_bytes);
         let batch_semaphore = Arc::new(Semaphore::new(bp.max_inflight_batches.max(1) as usize));
 
-        // Channels. Row 6.1 keeps them 1-element-deep — the
-        // bounded shape pre-bakes 6.2's MPMC topology without
-        // unlocking parallelism.
-        let (descriptor_tx, descriptor_rx) = async_channel::bounded::<AdmittedDescriptor>(1);
-        let (completion_tx, completion_rx) = mpsc::channel::<WriteCompletion>(1);
+        let (descriptor_tx, descriptor_rx) =
+            async_channel::bounded::<AdmittedDescriptor>(channel_depth);
+        let (fetched_tx, fetched_rx) = async_channel::bounded::<FetchedBatch>(channel_depth);
+        let (completion_tx, completion_rx) = mpsc::channel::<WriteCompletion>(channel_depth);
 
         let mut coordinator = coordinators.take(&source_id).ok_or_else(|| {
             RuntimeError::Ack(format!("no coordinator registered for source {source_id}",))
         })?;
 
-        let fetch_handle = source.fetch_handle();
+        // Spawn N fetch workers. Each holds a clone of the
+        // `BufferSourceFetchHandle` — RFC 0003 says `fetch(&self,
+        // ...)` is safe to call from N tasks against distinct
+        // descriptors. The shared `descriptor_rx` is an
+        // async_channel receiver: cloning the receiver is the MPMC
+        // pattern (each worker's clone reads from the same queue;
+        // `recv` is wait-and-grab).
+        let mut fetch_handles = Vec::with_capacity(fetch_concurrency);
+        for worker_idx in 0..fetch_concurrency {
+            let handle = source.fetch_handle();
+            let rx = descriptor_rx.clone();
+            let tx = fetched_tx.clone();
+            let completion = completion_tx.clone();
+            let src_id = source_id.clone();
+            let delay = test_fetch_delay.clone();
+            fetch_handles.push(tokio::spawn(fetch_worker(
+                handle, rx, tx, completion, src_id, worker_idx, delay,
+            )));
+        }
+        // Drop the local handles to descriptor_rx / fetched_tx so
+        // worker exits close the receiver side cleanly on shutdown.
+        drop(descriptor_rx);
+        drop(fetched_tx);
 
-        let worker_handle = tokio::spawn(internal_worker(
-            fetch_handle,
+        let decode_handle = tokio::spawn(decode_sink_worker(
             Arc::clone(&decoder),
             Arc::clone(&sink),
             options.clone(),
             sink_id.clone(),
             source_id.clone(),
-            descriptor_rx,
+            fetched_rx,
             completion_tx,
         ));
 
@@ -407,22 +475,46 @@ impl Runtime {
             sink_id,
             shutdown,
             progress_tx.clone(),
+            admission_recorder,
         )
         .await;
 
-        // Drop hard so the worker sees its channel closed and exits.
-        let worker_result = worker_handle.await.map_err(|join_err| {
-            RuntimeError::Pipeline(format!("internal worker panicked: {join_err}"))
+        // Drain fetch workers (their descriptor_rx closes once the
+        // actor drops descriptor_tx). Collect the first fatal — if
+        // any — so it surfaces. Fetch workers that exit cleanly via
+        // a closed channel return `Ok(())`.
+        let mut fetch_result: RuntimeResult<()> = Ok(());
+        for handle in fetch_handles {
+            match handle.await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    if fetch_result.is_ok() {
+                        fetch_result = Err(e);
+                    }
+                }
+                Err(join_err) => {
+                    if fetch_result.is_ok() {
+                        fetch_result = Err(RuntimeError::Pipeline(format!(
+                            "fetch worker panicked: {join_err}"
+                        )));
+                    }
+                }
+            }
+        }
+
+        let decode_result = decode_handle.await.map_err(|join_err| {
+            RuntimeError::Pipeline(format!("decode/sink worker panicked: {join_err}"))
         })?;
 
         // Surface the most informative error: actor errors take
         // precedence (they reflect coordinator / source state) but
         // a worker fatal that the actor never observed is still a
         // failure.
-        match (actor_result, worker_result) {
-            (Err(e), _) => Err(e),
-            (Ok(()), Err(e)) => Err(e),
-            (Ok(()), Ok(())) => {
+        match (actor_result, fetch_result, decode_result) {
+            (Err(e), _, _) => Err(e),
+            (Ok(()), Err(e), _) => Err(e),
+            (Ok(()), Ok(()), Err(e)) => Err(e),
+            (Ok(()), Ok(()), Ok(())) => {
                 info!("runtime exited cleanly");
                 Ok(())
             }
@@ -457,6 +549,25 @@ impl RuntimeBuilder {
         self
     }
 
+    /// Attach a test-only [`AdmissionRecorder`]. Each
+    /// `(source_id, sequence)` pair the per-source actor passes to
+    /// `register_pending` lands in the recorder's `Vec` in
+    /// admission order. Pin INV-ADMISSION-CONTIGUOUS in integration
+    /// tests where you can't observe the coordinator directly.
+    pub fn with_admission_recorder(mut self, recorder: AdmissionRecorder) -> Self {
+        self.admission_recorder = Some(recorder);
+        self
+    }
+
+    /// Attach a test-only [`TestFetchDelayFn`]. Each fetch worker
+    /// sleeps for `delay(descriptor.sequence)` before invoking the
+    /// underlying `BufferSourceFetchHandle::fetch`. Used to stress
+    /// admission ordering under uneven fetch completion times.
+    pub fn with_test_fetch_delay(mut self, delay: TestFetchDelayFn) -> Self {
+        self.test_fetch_delay = Some(delay);
+        self
+    }
+
     pub fn build(self) -> RuntimeResult<Runtime> {
         let source = self
             .source
@@ -478,6 +589,8 @@ impl RuntimeBuilder {
             options: self.options,
             progress_tx,
             progress_rx,
+            admission_recorder: self.admission_recorder,
+            test_fetch_delay: self.test_fetch_delay,
         })
     }
 }
@@ -502,6 +615,7 @@ async fn per_source_actor(
     _sink_id: SinkId,
     shutdown: CancellationToken,
     progress_tx: watch::Sender<RuntimeProgress>,
+    admission_recorder: Option<AdmissionRecorder>,
 ) -> RuntimeResult<()> {
     let source_id = source.id().clone();
     let bp = options.backpressure_for(&source_id);
@@ -631,7 +745,13 @@ async fn per_source_actor(
                 let seq = descriptor.sequence;
 
                 // INV-ADMISSION-CONTIGUOUS: synchronous register
-                // before send.
+                // before send. Recorder hook fires immediately
+                // before register_pending so a test sees the
+                // admission order even when fetch/decode/sink
+                // stages complete out of order.
+                if let Some(recorder) = admission_recorder.as_ref() {
+                    recorder.lock().unwrap().push((source_id.clone(), seq));
+                }
                 coordinator.register_pending(seq, seq)?;
                 in_flight = in_flight.saturating_add(1);
 
@@ -693,21 +813,47 @@ async fn admission_attempt(
 }
 
 // =========================================================================
-// Internal worker: fetch + decode + sink (single-task for row 6.1)
+// Per-source fetch workers (row 6.2)
 // =========================================================================
 
+/// One of N fetch workers per source. Each holds a clone of the
+/// source's `BufferSourceFetchHandle` (wrapping
+/// `Arc<buffer::ConsumerFetchHandle>`, RFC 0003 — `fetch(&self, ...)`
+/// is safe to call from concurrent tasks against distinct
+/// descriptors). The shared `descriptor_rx` is an
+/// `async_channel::Receiver` clone; recv is MPMC. Re-fetch safety
+/// holds by RFC 0003 §Concurrency Model, though the actor's
+/// admission arm sends each descriptor exactly once so re-fetch is
+/// purely defense-in-depth.
+///
+/// The worker emits two metrics per fetch:
+/// - `runtime_stage_queue_depth{stage=fetch,source}` — sampled
+///   before the recv awaits.
+/// - `runtime_stage_latency_seconds{stage=fetch,source}` — observed
+///   per fetch invocation.
 #[allow(clippy::too_many_arguments)]
-async fn internal_worker(
+async fn fetch_worker(
     fetch_handle: BufferSourceFetchHandle,
-    decoder: Arc<dyn Decoder>,
-    sink: Arc<dyn Sink>,
-    options: RuntimeOptions,
-    sink_id: SinkId,
-    source_id: SourceId,
     descriptor_rx: async_channel::Receiver<AdmittedDescriptor>,
+    fetched_tx: async_channel::Sender<FetchedBatch>,
     completion_tx: mpsc::Sender<WriteCompletion>,
+    source_id: SourceId,
+    worker_idx: usize,
+    test_fetch_delay: Option<TestFetchDelayFn>,
 ) -> RuntimeResult<()> {
-    while let Ok(admitted) = descriptor_rx.recv().await {
+    let source_label = source_id.0.clone();
+    loop {
+        metrics::gauge!(
+            crate::metrics::STAGE_QUEUE_DEPTH,
+            "stage" => "fetch",
+            "source" => source_label.clone(),
+        )
+        .set(descriptor_rx.len() as f64);
+
+        let admitted = match descriptor_rx.recv().await {
+            Ok(a) => a,
+            Err(_) => return Ok(()), // descriptor channel closed; graceful exit
+        };
         let AdmittedDescriptor {
             descriptor,
             reservation,
@@ -715,34 +861,99 @@ async fn internal_worker(
         } = admitted;
         let admitted_sequence = descriptor.sequence;
 
-        let outcome = process_descriptor(
-            &fetch_handle,
+        if let Some(delay_fn) = test_fetch_delay.as_ref() {
+            let delay = delay_fn(admitted_sequence);
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
+        }
+
+        let stage_start = std::time::Instant::now();
+        let source_batch = match fetch_handle.fetch(descriptor).await {
+            Ok(b) => b,
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    source = %source_id,
+                    worker = worker_idx,
+                    "fetch worker fatal",
+                );
+                let _ = completion_tx.send(WriteCompletion::Fatal(e)).await;
+                return Ok(());
+            }
+        };
+        metrics::histogram!(
+            crate::metrics::STAGE_LATENCY_SECONDS,
+            "stage" => "fetch",
+            "source" => source_label.clone(),
+        )
+        .record(stage_start.elapsed().as_secs_f64());
+
+        if fetched_tx
+            .send(FetchedBatch {
+                source_batch,
+                reservation,
+                batch_permit,
+                admitted_sequence,
+            })
+            .await
+            .is_err()
+        {
+            // Decode stage closed unexpectedly. INV-DESCRIPTOR-LOSS-FATAL.
+            let _ = completion_tx
+                .send(WriteCompletion::Fatal(RuntimeError::Pipeline(format!(
+                    "fetched-batch lost: source={source_id} seq={admitted_sequence} cause=decode-stage-closed",
+                ))))
+                .await;
+            return Ok(());
+        }
+    }
+}
+
+// =========================================================================
+// Decode + sink worker (single task in row 6.2; row 6.3 fans out
+// decode workers; row 6.4 lifts the sink write into a shared pool).
+// =========================================================================
+
+#[allow(clippy::too_many_arguments)]
+async fn decode_sink_worker(
+    decoder: Arc<dyn Decoder>,
+    sink: Arc<dyn Sink>,
+    options: RuntimeOptions,
+    sink_id: SinkId,
+    source_id: SourceId,
+    fetched_rx: async_channel::Receiver<FetchedBatch>,
+    completion_tx: mpsc::Sender<WriteCompletion>,
+) -> RuntimeResult<()> {
+    while let Ok(fetched) = fetched_rx.recv().await {
+        let FetchedBatch {
+            source_batch,
+            reservation,
+            batch_permit,
+            admitted_sequence,
+        } = fetched;
+
+        let outcome = process_fetched_batch(
             &decoder,
             &sink,
             &options,
             &sink_id,
-            descriptor,
+            source_batch,
             admitted_sequence,
         )
         .await;
 
-        // Reservation + permit drop on completion message send (or
-        // immediately after, when the actor is gone). The
-        // `AdmittedDescriptor` is consumed; their lifetimes end at
-        // the end of this iteration regardless.
         let message = match outcome {
             Ok(report) => WriteCompletion::Committed(report),
             Err(e) => {
-                warn!(error = %e, source = %source_id, "internal worker fatal");
-                let fatal = WriteCompletion::Fatal(e);
-                let _ = completion_tx.send(fatal).await;
+                warn!(error = %e, source = %source_id, "decode/sink worker fatal");
+                let _ = completion_tx.send(WriteCompletion::Fatal(e)).await;
                 return Ok(());
             }
         };
 
         if completion_tx.send(message).await.is_err() {
-            // Actor exited; nothing more to do.
-            return Ok(());
+            return Ok(()); // actor exited
         }
 
         drop(reservation);
@@ -752,17 +963,14 @@ async fn internal_worker(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn process_descriptor(
-    fetch_handle: &BufferSourceFetchHandle,
+async fn process_fetched_batch(
     decoder: &Arc<dyn Decoder>,
     sink: &Arc<dyn Sink>,
     options: &RuntimeOptions,
     sink_id: &SinkId,
-    descriptor: SourceBatchDescriptor,
+    source_batch: SourceBatch,
     admitted_sequence: u64,
 ) -> RuntimeResult<CommittedReport> {
-    let source_batch = fetch_handle.fetch(descriptor).await?;
-
     // Per-entry envelope validation. Envelope failures route as
     // RuntimeError::Decoder so the boundary stays the same as Phase
     // 4/5.
