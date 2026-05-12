@@ -542,6 +542,169 @@ async fn pipeline_graceful_drain_completes_inflight_commits() {
     fx.producer.close().await.expect("close producer");
 }
 
+/// Oversize-fault gate. The decoder produces a `DecodedBatch`
+/// whose `estimated_bytes` is well above
+/// `estimated_max_batch_bytes × oversize_fault_multiplier`; the
+/// decode worker emits `RuntimeError::Pipeline("oversize decoded
+/// batch: …")`. Pins the worst-case over-subscription cap from
+/// row 6.3 (`SourceBackpressureOptions::oversize_fault_multiplier`).
+/// Also asserts the saturating-mul edge case: with both
+/// `estimated_max_batch_bytes = u64::MAX` and
+/// `oversize_fault_multiplier = u32::MAX` the fault must not fire
+/// (effective limit = `u64::MAX`, so any actual size is below).
+#[tokio::test]
+async fn pipeline_oversize_decoded_batch_halts_runtime() {
+    use large_records::LargeDecoder;
+    use opendata_ingest_runtime::error::RuntimeError;
+    use opendata_ingest_runtime::sink::{CommitStatus, SinkId};
+    use support::{ProgrammableSink, ScriptedWrite};
+
+    let fx = in_memory_buffer_source(
+        "ingest/test/pipeline/oversize/manifest",
+        "ingest/test/pipeline/oversize/data",
+    )
+    .await;
+    fx.producer
+        .produce(vec![Bytes::from_static(b"payload")], logs_envelope())
+        .await
+        .expect("produce");
+    fx.producer.flush().await.expect("flush");
+
+    // estimated_max_batch_bytes = 1 MiB, multiplier = 4 → limit 4
+    // MiB. Decoder produces ~10 MiB. Fault must fire.
+    let sink = ProgrammableSink::new(
+        SinkId::from("programmable"),
+        vec![ScriptedWrite::Ok { rows_written: 1 }],
+        CommitStatus::Unknown,
+    );
+    let write_calls = Arc::clone(&sink.write_calls);
+    let pessimistic: u64 = 1 << 20; // 1 MiB
+    let actual: usize = 10 * (1usize << 20); // ~10 MiB
+
+    let mut opts = options_with_fetch_concurrency(1);
+    opts.source_defaults = SourceBackpressureOptions {
+        max_inflight_batches: 1,
+        max_inflight_bytes: 64 * 1024 * 1024,
+        estimated_max_batch_bytes: pessimistic,
+        fetch_concurrency: 1,
+        decode_concurrency: 1,
+        oversize_fault_multiplier: 4,
+    };
+
+    let runtime = Runtime::builder()
+        .add_source(fx.source)
+        .add_decoder(LargeDecoder {
+            bytes_per_batch: actual,
+        })
+        .set_sink(sink)
+        .with_options(opts)
+        .build()
+        .expect("build");
+
+    let shutdown = CancellationToken::new();
+    let shutdown_run = shutdown.clone();
+    let handle = tokio::spawn(async move { runtime.run(shutdown_run).await });
+
+    let join = timeout(Duration::from_secs(5), handle)
+        .await
+        .expect("runtime should halt on oversize")
+        .expect("runtime task join");
+    let err = join.expect_err("oversize batch must halt the runtime");
+    let msg = format!("{err}");
+    assert!(
+        matches!(err, RuntimeError::Pipeline(_)),
+        "expected RuntimeError::Pipeline, got {err:?}",
+    );
+    assert!(
+        msg.contains("oversize decoded batch"),
+        "error message should call out the oversize fault: {msg}",
+    );
+
+    let write_count = write_calls.lock().unwrap().len();
+    assert_eq!(
+        write_count, 0,
+        "oversize fault halts before the sink is touched",
+    );
+
+    let _ = shutdown;
+    fx.producer.close().await.expect("close producer");
+}
+
+/// Saturating-mul edge case of the oversize gate. Setting both
+/// `estimated_max_batch_bytes = u64::MAX` and
+/// `oversize_fault_multiplier = u32::MAX` must NOT overflow the
+/// product (the runtime uses `saturating_mul`), so the effective
+/// limit is `u64::MAX` and no batch can trip the fault. Lets an
+/// operator disable the fault explicitly without bumping into a
+/// hidden overflow.
+#[tokio::test]
+async fn pipeline_oversize_fault_saturating_mul_disables_gate() {
+    use large_records::LargeDecoder;
+    use opendata_ingest_runtime::sink::{CommitStatus, SinkId};
+    use support::{ProgrammableSink, ScriptedWrite};
+
+    let fx = in_memory_buffer_source(
+        "ingest/test/pipeline/oversize-saturating/manifest",
+        "ingest/test/pipeline/oversize-saturating/data",
+    )
+    .await;
+    fx.producer
+        .produce(vec![Bytes::from_static(b"payload")], logs_envelope())
+        .await
+        .expect("produce");
+    fx.producer.flush().await.expect("flush");
+
+    let sink = ProgrammableSink::new(
+        SinkId::from("programmable"),
+        vec![ScriptedWrite::Ok { rows_written: 1 }],
+        CommitStatus::Unknown,
+    );
+
+    let mut opts = options_with_fetch_concurrency(1);
+    opts.source_defaults = SourceBackpressureOptions {
+        max_inflight_batches: 1,
+        max_inflight_bytes: u64::MAX,
+        estimated_max_batch_bytes: u64::MAX,
+        fetch_concurrency: 1,
+        decode_concurrency: 1,
+        oversize_fault_multiplier: u32::MAX,
+    };
+
+    let runtime = Runtime::builder()
+        .add_source(fx.source)
+        .add_decoder(LargeDecoder {
+            bytes_per_batch: 10 * (1usize << 20),
+        })
+        .set_sink(sink)
+        .with_options(opts)
+        .build()
+        .expect("build");
+    let mut progress_rx = runtime.progress();
+
+    let shutdown = CancellationToken::new();
+    let shutdown_run = shutdown.clone();
+    let handle = tokio::spawn(async move { runtime.run(shutdown_run).await });
+
+    timeout(Duration::from_secs(5), async {
+        loop {
+            progress_rx.changed().await.expect("progress closed");
+            if progress_rx.borrow().source_ranges_committed >= 1 {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("runtime should commit the batch when the gate is disabled");
+
+    shutdown.cancel();
+    handle
+        .await
+        .expect("runtime task join")
+        .expect("runtime exited cleanly");
+
+    fx.producer.close().await.expect("close producer");
+}
+
 /// MEDIUM-1 path: decode-time byte reconciliation. The pessimistic
 /// admission reservation is small (`estimated_max_batch_bytes =
 /// 4 KiB`); the decoder produces a `DecodedBatch` reporting a much
