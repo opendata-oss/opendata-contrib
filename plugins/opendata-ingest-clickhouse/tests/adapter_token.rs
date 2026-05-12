@@ -237,21 +237,41 @@ fn adapter_token_changes_with_chunking_fingerprint_inputs() {
         .clone();
     assert_ne!(baseline, differ_quorum, "insert_quorum must affect token");
 
-    // insert_quorum None vs Some("") — defense-in-depth that
-    // the hasher disambiguates the two states (it writes
-    // `insert_quorum={}\n` with the unwrap_or default).
+    // insert_quorum None vs the baseline's Some("auto"). The
+    // hasher serializes the quorum value (or `""` when None),
+    // so these should differ at the token level even though
+    // None and Some("") would collide.
     let mut cfg = baseline_cfg.clone();
     cfg.insert_quorum = None;
-    let _differ_none = OtlpLogsClickHouseAdapter::new(cfg)
+    let differ_none = OtlpLogsClickHouseAdapter::new(cfg)
         .plan(batch("manifests/base", 0, 0, 1))
         .expect("plan none")[0]
         .idempotency_token
         .clone();
-    // (The current hasher serializes `None` as `insert_quorum=\n` —
-    // same as `Some("")`. Document the current behavior; if a
-    // future hasher disambiguates, change the assertion. Not
-    // load-bearing for v1 because `insert_quorum` is set in the
-    // production binary config.)
+    assert_ne!(
+        baseline, differ_none,
+        "insert_quorum None vs Some(\"auto\") must affect token"
+    );
+
+    // Documented current-behavior collision: insert_quorum
+    // None and Some("") hash identically because the hasher
+    // writes `insert_quorum=\n` (via `as_deref().unwrap_or("")`).
+    // Pin it as a sentinel so a future hasher tightening
+    // forces an `_adapter_version` bump.
+    let mut cfg_empty = baseline_cfg.clone();
+    cfg_empty.insert_quorum = Some(String::new());
+    let differ_empty = OtlpLogsClickHouseAdapter::new(cfg_empty)
+        .plan(batch("manifests/base", 0, 0, 1))
+        .expect("plan empty")[0]
+        .idempotency_token
+        .clone();
+    assert_eq!(
+        differ_none, differ_empty,
+        "insert_quorum None and Some(\"\") currently collide \
+         in the chunking fingerprint; if this assertion ever \
+         fails, bump LogsAdapterConfig::adapter_version to \
+         invalidate prior tokens."
+    );
 }
 
 /// INV-CLICKHOUSE-TOKEN-DETERMINISTIC: chunk_index monotonicity

@@ -1069,3 +1069,85 @@ async fn multi_source_runtime_ack_isolation() {
         reg.frontiers().map(|(id, f)| (id.to_string(), f)).collect();
     assert_eq!(frontiers.len(), 2);
 }
+
+/// INV-ADMISSION-CONTIGUOUS (runtime-level enforcement). A
+/// decoder that returns `Vec<DecodedBatch>::new()` for a
+/// source batch would silently drop that sequence from
+/// coordinator tracking and break advance_frontier on the
+/// next batch. The runtime fails closed on empty decoder
+/// output with `RuntimeError::Decoder(_)`. Defense in depth
+/// alongside the coordinator's strict-contiguity check.
+#[tokio::test]
+async fn runtime_rejects_empty_decoder_output() {
+    use opendata_ingest_runtime::decoded_batch::DecodedBatch;
+    use opendata_ingest_runtime::decoder::Decoder;
+    use opendata_ingest_runtime::envelope::MetadataEnvelope;
+    use opendata_ingest_runtime::error::RuntimeResult;
+    use opendata_ingest_runtime::source::SourceBatch;
+
+    /// Decoder that accepts everything and returns no decoded
+    /// batches at all. v1 production decoders (OTLP logs)
+    /// always return one batch; this fake exercises the
+    /// runtime's guard.
+    struct EmptyDecoder;
+    impl Decoder for EmptyDecoder {
+        fn accepts(&self, _envelope: &MetadataEnvelope) -> bool {
+            true
+        }
+        fn decode(&self, _batch: SourceBatch) -> RuntimeResult<Vec<DecodedBatch>> {
+            Ok(Vec::new())
+        }
+    }
+
+    let fx = in_memory_buffer_source(
+        "ingest/test/empty-decoder/manifest",
+        "ingest/test/empty-decoder/data",
+    )
+    .await;
+    fx.producer
+        .produce(vec![Bytes::from_static(b"payload")], logs_envelope())
+        .await
+        .expect("produce");
+    fx.producer.flush().await.expect("flush");
+
+    let sink = support::FakeSink::new("fake");
+    let captured = Arc::clone(&sink.captured);
+
+    let runtime = Runtime::builder()
+        .add_source(fx.source)
+        .add_decoder(EmptyDecoder)
+        .set_sink(sink)
+        .with_options(live_options())
+        .build()
+        .expect("build");
+    let mut progress_rx = runtime.progress();
+
+    let shutdown = CancellationToken::new();
+    let shutdown_run = shutdown.clone();
+    let handle = tokio::spawn(async move { runtime.run(shutdown_run).await });
+
+    let join = timeout(Duration::from_secs(5), handle)
+        .await
+        .expect("runtime should exit on empty decoder output")
+        .expect("runtime task join");
+    let err = join.expect_err("empty decoder output must surface as RuntimeError");
+    assert!(
+        matches!(err, RuntimeError::Decoder(_)),
+        "expected RuntimeError::Decoder, got {err:?}"
+    );
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("empty Vec<DecodedBatch>") || msg.contains("INV-ADMISSION-CONTIGUOUS"),
+        "expected admission-contiguity message, got: {msg}"
+    );
+
+    // Sink must never see a write — the runtime exits before
+    // mark_committed runs.
+    assert!(captured.lock().unwrap().is_empty());
+    // Ack frontier never advanced.
+    let p = *progress_rx.borrow_and_update();
+    assert_eq!(p.last_acked_sequence, None);
+
+    let _ = shutdown;
+    fx.producer.close().await.expect("close producer");
+}

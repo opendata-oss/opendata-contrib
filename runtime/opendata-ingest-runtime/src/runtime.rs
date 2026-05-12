@@ -258,6 +258,26 @@ impl Runtime {
         }
 
         let decoded = self.decoder.decode(batch)?;
+        if decoded.is_empty() {
+            // A decoder returning zero DecodedBatches would
+            // silently drop this source sequence from
+            // coordinator tracking; the next sequence's
+            // register_pending would then fail
+            // INV-ADMISSION-CONTIGUOUS, but only at the next
+            // batch. Reject the empty output here so the error
+            // points at the offending decode call. v1
+            // decoders (OTLP logs) always return exactly one
+            // DecodedBatch per source batch; a future v2
+            // decoder that legitimately skips records should
+            // emit a zero-record DecodedBatch instead.
+            return Err(RuntimeError::Decoder(
+                "decoder returned empty Vec<DecodedBatch>; \
+                 every source batch must produce at least one \
+                 DecodedBatch (zero-record allowed) to keep \
+                 admission contiguous (INV-ADMISSION-CONTIGUOUS)"
+                    .into(),
+            ));
+        }
         let mut rows_written = 0u64;
 
         for db in decoded {

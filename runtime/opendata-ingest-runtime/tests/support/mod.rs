@@ -248,6 +248,12 @@ pub struct BlockToken {
     release: Arc<Notify>,
     entered: Arc<Notify>,
     entered_count: Arc<AtomicUsize>,
+    /// Back-reference to the sink's `gate_active` flag so
+    /// `Drop` can disengage the gate. Without this, a token's
+    /// drop would wake current waiters but leave the gate
+    /// armed; a later sink call (in the same test) would park
+    /// forever.
+    gate_active: Arc<Mutex<bool>>,
 }
 
 impl BlockToken {
@@ -267,12 +273,16 @@ impl BlockToken {
 
 impl Drop for BlockToken {
     fn drop(&mut self) {
-        // Release every gated call currently parked at the gate.
+        // Disengage the gate FIRST so any sink call already
+        // racing into `maybe_park` (or arriving later in the
+        // same test) sees `gate_active == false` and proceeds
+        // without parking. Then wake any waiters currently
+        // parked.
+        *self.gate_active.lock().unwrap() = false;
         // `Notify::notify_waiters` wakes all waiters present at
         // the time of the call (unlike `notify_one`, which only
-        // signals one). Tests typically have at most one parked
-        // call, but a multi-entry script with several entries
-        // could have queued more — be permissive.
+        // signals one). Multi-entry scripts can leave more than
+        // one waiter parked; wake them all.
         self.release.notify_waiters();
     }
 }
@@ -317,10 +327,11 @@ impl ProgrammableSink {
 
     /// Replace the script atomically so one sink instance can be
     /// reused across a pre-crash/post-crash test boundary
-    /// without rebuilding fixtures. The new script also
-    /// implicitly resets the gate: a fresh
-    /// `block_until_released` after `replace_script` will
-    /// observe the next call.
+    /// without rebuilding fixtures.
+    ///
+    /// Gate state is **not** modified — `replace_script` only
+    /// swaps the response queue. To re-engage a gate after a
+    /// prior token dropped, call `block_until_released` again.
     pub fn replace_script(&self, new_script: Vec<ScriptedWrite>) {
         *self.write_script.lock().unwrap() = new_script.into();
     }
@@ -340,7 +351,9 @@ impl ProgrammableSink {
     /// Only one active gate per sink at a time; constructing a
     /// second gate while the first is alive replaces the
     /// internal flags but the token's drop semantics still hold
-    /// (the previous token's drop will wake any waiters).
+    /// (the previous token's drop will wake any waiters and
+    /// clear `gate_active`, which the new token's construction
+    /// then resets to `true`).
     pub fn block_until_released(&self, also_gate_write: bool) -> BlockToken {
         *self.gate_active.lock().unwrap() = true;
         *self.gate_writes.lock().unwrap() = also_gate_write;
@@ -351,6 +364,7 @@ impl ProgrammableSink {
             release: Arc::clone(&self.gate_release),
             entered: Arc::clone(&self.gate_entered),
             entered_count: Arc::clone(&self.gate_entered_count),
+            gate_active: Arc::clone(&self.gate_active),
         }
     }
 

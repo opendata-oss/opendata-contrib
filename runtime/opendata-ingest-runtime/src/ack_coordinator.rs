@@ -13,8 +13,16 @@
 //!
 //! - INV-FRONTIER-NEVER-OVER-HOLE — `frontier()` never returns a
 //!   value that skips an uncommitted pending range.
-//! - INV-ADMISSION-ORDER — `register_pending(low, _)` is strictly
-//!   monotonic per source.
+//! - INV-ADMISSION-CONTIGUOUS — `register_pending(low, _)` is
+//!   strictly contiguous per source: the first call satisfies
+//!   the baseline floor (`low == initial_frontier_baseline + 1`
+//!   when supplied, else any `low` is absorbed); every
+//!   subsequent call satisfies `low == last_registered_high +
+//!   1`. Stronger than mere monotonicity: catches admission
+//!   gaps that would silently stall `advance_frontier` at the
+//!   hole forever (e.g., a decoder that returns an empty
+//!   `Vec<DecodedBatch>` for a source batch and silently drops
+//!   it from coordinator tracking).
 //! - INV-FRONTIER-BASELINE-FLOOR — the coordinator's
 //!   `effective_baseline` is fixed once, by the constructor's
 //!   `initial_frontier_baseline` (when known durably) or by the
@@ -80,9 +88,18 @@ pub struct AckCoordinator {
     /// Highest sequence the coordinator has committed since
     /// construction. `None` until the first commit lands.
     acked_frontier: Option<u64>,
-    /// Highest `low` value passed to a successful
-    /// `register_pending`. Used to enforce INV-ADMISSION-ORDER.
-    last_registered_low: Option<u64>,
+    /// Highest `high` value passed to a successful
+    /// `register_pending`. Used to enforce
+    /// INV-ADMISSION-CONTIGUOUS: each subsequent register call
+    /// must have `low == last_registered_high + 1`. Stronger
+    /// than the original monotonicity check (`low >
+    /// last_registered_low`): admission gaps would silently
+    /// stall `advance_frontier` at the hole. The strict-
+    /// contiguity check catches a decoder that drops a source
+    /// batch (returns empty `Vec<DecodedBatch>`) at the next
+    /// admission attempt instead of letting the frontier stall
+    /// forever.
+    last_registered_high: Option<u64>,
     /// Ranges that have entered the pipeline. Keyed by `low`
     /// (unique by INV-PENDING-DISJOINT).
     pending: BTreeMap<u64, PendingRange>,
@@ -106,7 +123,7 @@ impl AckCoordinator {
             effective_baseline: initial_frontier_baseline,
             baseline_fixed: initial_frontier_baseline.is_some(),
             acked_frontier: None,
-            last_registered_low: None,
+            last_registered_high: None,
             pending: BTreeMap::new(),
         }
     }
@@ -152,7 +169,12 @@ impl AckCoordinator {
     ///
     /// Returns `Err(RuntimeError::Ack)` when any of:
     /// - `low > high` (caller bug),
-    /// - INV-ADMISSION-ORDER: `low <= last_registered_low`,
+    /// - INV-ADMISSION-CONTIGUOUS: `low != last_registered_high + 1`
+    ///   after the first registration. Stronger than mere
+    ///   monotonicity: admission gaps would silently stall
+    ///   `advance_frontier` at the hole. Catches a decoder that
+    ///   drops a source batch (returns empty
+    ///   `Vec<DecodedBatch>`) at the next admission attempt.
     /// - INV-FRONTIER-BASELINE-FLOOR against a constructor-supplied
     ///   baseline: `low != b + 1` on the first range when
     ///   `initial_frontier_baseline == Some(b)`,
@@ -167,7 +189,7 @@ impl AckCoordinator {
 
         // INV-FRONTIER-BASELINE-FLOOR (constructor-supplied
         // baseline path; strict equality).
-        if self.last_registered_low.is_none()
+        if self.last_registered_high.is_none()
             && let Some(b) = self.initial_frontier_baseline
             && low != b.saturating_add(1)
         {
@@ -177,14 +199,18 @@ impl AckCoordinator {
             )));
         }
 
-        // INV-ADMISSION-ORDER.
-        if let Some(prev) = self.last_registered_low
-            && low <= prev
-        {
-            return Err(RuntimeError::Ack(format!(
-                "non-monotonic admission on source {}: prev_low={prev}, new low={low}",
-                self.source,
-            )));
+        // INV-ADMISSION-CONTIGUOUS: strict equality on the next
+        // expected low. Stronger than the rev-6 monotonicity
+        // check; catches the "decoder dropped a source batch"
+        // liveness gap by failing loud at the next admission.
+        if let Some(prev_high) = self.last_registered_high {
+            let expected = prev_high.saturating_add(1);
+            if low != expected {
+                return Err(RuntimeError::Ack(format!(
+                    "non-contiguous admission on source {}: last_high={prev_high}, expected low={expected}, got low={low}",
+                    self.source,
+                )));
+            }
         }
 
         // INV-NO-ACK-BEFORE-COMMIT defense in depth.
@@ -230,7 +256,7 @@ impl AckCoordinator {
                 sink_committed: false,
             },
         );
-        self.last_registered_low = Some(low);
+        self.last_registered_high = Some(high);
         Ok(())
     }
 
@@ -267,8 +293,8 @@ impl AckCoordinator {
     /// Pops every committed pending range whose `low` equals the
     /// next-expected sequence; stops at the first uncommitted
     /// range or the first non-contiguous committed range (the
-    /// latter is unreachable in Phase 5 under INV-ADMISSION-ORDER
-    /// but matters under Phase 6 parallel completion).
+    /// latter is unreachable under INV-ADMISSION-CONTIGUOUS,
+    /// which guarantees the pending map is gap-free).
     pub fn advance_frontier(&mut self) {
         if !self.baseline_fixed {
             // No `register_pending` has run yet, so the pending
@@ -289,10 +315,10 @@ impl AckCoordinator {
                 },
             };
             if next_low != expected_low {
-                // Hole between baseline/frontier and the next
-                // pending range. Phase 5: unreachable under
-                // INV-ADMISSION-ORDER. Phase 6: wait for the
-                // earlier range's commit.
+                // Defense in depth: under INV-ADMISSION-CONTIGUOUS
+                // every pending range slots into the next-expected
+                // sequence, so this branch is unreachable in
+                // well-formed input. Bail out without advancing.
                 return;
             }
             self.pending.pop_first();
@@ -417,9 +443,48 @@ mod tests {
         let mut c = coord(None);
         c.register_pending(0, 0).unwrap();
         c.register_pending(1, 1).unwrap();
-        // Same low or lower — INV-ADMISSION-ORDER.
+        // Same low (or lower) — fails INV-ADMISSION-CONTIGUOUS
+        // (the strict-equality successor check subsumes the
+        // monotonicity check).
         let err = c.register_pending(1, 1).unwrap_err();
         assert!(matches!(err, RuntimeError::Ack(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn register_pending_rejects_admission_gap() {
+        // INV-ADMISSION-CONTIGUOUS. A decoder that drops a
+        // source batch (returns empty Vec<DecodedBatch>) would
+        // skip its sequence in admission. The next attempt
+        // (jumping from N to N+2) must be rejected loud rather
+        // than silently stalling advance_frontier at the hole.
+        let mut c = coord(None);
+        c.register_pending(0, 0).unwrap();
+        // Gap: expected 1, got 2.
+        let err = c.register_pending(2, 2).unwrap_err();
+        assert!(matches!(err, RuntimeError::Ack(_)), "got {err:?}");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("non-contiguous admission"),
+            "expected contiguity-error message, got: {msg}"
+        );
+        // The reject is non-destructive: pending count stays
+        // 1, and the next correct admission (low=1) succeeds.
+        assert_eq!(c.pending_count(), 1);
+        c.register_pending(1, 1).unwrap();
+        assert_eq!(c.pending_count(), 2);
+    }
+
+    #[test]
+    fn register_pending_rejects_gap_when_high_spans_multiple_sequences() {
+        // INV-ADMISSION-CONTIGUOUS, multi-sequence variant. A
+        // hypothetical v2 decoder could emit a DecodedBatch
+        // spanning low..=high; the next admission must start
+        // at high + 1 exactly.
+        let mut c = coord(None);
+        c.register_pending(0, 4).unwrap();
+        let err = c.register_pending(6, 6).unwrap_err(); // expected 5
+        assert!(matches!(err, RuntimeError::Ack(_)), "got {err:?}");
+        c.register_pending(5, 5).unwrap();
     }
 
     // --- INV-FRONTIER-BASELINE-FLOOR ---
