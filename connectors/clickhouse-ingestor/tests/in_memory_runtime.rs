@@ -29,7 +29,9 @@ use opendata_ingest_runtime::decoded_batch::DecodedRecords;
 use opendata_ingest_runtime::envelope::{ConfiguredEnvelope, PayloadEncoding, SignalType};
 use opendata_ingest_runtime::error::{RuntimeError, RuntimeResult};
 use opendata_ingest_runtime::identity::CommitIdentity;
-use opendata_ingest_runtime::runtime::{AckFlushPolicy, Runtime, RuntimeOptions};
+use opendata_ingest_runtime::runtime::{
+    AckFlushPolicy, Runtime, RuntimeOptions, SinkPoolOptions, SourceBackpressureOptions,
+};
 use opendata_ingest_runtime::sink::{
     CommitStatus, Sink, SinkBudget, SinkCommit, SinkCommitFailure, SinkCommitResult, SinkId,
 };
@@ -196,6 +198,9 @@ fn options(dry_run: bool) -> RuntimeOptions {
         max_descriptors_per_poll: 1,
         max_retry_attempts: 0,
         retry_backoff: Duration::from_millis(0),
+        source_defaults: SourceBackpressureOptions::serial(),
+        source_overrides: Default::default(),
+        sink: SinkPoolOptions::default(),
     }
 }
 

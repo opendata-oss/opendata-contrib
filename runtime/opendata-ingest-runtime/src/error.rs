@@ -36,4 +36,13 @@ pub enum RuntimeError {
     /// returns this rather than `panic!()`.
     #[error("unsupported in this runtime version: {0}")]
     Unsupported(&'static str),
+
+    /// A pipeline stage encountered an unrecoverable structural
+    /// violation that the per-source actor cannot resolve. Covers
+    /// lost descriptors (INV-DESCRIPTOR-LOSS-FATAL), a fetch /
+    /// decode worker panic, channel close on a non-shutdown path,
+    /// oversize decoded batches, and decoded ranges that disagree
+    /// with the admitted source range.
+    #[error("pipeline error: {0}")]
+    Pipeline(String),
 }

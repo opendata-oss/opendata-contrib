@@ -18,7 +18,9 @@ use clickhouse_ingestor::{ClickHouseSink, OtlpLogsDecoder};
 use common::ObjectStoreConfig;
 use common::clock::SystemClock;
 use opendata_ingest_runtime::envelope::{ConfiguredEnvelope, PayloadEncoding, SignalType};
-use opendata_ingest_runtime::runtime::{AckFlushPolicy, Runtime, RuntimeOptions};
+use opendata_ingest_runtime::runtime::{
+    AckFlushPolicy, Runtime, RuntimeOptions, SinkPoolOptions, SourceBackpressureOptions,
+};
 use opendata_ingest_runtime::source::BufferSource;
 use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
 use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue, any_value::Value};
@@ -212,6 +214,9 @@ async fn clickhouse_round_trip_with_dedup() -> Result<(), Box<dyn std::error::Er
         max_descriptors_per_poll: 1,
         max_retry_attempts: 3,
         retry_backoff: Duration::from_millis(100),
+        source_defaults: SourceBackpressureOptions::serial(),
+        source_overrides: Default::default(),
+        sink: SinkPoolOptions::default(),
     };
     let adapter = Arc::new(OtlpLogsClickHouseAdapter::new(adapter_cfg.clone()));
     let sink_writer = Arc::new(writer.clone());

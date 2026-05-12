@@ -16,6 +16,7 @@ buffer = { package = "opendata-buffer", version = "0.2.0" }
 common = { package = "opendata-common", version = "0.1.14" }
 
 anyhow = "1.0"
+async-channel = "2"
 axum = "0.8"
 bytes = "1.0"
 clap = { version = "4", features = ["derive", "env"] }
@@ -43,3 +44,16 @@ urlencoding = "2.1"
 [profile.release]
 debug = true
 strip = "none"
+
+# Phase 6 dev-only patch (impl-plan row 6.1; phase06 design §Migration
+# Plan step 1). Points opendata-buffer and opendata-common at the
+# Phase 2 read-ahead-impl worktree so the runtime can consume the
+# RFC 0003 surface (`next_descriptors`, `fetch_handle`,
+# `ack_through`) before that work ships as a published 0.3 release.
+#
+# Phase 11.2 (release flip) removes this block once the buffer
+# release lands. See `plans/odb-high-throughput/local-development.md`
+# §Cross-Repo Path Dependencies.
+[patch.crates-io]
+opendata-buffer = { path = "../opendata-2-buffer-readahead-impl/buffer" }
+opendata-common = { path = "../opendata-2-buffer-readahead-impl/common" }

@@ -16,7 +16,9 @@ use std::time::Duration;
 use bytes::Bytes;
 use opendata_ingest_runtime::envelope::{ConfiguredEnvelope, PayloadEncoding, SignalType};
 use opendata_ingest_runtime::error::RuntimeError;
-use opendata_ingest_runtime::runtime::{AckFlushPolicy, Runtime, RuntimeOptions};
+use opendata_ingest_runtime::runtime::{
+    AckFlushPolicy, Runtime, RuntimeOptions, SinkPoolOptions, SourceBackpressureOptions,
+};
 use opendata_ingest_runtime::sink::{CommitStatus, SinkId};
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
@@ -39,6 +41,9 @@ fn live_options() -> RuntimeOptions {
         max_descriptors_per_poll: 1,
         max_retry_attempts: 3,
         retry_backoff: Duration::from_millis(0),
+        source_defaults: SourceBackpressureOptions::serial(),
+        source_overrides: Default::default(),
+        sink: SinkPoolOptions::default(),
     }
 }
 

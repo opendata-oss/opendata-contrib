@@ -371,6 +371,14 @@ impl AckCoordinators {
         self.coordinators.get_mut(source)
     }
 
+    /// Remove a coordinator from the registry and return it. Phase 6
+    /// row 6.1's per-source actor takes ownership of its coordinator
+    /// via this method so admission and completion arms can hold
+    /// `&mut AckCoordinator` directly (no `Arc<Mutex<_>>`).
+    pub fn take(&mut self, source: &SourceId) -> Option<AckCoordinator> {
+        self.coordinators.remove(source)
+    }
+
     /// Iterator over `(SourceId, frontier)` for metric emission /
     /// dry-run progress reporting.
     pub fn frontiers(&self) -> impl Iterator<Item = (&SourceId, Option<u64>)> {

@@ -25,26 +25,60 @@ jobs:
           docker-images: true
           swap-storage: true
 
-      - uses: actions/checkout@v4
+      - name: Checkout opendata-contrib
+        uses: actions/checkout@v4
+        with:
+          path: opendata-contrib
+
+      # Phase 6 dual-checkout (phase06 design §Open Questions Q1
+      # option 2). The runtime crate's workspace `[patch.crates-io]`
+      # block points `opendata-buffer` / `opendata-common` at this
+      # sibling checkout so cargo can resolve the unreleased RFC 0003
+      # read-ahead API surface. Phase 11.2 (release flip) removes the
+      # patch block + this step in one motion.
+      - name: Read pinned opendata buffer SHA
+        id: buffer_sha
+        working-directory: opendata-contrib
+        run: |
+          SHA="$(tr -d '[:space:]' < .odb-ht-buffer-sha)"
+          if [ -z "$SHA" ]; then
+            echo "::error::.odb-ht-buffer-sha is empty"
+            exit 1
+          fi
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout opendata at pinned buffer SHA
+        uses: actions/checkout@v4
+        with:
+          repository: opendata-oss/opendata
+          ref: ${{ steps.buffer_sha.outputs.sha }}
+          path: opendata-2-buffer-readahead-impl
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: opendata-contrib
 
       - name: Check formatting
+        working-directory: opendata-contrib
         run: cargo fmt --all -- --check
 
       - name: Run clippy
+        working-directory: opendata-contrib
         run: cargo clippy --all-targets --all-features -- -D warnings
 
       - name: Build
+        working-directory: opendata-contrib
         run: cargo build --all-targets
 
       - name: Run tests
+        working-directory: opendata-contrib
         run: cargo test --all
 
       - name: Check documentation builds
+        working-directory: opendata-contrib
         run: cargo doc --all --no-deps
         env:
           RUSTDOCFLAGS: "-D warnings"

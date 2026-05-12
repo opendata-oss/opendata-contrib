@@ -29,7 +29,9 @@ use opendata_ingest_otel::logs::OtlpLogsDecoder;
 use opendata_ingest_runtime::envelope::{ConfiguredEnvelope, PayloadEncoding, SignalType};
 use opendata_ingest_runtime::error::{RuntimeError, RuntimeResult};
 use opendata_ingest_runtime::identity::CommitIdentity;
-use opendata_ingest_runtime::runtime::{AckFlushPolicy, Runtime, RuntimeOptions};
+use opendata_ingest_runtime::runtime::{
+    AckFlushPolicy, Runtime, RuntimeOptions, SinkPoolOptions, SourceBackpressureOptions,
+};
 use opendata_ingest_runtime::sink::{
     CommitStatus, Sink, SinkBudget, SinkCommit, SinkCommitFailure, SinkCommitResult, SinkId,
 };
@@ -139,6 +141,13 @@ async fn main() -> Result<()> {
         max_descriptors_per_poll: 1,
         max_retry_attempts: cfg.runtime.retry_max_attempts,
         retry_backoff: std::time::Duration::from_millis(cfg.runtime.retry_initial_backoff_ms),
+        // Phase 6 row 6.1 wiring: keep the binary on the
+        // serial-equivalent profile until later rows turn on parallel
+        // fetch/decode/sink-writer workers and the config surface
+        // grows the matching knobs.
+        source_defaults: SourceBackpressureOptions::serial(),
+        source_overrides: Default::default(),
+        sink: SinkPoolOptions::default(),
     };
     // Compile-time sanity check that the policy translation didn't
     // drift; not strictly necessary at runtime.

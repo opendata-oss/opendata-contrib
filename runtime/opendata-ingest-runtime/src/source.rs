@@ -1,35 +1,27 @@
 //! Source-side data types and the concrete `BufferSource` for v1.
 //!
-//! For v1 (RFC 0002 rev 8), the source side is concrete — the
-//! runtime owns a `BufferSource` + `Clone` `BufferSourceFetchHandle`
-//! that wrap `buffer::Consumer` (and, once RFC 0003 ships, the
-//! paired `ConsumerFetchHandle`). This file holds the sink-neutral
-//! data types (`SourceId`, `SourceBatchDescriptor`, `SourceBatch`,
-//! `SourceEntry`, `SourceBudget`, `SourceRangeMetadata`), the
-//! `split_into_raw_entries` materialization helper, and the
-//! concrete `BufferSource` / `BufferSourceFetchHandle` pair.
+//! Phase 6 row 6.1 cut over to the RFC 0003-direct surface
+//! (`Consumer::next_descriptors`, `Consumer::fetch_handle`,
+//! `Consumer::ack_through`); the Phase 4 sequence-keyed cache and the
+//! `first_seen` resume-anchor disappear. `BufferSourceFetchHandle`
+//! wraps `Arc<buffer::ConsumerFetchHandle>` and is safe to clone into
+//! N fetch worker tasks per RFC 0003 §Concurrency Model.
 //!
-//! `opendata-buffer` v0.2.0 only ships `next_batch / ack / flush`;
-//! RFC 0003's `next_descriptors` / `ConsumerFetchHandle` /
-//! `ack_through` are not yet released. The Phase 4 `BufferSource`
-//! falls back to the serial-`next_batch` path: each
-//! `next_descriptors(max, _)` call invokes `next_batch` up to `max`
-//! times, stashes the resulting `SourceBatch` in a sequence-keyed
-//! cache shared with `BufferSourceFetchHandle`, and returns
-//! descriptors. The fetch handle pops the matching `SourceBatch`.
-//! `ack_through(seq)` issues per-sequence `Consumer::ack(s)` calls
-//! across `(last_acked+1)..=seq` because v0.2.0 lacks bulk ack.
-//! Phase 6 swaps this for the RFC 0003 path once the buffer crate
-//! releases the read-ahead API.
+//! The handle's `fetch(&self, descriptor)` is stateless. Two
+//! concurrent fetches against the same handle (or two clones) against
+//! distinct descriptors are fully independent; re-fetching the same
+//! descriptor twice is safe by the same RFC. Phase 6 row 6.2 wires
+//! the parallel fetch worker pool against this surface.
 
 use bytes::Bytes;
-use std::collections::HashMap;
+use serde::{Deserialize, Serialize};
 use std::fmt;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use crate::error::{RuntimeError, RuntimeResult};
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct SourceId(pub String);
 
 impl fmt::Display for SourceId {
@@ -61,9 +53,9 @@ pub struct SourceRangeMetadata {
 }
 
 /// Backpressure budget the source poller is allowed to consume on a
-/// single `next_descriptors` call. Phase 6 wires reservations end to
-/// end (RFC 0002 rev 6 §Backpressure Model > Byte Budget Accounting);
-/// Phase 4 only carries the type so the call shape matches.
+/// single `next_descriptors` call. Phase 6 row 6.3 wires the byte
+/// axis end to end via `SourceByteBudget`; Phase 4 only carried the
+/// type so the call shape matches.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SourceBudget {
     pub bytes_remaining: u64,
@@ -76,6 +68,12 @@ pub struct SourceBatchDescriptor {
     pub sequence: u64,
     pub location: String,
     pub per_range_metadata: Vec<SourceRangeMetadata>,
+    /// Buffer-side metadata items reconstructed by the fetch
+    /// handle when it converts the descriptor back into a
+    /// `buffer::BatchDescriptor`. Kept on the descriptor so the
+    /// fetch path is stateless: the consumer doesn't need to
+    /// cache anything per sequence.
+    pub buffer_metadata: Vec<buffer::Metadata>,
     /// Object size in bytes when the source can supply it without an
     /// extra round trip. `BufferSource` passes through
     /// `BatchDescriptor.object_bytes` (RFC 0003), which is `None`
@@ -115,9 +113,8 @@ pub struct SourceBatch {
 /// entries.
 ///
 /// Phase 4.3 moved this from `clickhouse-ingestor::source`. The
-/// `BufferSourceFetchHandle::fetch` impl in Phase 4.4 calls this to
-/// convert each underlying `buffer::ConsumedBatch` into a
-/// [`SourceBatch`].
+/// `BufferSourceFetchHandle::fetch` impl calls this to convert each
+/// underlying `buffer::ConsumedBatch` into a [`SourceBatch`].
 pub fn split_into_raw_entries(
     batch: buffer::ConsumedBatch,
     source: SourceId,
@@ -161,56 +158,69 @@ pub fn split_into_raw_entries(
     }
 }
 
-/// Cloneable fetch primitive paired with [`BufferSource`]. Each
-/// clone holds the same sequence-keyed `SourceBatch` cache the owner
-/// populates via `next_descriptors`. Cloning is O(1) (Arc bump);
-/// `fetch` is safe to call from N worker tasks against distinct
-/// descriptors, though Phase 4 only exercises the serial path.
+/// Cloneable, concurrency-safe fetch primitive paired with
+/// [`BufferSource`]. Wraps `Arc<buffer::ConsumerFetchHandle>` from
+/// RFC 0003 — the underlying handle is stateless and safe to call
+/// from N tasks against distinct descriptors. Each `BufferSource`
+/// emits a fresh handle from `BufferSource::fetch_handle()`; cloning
+/// the handle into worker tasks is O(1) (Arc bump).
 #[derive(Clone)]
 pub struct BufferSourceFetchHandle {
-    cached: Arc<Mutex<HashMap<u64, SourceBatch>>>,
+    inner: Arc<buffer::ConsumerFetchHandle>,
+    source: SourceId,
+    manifest_path: String,
 }
 
 impl BufferSourceFetchHandle {
-    /// Pop the [`SourceBatch`] that [`BufferSource::next_descriptors`]
-    /// stashed for `descriptor.sequence`. Returns an error if the
-    /// descriptor was never handed out by this fetch handle's owner.
+    /// Fetch the data object pointed at by `descriptor` and
+    /// materialize a [`SourceBatch`]. `&self` per RFC 0003 — calls
+    /// against distinct descriptors are fully independent.
+    /// Re-fetching the same descriptor twice is safe (RFC 0003
+    /// §Concurrency Model > "Re-fetching a descriptor is safe").
     pub async fn fetch(&self, descriptor: SourceBatchDescriptor) -> RuntimeResult<SourceBatch> {
-        let mut guard = self
-            .cached
-            .lock()
-            .expect("BufferSource cache mutex poisoned");
-        guard.remove(&descriptor.sequence).ok_or_else(|| {
-            RuntimeError::Source(
-                format!("no cached SourceBatch for sequence {}", descriptor.sequence).into(),
-            )
-        })
+        let buffer_descriptor = buffer::BatchDescriptor {
+            sequence: descriptor.sequence,
+            location: descriptor.location,
+            metadata: descriptor.buffer_metadata,
+            object_bytes: descriptor.object_bytes,
+        };
+        let consumed = self
+            .inner
+            .fetch(buffer_descriptor)
+            .await
+            .map_err(|e| RuntimeError::Source(Box::new(e)))?;
+        Ok(split_into_raw_entries(
+            consumed,
+            self.source.clone(),
+            self.manifest_path.clone(),
+        ))
     }
 }
 
 /// Concrete `BufferSource` for v1. Wraps `buffer::Consumer` as the
 /// manifest owner (mutates ack state through `&mut self`); paired
-/// with a [`BufferSourceFetchHandle`] that holds a `Clone` reference
-/// to the sequence-keyed batch cache.
+/// with a [`BufferSourceFetchHandle`] that wraps a cloneable
+/// `Arc<buffer::ConsumerFetchHandle>`.
 ///
-/// The runtime owns exactly one `BufferSource` per configured source
-/// and drives it from the serial poll loop in `runtime::Runtime`.
+/// The runtime owns exactly one `BufferSource` per configured source.
+/// The per-source actor task (Phase 6 row 6.4) holds the `&mut
+/// BufferSource` for the source's lifetime; admission and
+/// `ack_through` happen on distinct `select!` arms inside that one
+/// task, so no synchronization wrapper is needed.
 pub struct BufferSource {
     id: SourceId,
     consumer: buffer::Consumer,
     manifest_path: String,
-    cached: Arc<Mutex<HashMap<u64, SourceBatch>>>,
+    fetch_handle_inner: Arc<buffer::ConsumerFetchHandle>,
     last_acked: Option<u64>,
-    /// First sequence ever returned by `next_descriptors`. Used by
-    /// `ack_through` to anchor the ack range when the consumer is
-    /// resumed mid-stream (i.e. `last_acked` starts as `None` because
-    /// the caller didn't pass a `last_acked_sequence` to
-    /// `BufferSource::new` but the first batch's sequence is far
-    /// from 0). Without this, the first `ack_through(N)` would loop
-    /// `0..=N` and issue N+1 fake `Consumer::ack` calls for
-    /// sequences this source never handed out — see Phase 4 review
-    /// HIGH-1.
-    first_seen: Option<u64>,
+    /// Highest sequence advanced by `ack_through` but not yet
+    /// durably persisted. Drained on `flush_acks`. Lets the runtime
+    /// keep [`AckFlushPolicy::EveryN`] semantics from Phase 5 even
+    /// though the buffer-side [`buffer::Consumer::ack_through`] now
+    /// dequeues durably on every call (RFC 0003). Without this
+    /// indirection, every commit would be a durable boundary and
+    /// `EveryN { n }` would degrade to `EveryCommitGroup`.
+    pending_durable_ack: Option<u64>,
 }
 
 impl BufferSource {
@@ -223,13 +233,15 @@ impl BufferSource {
         manifest_path: impl Into<String>,
         last_acked_sequence: Option<u64>,
     ) -> Self {
+        let manifest_path = manifest_path.into();
+        let fetch_handle_inner = Arc::new(consumer.fetch_handle());
         Self {
             id: id.into(),
             consumer,
-            manifest_path: manifest_path.into(),
-            cached: Arc::new(Mutex::new(HashMap::new())),
+            manifest_path,
+            fetch_handle_inner,
             last_acked: last_acked_sequence,
-            first_seen: None,
+            pending_durable_ack: None,
         }
     }
 
@@ -245,106 +257,90 @@ impl BufferSource {
         self.last_acked
     }
 
-    /// Fetch up to `max` new descriptors. Each call drives
-    /// `Consumer::next_batch` (the v0.2.0 serial primitive) up to
-    /// `max` times, stashes the resulting `SourceBatch` keyed by
-    /// sequence in the shared cache, and returns descriptors. A
-    /// `next_batch` returning `Ok(None)` stops the loop early (no
-    /// more visible right now); the runtime sleeps and retries.
+    /// Fetch up to `max` new descriptors from the manifest. Delegates
+    /// directly to `Consumer::next_descriptors` (RFC 0003) — the
+    /// consumer maintains its own read-ahead cursor, so successive
+    /// calls return contiguous, monotonically increasing sequences
+    /// without re-reading the manifest each time.
     ///
-    /// `_budget` is reserved for the byte-budget filter that lands
-    /// in Phase 6; v0.2.0 batches carry no size hint, so v1 ignores
-    /// it.
+    /// `_budget` is the byte-budget filter that Phase 6 wires end to
+    /// end via [`crate::source_budget::SourceByteBudget`]; the
+    /// buffer-side `next_descriptors` does not yet accept a budget
+    /// arg, so the runtime gates admission on the budget BEFORE
+    /// calling this method (Phase 6 design §Algorithms > Per-Source
+    /// Actor).
     pub async fn next_descriptors(
         &mut self,
         max: usize,
         _budget: SourceBudget,
     ) -> RuntimeResult<Vec<SourceBatchDescriptor>> {
-        let mut descriptors = Vec::with_capacity(max);
-        for _ in 0..max {
-            match self.consumer.next_batch().await {
-                Ok(Some(batch)) => {
-                    let sequence = batch.sequence;
-                    if self.first_seen.is_none() {
-                        self.first_seen = Some(sequence);
-                    }
-                    let location = batch.location.clone();
-                    let per_range_metadata = batch
-                        .metadata
-                        .iter()
-                        .map(|m| SourceRangeMetadata {
-                            raw_metadata: m.payload.clone(),
-                            ingestion_time_ms: m.ingestion_time_ms,
-                        })
-                        .collect();
-                    let source_batch =
-                        split_into_raw_entries(batch, self.id.clone(), self.manifest_path.clone());
-                    self.cached
-                        .lock()
-                        .expect("BufferSource cache mutex poisoned")
-                        .insert(sequence, source_batch);
-                    descriptors.push(SourceBatchDescriptor {
-                        source: self.id.clone(),
-                        sequence,
-                        location,
-                        per_range_metadata,
-                        object_bytes: None,
-                    });
-                }
-                Ok(None) => break,
-                Err(e) => return Err(RuntimeError::Source(Box::new(e))),
-            }
-        }
-        Ok(descriptors)
+        let raw = self
+            .consumer
+            .next_descriptors(max)
+            .await
+            .map_err(|e| RuntimeError::Source(Box::new(e)))?;
+        Ok(raw
+            .into_iter()
+            .map(|d| SourceBatchDescriptor {
+                source: self.id.clone(),
+                sequence: d.sequence,
+                per_range_metadata: d
+                    .metadata
+                    .iter()
+                    .map(|m| SourceRangeMetadata {
+                        raw_metadata: m.payload.clone(),
+                        ingestion_time_ms: m.ingestion_time_ms,
+                    })
+                    .collect(),
+                location: d.location,
+                buffer_metadata: d.metadata,
+                object_bytes: d.object_bytes,
+            })
+            .collect())
     }
 
-    /// Build a fresh fetch handle pointing at the same sequence-keyed
-    /// cache. O(1) — `Arc` bump.
+    /// Build a fresh fetch handle. O(1) — `Arc` bump. The handle's
+    /// `fetch` method is `&self` per RFC 0003, so the runtime may
+    /// clone this into many fetch worker tasks (Phase 6 row 6.2).
     pub fn fetch_handle(&self) -> BufferSourceFetchHandle {
         BufferSourceFetchHandle {
-            cached: Arc::clone(&self.cached),
+            inner: Arc::clone(&self.fetch_handle_inner),
+            source: self.id.clone(),
+            manifest_path: self.manifest_path.clone(),
         }
     }
 
-    /// Advance the durable ack frontier through (and including)
-    /// `sequence`. `buffer::Consumer::ack` requires strict in-order,
-    /// one-at-a-time acks in v0.2.0, so this loops over
-    /// `start..=sequence`. `start` is `last_acked + 1` if anything
-    /// has been acked, else the first sequence the source ever
-    /// handed out via `next_descriptors` — never `0` unconditionally.
-    /// The latter rule prevents a stampede of fake acks on resume
-    /// when the producer has already written far past sequence 0
-    /// (see Phase 4 review HIGH-1). Phase 6 swaps the loop for
-    /// `Consumer::ack_through(seq)` once RFC 0003 ships.
+    /// Advance the in-memory ack frontier through (and including)
+    /// `sequence`. Does **not** touch the durable manifest — that
+    /// happens in [`flush_acks`](Self::flush_acks). Lets the
+    /// runtime preserve the Phase 5 `AckFlushPolicy::EveryN`
+    /// semantic on top of RFC 0003's durable-immediate
+    /// `Consumer::ack_through`.
     pub async fn ack_through(&mut self, sequence: u64) -> RuntimeResult<()> {
-        let start = match self.last_acked {
-            Some(s) => s.saturating_add(1),
-            // No prior ack on this source. Anchor at the first
-            // sequence we've actually seen via `next_descriptors`;
-            // if `ack_through` is called before any descriptor was
-            // handed out (a caller bug), fall back to acking just
-            // `sequence` so we don't fabricate acks for sequences
-            // we never observed.
-            None => self.first_seen.unwrap_or(sequence),
-        };
-        for seq in start..=sequence {
-            self.consumer
-                .ack(seq)
-                .await
-                .map_err(|e| RuntimeError::Source(Box::new(e)))?;
-        }
+        self.pending_durable_ack = Some(sequence);
         self.last_acked = Some(sequence);
         Ok(())
     }
 
-    /// Force the underlying `buffer::Consumer`'s durable manifest
-    /// checkpoint. Called on `AckFlushPolicy` boundaries and on
-    /// graceful shutdown.
+    /// Drain the pending in-memory ack through the buffer's
+    /// durable manifest. Equivalent to
+    /// `Consumer::ack_through(pending)` in RFC 0003 terms — the
+    /// durable dequeue happens here, not on each
+    /// [`ack_through`](Self::ack_through) call. Returns `Ok(())`
+    /// when there's nothing pending. Surfaces `Error::Fenced` as
+    /// [`RuntimeError::Source`] so the per-source actor halts on
+    /// fence.
     pub async fn flush_acks(&mut self) -> RuntimeResult<()> {
-        self.consumer
-            .flush()
-            .await
-            .map_err(|e| RuntimeError::Source(Box::new(e)))
+        if let Some(seq) = self.pending_durable_ack.take()
+            && let Err(e) = self.consumer.ack_through(seq).await
+        {
+            // Re-arm the pending pointer so a retry against the
+            // same sequence is safe (matches the per-call
+            // fail-atomic contract).
+            self.pending_durable_ack = Some(seq);
+            return Err(RuntimeError::Source(Box::new(e)));
+        }
+        Ok(())
     }
 }
 

@@ -2121,8 +2121,6 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 [[package]]
 name = "opendata-buffer"
 version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c243ee7d1c3112fe0f5f3f2b597259931e370505fbf29147ab4e3c1e8f752bdd"
 dependencies = [
  "bytes",
  "futures",
@@ -2141,8 +2139,6 @@ dependencies = [
 [[package]]
 name = "opendata-common"
 version = "0.1.14"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9e58571de9fa9e1373f8221356d52ed1c7da8ddec4169270e39f2993f59a238b"
 dependencies = [
  "async-trait",
  "bytes",
@@ -2194,6 +2190,7 @@ dependencies = [
 name = "opendata-ingest-runtime"
 version = "0.1.2"
 dependencies = [
+ "async-channel",
  "async-trait",
  "bytes",
  "opendata-buffer",
