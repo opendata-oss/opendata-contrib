@@ -260,3 +260,205 @@ async fn pipeline_ack_correctness_under_fetch_concurrency_8() {
 
     fx.producer.close().await.expect("close producer");
 }
+
+mod large_records {
+    use std::any::Any;
+    use std::sync::Arc;
+
+    use async_trait::async_trait;
+    use opendata_ingest_runtime::decoded_batch::{
+        BatchStats, DecodedBatch, DecodedRecords, SourceCoordinateColumns, TypedRecords,
+        TypedSchema,
+    };
+    use opendata_ingest_runtime::decoder::Decoder;
+    use opendata_ingest_runtime::envelope::MetadataEnvelope;
+    use opendata_ingest_runtime::error::RuntimeResult;
+    use opendata_ingest_runtime::identity::SchemaVersion;
+    use opendata_ingest_runtime::source::SourceBatch;
+
+    /// `TypedRecords` impl that reports a controllable
+    /// `estimated_bytes`. Used by the byte-budget reconciliation
+    /// test (row 6.3) to drive the post-decode total above the
+    /// pessimistic admission reservation.
+    pub struct LargeRecords {
+        schema: TypedSchema,
+        count: usize,
+        bytes: usize,
+    }
+
+    impl LargeRecords {
+        pub fn new(count: usize, bytes: usize) -> Self {
+            Self {
+                schema: TypedSchema {
+                    name: "test.large.v1".into(),
+                    version: SchemaVersion(1),
+                },
+                count,
+                bytes,
+            }
+        }
+    }
+
+    impl TypedRecords for LargeRecords {
+        fn record_count(&self) -> usize {
+            self.count
+        }
+        fn estimated_bytes(&self) -> usize {
+            self.bytes
+        }
+        fn schema(&self) -> &TypedSchema {
+            &self.schema
+        }
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    /// Decoder that emits one `DecodedBatch` with the configured
+    /// `estimated_bytes` reported by `LargeRecords`. Otherwise
+    /// identical to `FakeDecoder`.
+    pub struct LargeDecoder {
+        pub bytes_per_batch: usize,
+    }
+
+    #[async_trait]
+    impl Decoder for LargeDecoder {
+        fn accepts(&self, _envelope: &MetadataEnvelope) -> bool {
+            true
+        }
+
+        fn decode(&self, batch: SourceBatch) -> RuntimeResult<Vec<DecodedBatch>> {
+            let entry_count = batch.entries.len();
+            let source = batch.source.clone();
+            let sequence = batch.sequence;
+            let source_columns = SourceCoordinateColumns {
+                manifest_path: batch.manifest_path.clone(),
+                data_path: batch.data_object_path.clone(),
+                sequences: vec![sequence; entry_count],
+                entry_indices: (0..entry_count as u32).collect(),
+                record_indices: vec![0; entry_count],
+                ingestion_time_ms: batch.entries.iter().map(|e| e.ingestion_time_ms).collect(),
+            };
+            Ok(vec![DecodedBatch {
+                source,
+                low_sequence: sequence,
+                high_sequence: sequence,
+                source_entry_count: entry_count as u32,
+                records: DecodedRecords::Typed(Arc::new(LargeRecords::new(
+                    entry_count,
+                    self.bytes_per_batch,
+                ))),
+                source_columns,
+                stats: BatchStats {
+                    source_byte_count: 0,
+                    decoded_byte_estimate: self.bytes_per_batch as u64,
+                },
+                schema_version: SchemaVersion(1),
+            }])
+        }
+    }
+}
+
+/// MEDIUM-1 path: decode-time byte reconciliation. The pessimistic
+/// admission reservation is small (`estimated_max_batch_bytes =
+/// 4 KiB`); the decoder produces a `DecodedBatch` reporting a much
+/// larger post-decode footprint (`1 MiB`). When the runtime parks
+/// the sink mid-write, the per-source byte budget's `in_flight()`
+/// reflects the reconciled (post-decode) total — proving the
+/// decode worker called `reservation.reconcile(actual_bytes)` and
+/// that the reservation actually expanded against the shared
+/// budget.
+#[tokio::test]
+async fn pipeline_decode_byte_reconciliation_grows_reservation() {
+    use large_records::LargeDecoder;
+    use opendata_ingest_runtime::sink::{CommitStatus, SinkId};
+    use support::{ProgrammableSink, ScriptedWrite};
+
+    let fx = in_memory_buffer_source(
+        "ingest/test/pipeline/byte-reconciliation/manifest",
+        "ingest/test/pipeline/byte-reconciliation/data",
+    )
+    .await;
+    fx.producer
+        .produce(vec![Bytes::from_static(b"payload")], logs_envelope())
+        .await
+        .expect("produce");
+    fx.producer.flush().await.expect("flush");
+
+    let sink = ProgrammableSink::new(
+        SinkId::from("programmable"),
+        vec![ScriptedWrite::Ok { rows_written: 1 }],
+        CommitStatus::Unknown,
+    );
+    // Gate the write so the test can observe the budget while the
+    // reservation is still alive (it drops at WriteCompletion send,
+    // which is downstream of write).
+    let token = sink.block_until_released(true);
+
+    let pessimistic_bytes: u64 = 4 * 1024;
+    let decoded_bytes: usize = 1024 * 1024;
+    let mut opts = options_with_fetch_concurrency(1);
+    opts.source_defaults = SourceBackpressureOptions {
+        max_inflight_batches: 1,
+        max_inflight_bytes: 16 * 1024 * 1024,
+        estimated_max_batch_bytes: pessimistic_bytes,
+        fetch_concurrency: 1,
+        decode_concurrency: 1,
+        oversize_fault_multiplier: u32::MAX, // disable for this case
+    };
+
+    let runtime = Runtime::builder()
+        .add_source(fx.source)
+        .add_decoder(LargeDecoder {
+            bytes_per_batch: decoded_bytes,
+        })
+        .set_sink(sink)
+        .with_options(opts)
+        .build()
+        .expect("build");
+    let budget = runtime.source_byte_budget();
+
+    let shutdown = CancellationToken::new();
+    let shutdown_run = shutdown.clone();
+    let handle = tokio::spawn(async move { runtime.run(shutdown_run).await });
+
+    // Wait until the gated write parks (`maybe_park` increments the
+    // entry counter before the await). At that point admission has
+    // reserved `pessimistic_bytes`, the decode worker has
+    // reconciled to roughly `decoded_bytes`, and the reservation is
+    // held by the sink writer task across the parked
+    // `Sink::write`.
+    timeout(Duration::from_secs(5), token.wait_for_entry())
+        .await
+        .expect("sink write should park");
+
+    let in_flight = budget.in_flight();
+    assert!(
+        in_flight > pessimistic_bytes,
+        "reservation must have grown past the pessimistic size: \
+         in_flight={in_flight}, pessimistic={pessimistic_bytes}",
+    );
+    // Allow some slack for the source_coords overhead, but the
+    // total should be in the ballpark of the decoder's
+    // `estimated_bytes()`.
+    assert!(
+        in_flight >= decoded_bytes as u64,
+        "reservation must have reconciled to at least the decoder's \
+         estimated_bytes: in_flight={in_flight}, decoded_bytes={decoded_bytes}",
+    );
+
+    drop(token); // release the sink write
+    shutdown.cancel();
+    handle
+        .await
+        .expect("runtime task join")
+        .expect("runtime exited cleanly");
+
+    assert_eq!(
+        budget.in_flight(),
+        0,
+        "reservation must drop back to zero after sink commit",
+    );
+
+    fx.producer.close().await.expect("close producer");
+}

@@ -1,16 +1,21 @@
 //! Pipelined runtime: per-source actor + bounded fetch/decode/sink workers.
 //!
 //! Row 6.1 stood up the actor + channel scaffolding with a single
-//! internal worker. Row 6.2 splits the fetch stage into N parallel
-//! workers driven by `source_defaults.fetch_concurrency`; the decode +
-//! sink stages remain serial (row 6.3 fans out decode workers; row
-//! 6.4 lifts the sink write into a shared pool).
+//! internal worker. Row 6.2 split fetch into N parallel workers
+//! driven by `source_defaults.fetch_concurrency`. Row 6.3 layers M
+//! decode workers driven by `source_defaults.decode_concurrency`
+//! and wires the decode-time byte reconciliation step. The sink
+//! write stays serial in 6.3 (row 6.4 lifts it into a shared writer
+//! pool).
 //!
 //! ```text
-//!   per-source actor                  fetch pool (N tasks)        decode + sink worker
-//!   ────────────────                  ────────────────────        ────────────────────
-//!   admission arm  ─[Admitted]──▶ (async_channel: MPMC) ──▶ [Fetched] ──▶ decode + write_with_retry
-//!   completion arm ◀──────────────[WriteCompletion]────────────────────
+//!   actor    fetch pool (N)              decode pool (M)              sink writer
+//!   ─────    ──────────────              ───────────────              ───────────
+//!   admit ─▶ [desc rx MPMC] ──▶ N tasks ─▶ [fetched rx MPMC] ──▶ M tasks
+//!                                                              ─▶ reconcile bytes
+//!                                                              ─▶ [SinkCommit rx] ─▶ 1 task
+//!                                                                                  ─▶ write_with_retry
+//!   actor ◀────────────────────────[WriteCompletion mpsc]───────────────────────────
 //! ```
 //!
 //! The actor owns `&mut BufferSource` and `&mut AckCoordinator`;
@@ -306,7 +311,7 @@ struct AdmittedDescriptor {
 }
 
 /// Output of a fetch worker. The reservation + batch_permit travel
-/// with the unit through decode + sink; they drop when the decode
+/// with the unit through decode + sink; they drop when the sink
 /// worker emits a `WriteCompletion` (success or fatal).
 struct FetchedBatch {
     source_batch: SourceBatch,
@@ -315,6 +320,19 @@ struct FetchedBatch {
     /// Original descriptor sequence — used by the decode worker to
     /// validate the decoded range matches what admission registered.
     admitted_sequence: u64,
+}
+
+/// Output of a decode worker. The decode worker reconciled the
+/// `reservation` to actual post-decode bytes before emitting this;
+/// the sink writer carries it through `Sink::write` and drops it on
+/// completion.
+struct SinkCommitEnvelope {
+    commit: SinkCommit,
+    /// Pending range registered at admission. The actor uses this
+    /// for `mark_committed` once the write completes.
+    range: (u64, u64),
+    reservation: ByteReservation,
+    batch_permit: tokio::sync::OwnedSemaphorePermit,
 }
 
 /// Worker → actor completion message.
@@ -345,6 +363,10 @@ pub struct Runtime {
     options: RuntimeOptions,
     progress_tx: watch::Sender<RuntimeProgress>,
     progress_rx: watch::Receiver<RuntimeProgress>,
+    /// Per-source byte budget. Constructed at build time so tests
+    /// can clone the `Arc` via [`Runtime::source_byte_budget`] and
+    /// observe `in_flight()` mid-run.
+    source_byte_budget: Arc<SourceByteBudget>,
     admission_recorder: Option<AdmissionRecorder>,
     test_fetch_delay: Option<TestFetchDelayFn>,
 }
@@ -380,6 +402,14 @@ impl Runtime {
         self.progress_rx.clone()
     }
 
+    /// Clone the per-source byte budget. Tests use this to observe
+    /// `in_flight()` mid-run (e.g. to verify decode-time
+    /// reconciliation grew the reservation past the pessimistic
+    /// admission size).
+    pub fn source_byte_budget(&self) -> Arc<SourceByteBudget> {
+        Arc::clone(&self.source_byte_budget)
+    }
+
     /// Run until cancellation. On `shutdown.cancelled()` admission
     /// stops, the in-flight units drain, the durable ack frontier is
     /// flushed, and the function returns `Ok(())`. Any pipeline /
@@ -394,6 +424,7 @@ impl Runtime {
             options,
             progress_tx,
             progress_rx: _progress_rx,
+            source_byte_budget,
             admission_recorder,
             test_fetch_delay,
         } = self;
@@ -409,58 +440,68 @@ impl Runtime {
         let sink_id = sink.id().clone();
         let bp = options.backpressure_for(&source_id);
         let fetch_concurrency = bp.fetch_concurrency.max(1) as usize;
-        // Channel depths follow the per-source batch-count axis so
-        // backpressure stays purely on `batch_semaphore` (the
-        // per-source budget actor + the slot semaphore are the
-        // gates; the channels themselves are just hand-off
-        // queues). Match Phase 6 design §Internal channel types.
+        let decode_concurrency = bp.decode_concurrency.max(1) as usize;
         let channel_depth = bp.max_inflight_batches.max(1) as usize;
 
-        // Per-source byte budget + batch-slot semaphore. Both feed
-        // backpressure on the actor's admission arm.
-        let budget = SourceByteBudget::new(source_id.clone(), bp.max_inflight_bytes);
         let batch_semaphore = Arc::new(Semaphore::new(bp.max_inflight_batches.max(1) as usize));
 
         let (descriptor_tx, descriptor_rx) =
             async_channel::bounded::<AdmittedDescriptor>(channel_depth);
         let (fetched_tx, fetched_rx) = async_channel::bounded::<FetchedBatch>(channel_depth);
+        let (sink_commit_tx, sink_commit_rx) =
+            async_channel::bounded::<SinkCommitEnvelope>(channel_depth);
         let (completion_tx, completion_rx) = mpsc::channel::<WriteCompletion>(channel_depth);
 
         let mut coordinator = coordinators.take(&source_id).ok_or_else(|| {
             RuntimeError::Ack(format!("no coordinator registered for source {source_id}",))
         })?;
 
-        // Spawn N fetch workers. Each holds a clone of the
-        // `BufferSourceFetchHandle` — RFC 0003 says `fetch(&self,
+        // N fetch workers — RFC 0003 §Concurrency Model: `fetch(&self,
         // ...)` is safe to call from N tasks against distinct
-        // descriptors. The shared `descriptor_rx` is an
-        // async_channel receiver: cloning the receiver is the MPMC
-        // pattern (each worker's clone reads from the same queue;
-        // `recv` is wait-and-grab).
+        // descriptors. The descriptor channel is async_channel
+        // (cloneable receiver = MPMC).
         let mut fetch_handles = Vec::with_capacity(fetch_concurrency);
         for worker_idx in 0..fetch_concurrency {
-            let handle = source.fetch_handle();
-            let rx = descriptor_rx.clone();
-            let tx = fetched_tx.clone();
-            let completion = completion_tx.clone();
-            let src_id = source_id.clone();
-            let delay = test_fetch_delay.clone();
             fetch_handles.push(tokio::spawn(fetch_worker(
-                handle, rx, tx, completion, src_id, worker_idx, delay,
+                source.fetch_handle(),
+                descriptor_rx.clone(),
+                fetched_tx.clone(),
+                completion_tx.clone(),
+                source_id.clone(),
+                worker_idx,
+                test_fetch_delay.clone(),
             )));
         }
-        // Drop the local handles to descriptor_rx / fetched_tx so
-        // worker exits close the receiver side cleanly on shutdown.
         drop(descriptor_rx);
         drop(fetched_tx);
 
-        let decode_handle = tokio::spawn(decode_sink_worker(
-            Arc::clone(&decoder),
+        // M decode workers. `decoder: Arc<dyn Decoder>` is
+        // `Send + Sync`. Each worker reconciles its reservation to
+        // actual post-decode bytes before forwarding the
+        // `SinkCommitEnvelope` downstream.
+        let mut decode_handles = Vec::with_capacity(decode_concurrency);
+        for worker_idx in 0..decode_concurrency {
+            decode_handles.push(tokio::spawn(decode_worker(
+                Arc::clone(&decoder),
+                options.clone(),
+                sink_id.clone(),
+                source_id.clone(),
+                worker_idx,
+                fetched_rx.clone(),
+                sink_commit_tx.clone(),
+                completion_tx.clone(),
+            )));
+        }
+        drop(fetched_rx);
+        drop(sink_commit_tx);
+
+        // One sink writer task in row 6.3. Row 6.4 grows this into
+        // a shared `SinkWriterPool` with round-robin fairness.
+        let sink_writer_handle = tokio::spawn(sink_writer_task(
             Arc::clone(&sink),
             options.clone(),
-            sink_id.clone(),
             source_id.clone(),
-            fetched_rx,
+            sink_commit_rx,
             completion_tx,
         ));
 
@@ -470,7 +511,7 @@ impl Runtime {
             options.clone(),
             descriptor_tx,
             completion_rx,
-            Arc::clone(&budget),
+            Arc::clone(&source_byte_budget),
             batch_semaphore,
             sink_id,
             shutdown,
@@ -479,10 +520,6 @@ impl Runtime {
         )
         .await;
 
-        // Drain fetch workers (their descriptor_rx closes once the
-        // actor drops descriptor_tx). Collect the first fatal — if
-        // any — so it surfaces. Fetch workers that exit cleanly via
-        // a closed channel return `Ok(())`.
         let mut fetch_result: RuntimeResult<()> = Ok(());
         for handle in fetch_handles {
             match handle.await {
@@ -502,19 +539,39 @@ impl Runtime {
             }
         }
 
-        let decode_result = decode_handle.await.map_err(|join_err| {
-            RuntimeError::Pipeline(format!("decode/sink worker panicked: {join_err}"))
+        let mut decode_result: RuntimeResult<()> = Ok(());
+        for handle in decode_handles {
+            match handle.await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    if decode_result.is_ok() {
+                        decode_result = Err(e);
+                    }
+                }
+                Err(join_err) => {
+                    if decode_result.is_ok() {
+                        decode_result = Err(RuntimeError::Pipeline(format!(
+                            "decode worker panicked: {join_err}"
+                        )));
+                    }
+                }
+            }
+        }
+
+        let sink_result = sink_writer_handle.await.map_err(|join_err| {
+            RuntimeError::Pipeline(format!("sink writer panicked: {join_err}"))
         })?;
 
         // Surface the most informative error: actor errors take
         // precedence (they reflect coordinator / source state) but
         // a worker fatal that the actor never observed is still a
         // failure.
-        match (actor_result, fetch_result, decode_result) {
-            (Err(e), _, _) => Err(e),
-            (Ok(()), Err(e), _) => Err(e),
-            (Ok(()), Ok(()), Err(e)) => Err(e),
-            (Ok(()), Ok(()), Ok(())) => {
+        match (actor_result, fetch_result, decode_result, sink_result) {
+            (Err(e), _, _, _) => Err(e),
+            (Ok(()), Err(e), _, _) => Err(e),
+            (Ok(()), Ok(()), Err(e), _) => Err(e),
+            (Ok(()), Ok(()), Ok(()), Err(e)) => Err(e),
+            (Ok(()), Ok(()), Ok(()), Ok(())) => {
                 info!("runtime exited cleanly");
                 Ok(())
             }
@@ -581,6 +638,8 @@ impl RuntimeBuilder {
         let mut coordinators = AckCoordinators::new();
         coordinators.register_source(source.id().clone(), source.last_acked_sequence())?;
         let (progress_tx, progress_rx) = watch::channel(RuntimeProgress::default());
+        let bp = self.options.backpressure_for(source.id());
+        let source_byte_budget = SourceByteBudget::new(source.id().clone(), bp.max_inflight_bytes);
         Ok(Runtime {
             source,
             decoder,
@@ -589,6 +648,7 @@ impl RuntimeBuilder {
             options: self.options,
             progress_tx,
             progress_rx,
+            source_byte_budget,
             admission_recorder: self.admission_recorder,
             test_fetch_delay: self.test_fetch_delay,
         })
@@ -911,69 +971,161 @@ async fn fetch_worker(
 }
 
 // =========================================================================
-// Decode + sink worker (single task in row 6.2; row 6.3 fans out
-// decode workers; row 6.4 lifts the sink write into a shared pool).
+// Per-source decode workers (row 6.3) — M parallel tasks.
+//
+// Stateless. Each worker pulls one `FetchedBatch` from the shared
+// `fetched_rx`, decodes, **reconciles its `ByteReservation` to the
+// actual post-decode bytes**, builds a `SinkCommitEnvelope`, and
+// forwards to the sink writer task. Like fetch workers, no direct
+// shutdown token — graceful drain happens via channel close.
+//
+// The oversize-fault gate caps the worst-case over-subscription that
+// reconcile-grow can cause: if a decoded batch's actual bytes exceed
+// `estimated_max_batch_bytes × oversize_fault_multiplier`, the worker
+// emits `RuntimeError::Pipeline("oversize decoded batch: …")`. Default
+// multiplier is 4×.
 // =========================================================================
 
+/// Post-decode bytes for the source-coordinate columns. Phase 6
+/// design §Algorithms uses `decoded.estimated_bytes() +
+/// source_coords_bytes(decoded)` as the byte-budget total — the
+/// records crate already accounts for its own payload via
+/// `TypedRecords::estimated_bytes`; this helper adds the
+/// runtime-owned coordinate columns on top.
+fn source_coords_bytes(coords: &crate::decoded_batch::SourceCoordinateColumns) -> u64 {
+    let strings = coords.manifest_path.len() + coords.data_path.len();
+    let n = coords.sequences.len();
+    // u64 (sequence) + u32 (entry) + u32 (record) + i64 (ts) per row.
+    let per_row = 8 + 4 + 4 + 8;
+    (strings + n * per_row) as u64
+}
+
 #[allow(clippy::too_many_arguments)]
-async fn decode_sink_worker(
+async fn decode_worker(
     decoder: Arc<dyn Decoder>,
-    sink: Arc<dyn Sink>,
     options: RuntimeOptions,
     sink_id: SinkId,
     source_id: SourceId,
+    worker_idx: usize,
     fetched_rx: async_channel::Receiver<FetchedBatch>,
+    sink_commit_tx: async_channel::Sender<SinkCommitEnvelope>,
     completion_tx: mpsc::Sender<WriteCompletion>,
 ) -> RuntimeResult<()> {
-    while let Ok(fetched) = fetched_rx.recv().await {
+    let source_label = source_id.0.clone();
+    let bp = options.backpressure_for(&source_id);
+    loop {
+        metrics::gauge!(
+            crate::metrics::STAGE_QUEUE_DEPTH,
+            "stage" => "decode",
+            "source" => source_label.clone(),
+        )
+        .set(fetched_rx.len() as f64);
+
+        let fetched = match fetched_rx.recv().await {
+            Ok(f) => f,
+            Err(_) => return Ok(()),
+        };
         let FetchedBatch {
             source_batch,
-            reservation,
+            mut reservation,
             batch_permit,
             admitted_sequence,
         } = fetched;
 
-        let outcome = process_fetched_batch(
+        let stage_start = std::time::Instant::now();
+        let outcome = decode_one(
             &decoder,
-            &sink,
             &options,
             &sink_id,
             source_batch,
             admitted_sequence,
+            &bp,
+            &mut reservation,
         )
         .await;
+        metrics::histogram!(
+            crate::metrics::STAGE_LATENCY_SECONDS,
+            "stage" => "decode",
+            "source" => source_label.clone(),
+        )
+        .record(stage_start.elapsed().as_secs_f64());
 
-        let message = match outcome {
-            Ok(report) => WriteCompletion::Committed(report),
+        match outcome {
+            Ok(DecodeOutcome::Live { commit, range }) => {
+                if sink_commit_tx
+                    .send(SinkCommitEnvelope {
+                        commit: *commit,
+                        range,
+                        reservation,
+                        batch_permit,
+                    })
+                    .await
+                    .is_err()
+                {
+                    // Sink stage closed unexpectedly.
+                    let _ = completion_tx
+                        .send(WriteCompletion::Fatal(RuntimeError::Pipeline(format!(
+                            "sink-commit lost: source={source_id} seq={admitted_sequence} cause=sink-stage-closed",
+                        ))))
+                        .await;
+                    return Ok(());
+                }
+            }
+            Ok(DecodeOutcome::DryRun {
+                range,
+                rows_written,
+            }) => {
+                // Dry-run: skip the sink stage entirely; report
+                // completion directly. Drop reservation + permit
+                // after the message lands.
+                let msg = WriteCompletion::Committed(CommittedReport {
+                    range,
+                    rows_written,
+                });
+                if completion_tx.send(msg).await.is_err() {
+                    return Ok(());
+                }
+                drop(reservation);
+                drop(batch_permit);
+            }
             Err(e) => {
-                warn!(error = %e, source = %source_id, "decode/sink worker fatal");
+                warn!(
+                    error = %e,
+                    source = %source_id,
+                    worker = worker_idx,
+                    "decode worker fatal",
+                );
                 let _ = completion_tx.send(WriteCompletion::Fatal(e)).await;
                 return Ok(());
             }
-        };
-
-        if completion_tx.send(message).await.is_err() {
-            return Ok(()); // actor exited
         }
-
-        drop(reservation);
-        drop(batch_permit);
     }
-    Ok(())
+}
+
+enum DecodeOutcome {
+    // `SinkCommit` is large (carries the whole `DecodedBatch`); box
+    // it so `DryRun` doesn't pad the enum.
+    Live {
+        commit: Box<SinkCommit>,
+        range: (u64, u64),
+    },
+    DryRun {
+        range: (u64, u64),
+        rows_written: u64,
+    },
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn process_fetched_batch(
+async fn decode_one(
     decoder: &Arc<dyn Decoder>,
-    sink: &Arc<dyn Sink>,
     options: &RuntimeOptions,
     sink_id: &SinkId,
     source_batch: SourceBatch,
     admitted_sequence: u64,
-) -> RuntimeResult<CommittedReport> {
-    // Per-entry envelope validation. Envelope failures route as
-    // RuntimeError::Decoder so the boundary stays the same as Phase
-    // 4/5.
+    bp: &SourceBackpressureOptions,
+    reservation: &mut ByteReservation,
+) -> RuntimeResult<DecodeOutcome> {
+    // Per-entry envelope validation.
     let envelopes =
         decode_envelopes(&source_batch).map_err(|e| RuntimeError::Decoder(Box::new(e)))?;
     validate_consistent(&envelopes, &options.configured_envelope)
@@ -1001,13 +1153,7 @@ async fn process_fetched_batch(
         ));
     }
     if decoded_batches.len() != 1 {
-        // Phase 6 contract: one SinkCommit per source range. Phase
-        // 5 supported multiple DecodedBatches per source batch, but
-        // admission now registers a single (sequence, sequence)
-        // range; producing multiple DecodedBatches would break
-        // mark_committed (no matching pending entry for the second
-        // range). Phase 6 design §Algorithms > Per-Source Decode
-        // Workers (and §Open Questions Q5) makes this strict.
+        // Phase 6 contract: one SinkCommit per source range.
         return Err(RuntimeError::Decoder(
             format!(
                 "Phase 6 expects one DecodedBatch per source batch; got {}",
@@ -1028,24 +1174,90 @@ async fn process_fetched_batch(
         )));
     }
 
+    // Decode-time byte reconciliation. Phase 6 design §Algorithms >
+    // Per-Source Decode Workers: actual post-decode memory =
+    // `records.estimated_bytes() + source_coords_bytes(coords)`.
+    //
+    // The oversize-fault gate runs *before* the reconcile so a
+    // pathological outlier halts the runtime instead of growing the
+    // budget unboundedly. `saturating_mul` keeps an operator who
+    // sets `estimated_max_batch_bytes` extremely high from
+    // accidentally disabling the fault via u64 overflow.
+    let records_bytes = match &decoded.records {
+        DecodedRecords::Typed(t) => t.estimated_bytes() as u64,
+    };
+    let actual_bytes = records_bytes + source_coords_bytes(&decoded.source_columns);
+    let fault_limit = bp
+        .estimated_max_batch_bytes
+        .saturating_mul(bp.oversize_fault_multiplier as u64);
+    if actual_bytes > fault_limit {
+        return Err(RuntimeError::Pipeline(format!(
+            "oversize decoded batch: source range {low}..={high} actual_bytes={actual_bytes} \
+             fault_limit={fault_limit} (estimated_max_batch_bytes={} × \
+             oversize_fault_multiplier={})",
+            bp.estimated_max_batch_bytes, bp.oversize_fault_multiplier,
+        )));
+    }
+    reservation.reconcile(actual_bytes);
+
     let row_count = match &decoded.records {
         DecodedRecords::Typed(t) => t.record_count() as u64,
     };
 
     if options.dry_run {
         debug!(low, high, rows = row_count, "dry-run: skipping sink write");
-        return Ok(CommittedReport {
+        return Ok(DecodeOutcome::DryRun {
             range: (low, high),
             rows_written: row_count,
         });
     }
 
     let commit = build_commit(sink_id.clone(), low, high, decoded);
-    let result = write_with_retry(sink, commit, options).await?;
-    Ok(CommittedReport {
+    Ok(DecodeOutcome::Live {
+        commit: Box::new(commit),
         range: (low, high),
-        rows_written: result.rows_written,
     })
+}
+
+// =========================================================================
+// Sink writer task (single task in row 6.3; row 6.4 grows this into
+// a shared `SinkWriterPool` with round-robin fairness across
+// sources).
+// =========================================================================
+
+async fn sink_writer_task(
+    sink: Arc<dyn Sink>,
+    options: RuntimeOptions,
+    source_id: SourceId,
+    sink_commit_rx: async_channel::Receiver<SinkCommitEnvelope>,
+    completion_tx: mpsc::Sender<WriteCompletion>,
+) -> RuntimeResult<()> {
+    while let Ok(envelope) = sink_commit_rx.recv().await {
+        let SinkCommitEnvelope {
+            commit,
+            range,
+            reservation,
+            batch_permit,
+        } = envelope;
+        let result = write_with_retry(&sink, commit, &options).await;
+        let msg = match result {
+            Ok(commit_result) => WriteCompletion::Committed(CommittedReport {
+                range,
+                rows_written: commit_result.rows_written,
+            }),
+            Err(e) => {
+                warn!(error = %e, source = %source_id, "sink writer fatal");
+                let _ = completion_tx.send(WriteCompletion::Fatal(e)).await;
+                return Ok(());
+            }
+        };
+        if completion_tx.send(msg).await.is_err() {
+            return Ok(()); // actor exited
+        }
+        drop(reservation);
+        drop(batch_permit);
+    }
+    Ok(())
 }
 
 fn build_commit(
