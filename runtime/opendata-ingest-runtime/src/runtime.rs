@@ -1,12 +1,15 @@
-//! Pipelined runtime: per-source actor + bounded fetch/decode/sink workers.
+//! Pipelined runtime: per-source actor + bounded fetch/decode workers + shared sink writer pool.
 //!
 //! Row 6.1 stood up the actor + channel scaffolding with a single
 //! internal worker. Row 6.2 split fetch into N parallel workers
-//! driven by `source_defaults.fetch_concurrency`. Row 6.3 layers M
+//! driven by `source_defaults.fetch_concurrency`. Row 6.3 layered M
 //! decode workers driven by `source_defaults.decode_concurrency`
-//! and wires the decode-time byte reconciliation step. The sink
-//! write stays serial in 6.3 (row 6.4 lifts it into a shared writer
-//! pool).
+//! and wired the decode-time byte reconciliation step. Row 6.4
+//! lifts the single sink writer task into a `SinkWriterPool` of W
+//! workers (driven by `sink.max_concurrent_commits`); fatal errors
+//! propagate through a `hard_abort_token` that aborts every stage
+//! immediately, distinct from the external `shutdown` (admission)
+//! token's graceful-drain semantics.
 //!
 //! ```text
 //!   actor    fetch pool (N)              decode pool (M)              sink writer
@@ -441,6 +444,7 @@ impl Runtime {
         let bp = options.backpressure_for(&source_id);
         let fetch_concurrency = bp.fetch_concurrency.max(1) as usize;
         let decode_concurrency = bp.decode_concurrency.max(1) as usize;
+        let writer_pool_size = options.sink.max_concurrent_commits.max(1) as usize;
         let channel_depth = bp.max_inflight_batches.max(1) as usize;
 
         let batch_semaphore = Arc::new(Semaphore::new(bp.max_inflight_batches.max(1) as usize));
@@ -456,6 +460,12 @@ impl Runtime {
             RuntimeError::Ack(format!("no coordinator registered for source {source_id}",))
         })?;
 
+        // Two cancellation tokens. The external `shutdown` is the
+        // admission token (graceful drain on cancel). `hard_abort`
+        // is internally cancelled on fatal errors; every worker
+        // checks it via `select!` and exits immediately.
+        let hard_abort_token = CancellationToken::new();
+
         // N fetch workers — RFC 0003 §Concurrency Model: `fetch(&self,
         // ...)` is safe to call from N tasks against distinct
         // descriptors. The descriptor channel is async_channel
@@ -470,6 +480,7 @@ impl Runtime {
                 source_id.clone(),
                 worker_idx,
                 test_fetch_delay.clone(),
+                hard_abort_token.clone(),
             )));
         }
         drop(descriptor_rx);
@@ -490,20 +501,31 @@ impl Runtime {
                 fetched_rx.clone(),
                 sink_commit_tx.clone(),
                 completion_tx.clone(),
+                hard_abort_token.clone(),
             )));
         }
         drop(fetched_rx);
         drop(sink_commit_tx);
 
-        // One sink writer task in row 6.3. Row 6.4 grows this into
-        // a shared `SinkWriterPool` with round-robin fairness.
-        let sink_writer_handle = tokio::spawn(sink_writer_task(
-            Arc::clone(&sink),
-            options.clone(),
-            source_id.clone(),
-            sink_commit_rx,
-            completion_tx,
-        ));
+        // W writer workers — share `sink_commit_rx` MPMC. Each runs
+        // `write_with_retry` and emits `WriteCompletion` back to
+        // the actor. On a non-recoverable error, the worker cancels
+        // `hard_abort_token` so peers exit promptly.
+        let mut writer_handles = Vec::with_capacity(writer_pool_size);
+        for worker_idx in 0..writer_pool_size {
+            writer_handles.push(tokio::spawn(writer_worker(
+                Arc::clone(&sink),
+                options.clone(),
+                source_id.clone(),
+                sink_id.clone(),
+                worker_idx,
+                sink_commit_rx.clone(),
+                completion_tx.clone(),
+                hard_abort_token.clone(),
+            )));
+        }
+        drop(sink_commit_rx);
+        drop(completion_tx);
 
         let actor_result = per_source_actor(
             source,
@@ -515,10 +537,19 @@ impl Runtime {
             batch_semaphore,
             sink_id,
             shutdown,
+            hard_abort_token.clone(),
             progress_tx.clone(),
             admission_recorder,
         )
         .await;
+
+        // If the actor exited with an error, cancel the abort token
+        // so still-running workers unwind promptly. Successful exits
+        // close channels naturally and workers exit on
+        // `recv() == Err(Closed)`.
+        if actor_result.is_err() {
+            hard_abort_token.cancel();
+        }
 
         let mut fetch_result: RuntimeResult<()> = Ok(());
         for handle in fetch_handles {
@@ -558,9 +589,24 @@ impl Runtime {
             }
         }
 
-        let sink_result = sink_writer_handle.await.map_err(|join_err| {
-            RuntimeError::Pipeline(format!("sink writer panicked: {join_err}"))
-        })?;
+        let mut sink_result: RuntimeResult<()> = Ok(());
+        for handle in writer_handles {
+            match handle.await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    if sink_result.is_ok() {
+                        sink_result = Err(e);
+                    }
+                }
+                Err(join_err) => {
+                    if sink_result.is_ok() {
+                        sink_result = Err(RuntimeError::Pipeline(format!(
+                            "writer worker panicked: {join_err}"
+                        )));
+                    }
+                }
+            }
+        }
 
         // Surface the most informative error: actor errors take
         // precedence (they reflect coordinator / source state) but
@@ -674,6 +720,7 @@ async fn per_source_actor(
     batch_semaphore: Arc<Semaphore>,
     _sink_id: SinkId,
     shutdown: CancellationToken,
+    hard_abort_token: CancellationToken,
     progress_tx: watch::Sender<RuntimeProgress>,
     admission_recorder: Option<AdmissionRecorder>,
 ) -> RuntimeResult<()> {
@@ -706,7 +753,18 @@ async fn per_source_actor(
         tokio::select! {
             biased;
 
-            // 1. External shutdown — close admission. The runtime
+            // 1. Hard abort — a worker hit a non-recoverable error
+            //    (sink Fatal / retry-budget exhausted / oversize batch
+            //    / lost descriptor) and cancelled the abort token.
+            //    Drop in-flight units; the un-committed range
+            //    replays on the next start.
+            _ = hard_abort_token.cancelled() => {
+                return Err(RuntimeError::Pipeline(format!(
+                    "hard abort on source {source_id}"
+                )));
+            }
+
+            // 2. External shutdown — close admission. The runtime
             //    continues draining completions until in_flight == 0.
             _ = shutdown.cancelled(), if admission_open => {
                 debug!("admission token cancelled; draining in-flight commits");
@@ -814,6 +872,11 @@ async fn per_source_actor(
                 }
                 coordinator.register_pending(seq, seq)?;
                 in_flight = in_flight.saturating_add(1);
+                metrics::counter!(
+                    crate::metrics::DESCRIPTORS_HANDED_OUT_TOTAL,
+                    "source" => source_id.0.clone(),
+                )
+                .increment(1);
 
                 if descriptor_tx
                     .send(AdmittedDescriptor {
@@ -900,6 +963,7 @@ async fn fetch_worker(
     source_id: SourceId,
     worker_idx: usize,
     test_fetch_delay: Option<TestFetchDelayFn>,
+    hard_abort_token: CancellationToken,
 ) -> RuntimeResult<()> {
     let source_label = source_id.0.clone();
     loop {
@@ -910,9 +974,13 @@ async fn fetch_worker(
         )
         .set(descriptor_rx.len() as f64);
 
-        let admitted = match descriptor_rx.recv().await {
-            Ok(a) => a,
-            Err(_) => return Ok(()), // descriptor channel closed; graceful exit
+        let admitted = tokio::select! {
+            biased;
+            _ = hard_abort_token.cancelled() => return Ok(()),
+            recv = descriptor_rx.recv() => match recv {
+                Ok(a) => a,
+                Err(_) => return Ok(()), // descriptor channel closed; graceful exit
+            },
         };
         let AdmittedDescriptor {
             descriptor,
@@ -1010,6 +1078,7 @@ async fn decode_worker(
     fetched_rx: async_channel::Receiver<FetchedBatch>,
     sink_commit_tx: async_channel::Sender<SinkCommitEnvelope>,
     completion_tx: mpsc::Sender<WriteCompletion>,
+    hard_abort_token: CancellationToken,
 ) -> RuntimeResult<()> {
     let source_label = source_id.0.clone();
     let bp = options.backpressure_for(&source_id);
@@ -1021,9 +1090,13 @@ async fn decode_worker(
         )
         .set(fetched_rx.len() as f64);
 
-        let fetched = match fetched_rx.recv().await {
-            Ok(f) => f,
-            Err(_) => return Ok(()),
+        let fetched = tokio::select! {
+            biased;
+            _ = hard_abort_token.cancelled() => return Ok(()),
+            recv = fetched_rx.recv() => match recv {
+                Ok(f) => f,
+                Err(_) => return Ok(()),
+            },
         };
         let FetchedBatch {
             source_batch,
@@ -1220,44 +1293,115 @@ async fn decode_one(
 }
 
 // =========================================================================
-// Sink writer task (single task in row 6.3; row 6.4 grows this into
-// a shared `SinkWriterPool` with round-robin fairness across
-// sources).
+// Shared sink writer pool (row 6.4) — W workers per Phase 6 design
+// §Algorithms > Shared Sink Writer Pool with Round-Robin Fairness.
+//
+// Today's runtime is single-source, so workers share a single
+// `sink_commit_rx` (async_channel MPMC). The round-robin dispatcher
+// across per-source FIFOs lands when multi-source RuntimeBuilder
+// support arrives.
+//
+// Each worker:
+// - runs `write_with_retry` against the configured sink
+// - emits `WriteCompletion::Committed` on success, threading the
+//   range + rows_written back to the per-source actor
+// - on retry-budget exhaustion / Fatal, cancels
+//   `hard_abort_token` so peer workers + the actor unwind
+//   immediately
+// - emits `runtime_sink_commits_total{source,sink,result}` per
+//   outcome; samples `runtime_sink_queue_depth{sink}` pre-recv
 // =========================================================================
 
-async fn sink_writer_task(
+#[allow(clippy::too_many_arguments)]
+async fn writer_worker(
     sink: Arc<dyn Sink>,
     options: RuntimeOptions,
     source_id: SourceId,
+    sink_id: SinkId,
+    worker_idx: usize,
     sink_commit_rx: async_channel::Receiver<SinkCommitEnvelope>,
     completion_tx: mpsc::Sender<WriteCompletion>,
+    hard_abort_token: CancellationToken,
 ) -> RuntimeResult<()> {
-    while let Ok(envelope) = sink_commit_rx.recv().await {
+    let source_label = source_id.0.clone();
+    let sink_label = sink_id.0.clone();
+    loop {
+        metrics::gauge!(
+            crate::metrics::SINK_QUEUE_DEPTH,
+            "sink" => sink_label.clone(),
+        )
+        .set(sink_commit_rx.len() as f64);
+
+        let envelope = tokio::select! {
+            biased;
+            _ = hard_abort_token.cancelled() => return Ok(()),
+            recv = sink_commit_rx.recv() => match recv {
+                Ok(e) => e,
+                Err(_) => return Ok(()),
+            },
+        };
+
         let SinkCommitEnvelope {
             commit,
             range,
             reservation,
             batch_permit,
         } = envelope;
+        let stage_start = std::time::Instant::now();
         let result = write_with_retry(&sink, commit, &options).await;
-        let msg = match result {
-            Ok(commit_result) => WriteCompletion::Committed(CommittedReport {
-                range,
-                rows_written: commit_result.rows_written,
-            }),
+        metrics::histogram!(
+            crate::metrics::STAGE_LATENCY_SECONDS,
+            "stage" => "sink_dispatch",
+            "source" => source_label.clone(),
+        )
+        .record(stage_start.elapsed().as_secs_f64());
+
+        match result {
+            Ok(commit_result) => {
+                metrics::counter!(
+                    crate::metrics::SINK_COMMITS_TOTAL,
+                    "source" => source_label.clone(),
+                    "sink" => sink_label.clone(),
+                    "result" => crate::metrics::SinkCommitOutcome::Committed.as_label(),
+                )
+                .increment(1);
+                let msg = WriteCompletion::Committed(CommittedReport {
+                    range,
+                    rows_written: commit_result.rows_written,
+                });
+                if completion_tx.send(msg).await.is_err() {
+                    return Ok(()); // actor exited
+                }
+            }
             Err(e) => {
-                warn!(error = %e, source = %source_id, "sink writer fatal");
+                warn!(
+                    error = %e,
+                    source = %source_id,
+                    worker = worker_idx,
+                    "writer worker fatal",
+                );
+                metrics::counter!(
+                    crate::metrics::SINK_COMMITS_TOTAL,
+                    "source" => source_label.clone(),
+                    "sink" => sink_label.clone(),
+                    "result" => crate::metrics::SinkCommitOutcome::FailedFatal.as_label(),
+                )
+                .increment(1);
+                // Send the original error to the actor first so the
+                // completion arm sees the typed `RuntimeError::Sink`
+                // (etc.) rather than a generic `Pipeline("hard abort
+                // …")` from the abort arm racing the completion send.
+                // The supervisor cancels `hard_abort_token` after the
+                // actor exits with `Err(...)`, which is what tears
+                // peer workers down.
                 let _ = completion_tx.send(WriteCompletion::Fatal(e)).await;
                 return Ok(());
             }
-        };
-        if completion_tx.send(msg).await.is_err() {
-            return Ok(()); // actor exited
         }
+
         drop(reservation);
         drop(batch_permit);
     }
-    Ok(())
 }
 
 fn build_commit(

@@ -13,6 +13,10 @@ pub const ACK_FRONTIER: &str = "runtime_ack_frontier";
 pub const PENDING_RANGES: &str = "runtime_pending_ranges";
 pub const BACKPRESSURE_REASON: &str = "runtime_backpressure_reason";
 pub const SINK_COMMITS_TOTAL: &str = "runtime_sink_commits_total";
+pub const SINK_QUEUE_DEPTH: &str = "runtime_sink_queue_depth";
+pub const SINK_INFLIGHT_BYTES: &str = "runtime_sink_inflight_bytes";
+pub const DESCRIPTORS_HANDED_OUT_TOTAL: &str = "runtime_descriptors_handed_out_total";
+pub const ACK_LAG_SECONDS: &str = "runtime_ack_lag_seconds";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BackpressureReason {

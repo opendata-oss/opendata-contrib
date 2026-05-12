@@ -359,6 +359,125 @@ mod large_records {
     }
 }
 
+/// Row 6.4 `pipeline_graceful_drain_completes_inflight_commits`.
+///
+/// Run the pipeline against 20 source batches; gate the sink so
+/// all 20 admit and queue ahead of the write stage; cancel the
+/// external shutdown token while writes are parked; release the
+/// sink. Assert: the runtime returns `Ok(())`; every admitted unit
+/// produced exactly one `Sink::write` call; the final progress
+/// snapshot's `last_acked_sequence` equals the highest committed
+/// sequence (19); the durable Buffer ack frontier reflects the
+/// same.
+#[tokio::test]
+async fn pipeline_graceful_drain_completes_inflight_commits() {
+    use opendata_ingest_runtime::sink::{CommitStatus, SinkId};
+    use support::{ProgrammableSink, ScriptedWrite};
+
+    let fx = in_memory_buffer_source(
+        "ingest/test/pipeline/graceful-drain/manifest",
+        "ingest/test/pipeline/graceful-drain/data",
+    )
+    .await;
+    let batch_count = 20u64;
+    for i in 0..batch_count {
+        fx.producer
+            .produce(
+                vec![Bytes::from(format!("payload-{i}").into_bytes())],
+                logs_envelope(),
+            )
+            .await
+            .expect("produce");
+        fx.producer.flush().await.expect("flush");
+    }
+
+    let sink = ProgrammableSink::new(
+        SinkId::from("programmable"),
+        (0..batch_count)
+            .map(|_| ScriptedWrite::Ok { rows_written: 1 })
+            .collect(),
+        CommitStatus::Unknown,
+    );
+    let token = sink.block_until_released(true);
+    let write_calls = Arc::clone(&sink.write_calls);
+
+    let recorder: AdmissionRecorder = Arc::new(Mutex::new(Vec::new()));
+    let recorder_runtime = Arc::clone(&recorder);
+
+    let mut opts = options_with_fetch_concurrency(4);
+    opts.source_defaults = SourceBackpressureOptions {
+        max_inflight_batches: batch_count as u32,
+        fetch_concurrency: 4,
+        decode_concurrency: 2,
+        ..SourceBackpressureOptions::default()
+    };
+    opts.sink = SinkPoolOptions {
+        max_concurrent_commits: 4,
+        ..SinkPoolOptions::default()
+    };
+
+    let runtime = Runtime::builder()
+        .add_source(fx.source)
+        .add_decoder(FakeDecoder::permissive())
+        .set_sink(sink)
+        .with_options(opts)
+        .with_admission_recorder(recorder_runtime)
+        .build()
+        .expect("build");
+    let mut progress_rx = runtime.progress();
+
+    let shutdown = CancellationToken::new();
+    let shutdown_run = shutdown.clone();
+    let handle = tokio::spawn(async move { runtime.run(shutdown_run).await });
+
+    // Wait until all 20 batches have admitted (the recorder is
+    // updated synchronously in the actor's admission arm — the
+    // gated sink keeps everything piled up downstream). Once the
+    // recorder is full, the admission stage has finished its
+    // work and the in-flight units are stalled on the sink write.
+    timeout(Duration::from_secs(10), async {
+        loop {
+            if recorder.lock().unwrap().len() >= batch_count as usize {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("all batches should admit while sink is gated");
+
+    // Cancel admission with units still in-flight. Then release
+    // the sink so the in-flight units can drain.
+    shutdown.cancel();
+    drop(token);
+
+    let result = timeout(Duration::from_secs(15), handle)
+        .await
+        .expect("runtime should drain in-flight commits and exit Ok")
+        .expect("runtime task join");
+    result.expect("runtime exited cleanly");
+
+    // Final progress snapshot.
+    let p = *progress_rx.borrow_and_update();
+    assert_eq!(
+        p.source_ranges_committed, batch_count,
+        "every admitted unit must finish during graceful drain",
+    );
+    assert_eq!(
+        p.last_acked_sequence,
+        Some(batch_count - 1),
+        "durable ack frontier should equal the highest committed sequence",
+    );
+
+    let write_count = write_calls.lock().unwrap().len();
+    assert_eq!(
+        write_count, batch_count as usize,
+        "every admitted unit produced exactly one Sink::write call",
+    );
+
+    fx.producer.close().await.expect("close producer");
+}
+
 /// MEDIUM-1 path: decode-time byte reconciliation. The pessimistic
 /// admission reservation is small (`estimated_max_batch_bytes =
 /// 4 KiB`); the decoder produces a `DecodedBatch` reporting a much
