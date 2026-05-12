@@ -2,10 +2,10 @@
 //!
 //! Phase 4.4c lands `Runtime` + `RuntimeBuilder` on top of the
 //! concrete [`BufferSource`] and the rev-6 plugin traits (`Decoder`,
-//! `Sink`, `IdempotencyContract`). The loop is serial: one source
-//! batch fetched, decoded, written, and acked at a time. Phase 6
-//! introduces parallel fetch + bounded queues; the trait surface
-//! here does not change at that point.
+//! `Sink`). The loop is serial: one source batch fetched, decoded,
+//! written, and acked at a time. Phase 6 introduces parallel fetch +
+//! bounded queues; the trait surface here does not change at that
+//! point.
 //!
 //! Sequence:
 //!
@@ -15,11 +15,12 @@
 //! 4. Run the [`Decoder`].
 //! 5. For each [`DecodedBatch`] the decoder produces, register the
 //!    pending range with the per-source `AckCoordinator` looked up
-//!    via [`AckCoordinators`], construct a [`SinkCommit`] with an
-//!    [`IdempotencyKey`], call [`Sink::write`], `mark_committed`,
-//!    then `advance_frontier`. `MaybeCommitted` triggers a
-//!    [`Sink::check_committed`] lookup before retry per RFC 0002
-//!    rev 6.
+//!    via [`AckCoordinators`], construct a [`SinkCommit`] whose
+//!    [`CommitIdentity`] projects `(source, sink, range,
+//!    schema_version)` deterministically, call [`Sink::write`],
+//!    `mark_committed`, then `advance_frontier`. `MaybeCommitted`
+//!    triggers a [`Sink::check_committed`] lookup before retry per
+//!    RFC 0002 §Runtime/Sink Boundary.
 //! 6. Advance the Buffer ack frontier via
 //!    [`BufferSource::ack_through`] using the coordinator's
 //!    `frontier()` and flush per the configured [`AckFlushPolicy`].
@@ -49,7 +50,7 @@ use crate::envelope::{
     ConfiguredEnvelope, PayloadEncoding, SignalType, decode_envelopes, validate_consistent,
 };
 use crate::error::{RuntimeError, RuntimeResult};
-use crate::idempotency::{DefaultIdempotencyContract, IdempotencyContract, IdempotencyScope};
+use crate::identity::{CommitIdentity, SequenceRange};
 use crate::sink::{CommitStatus, Sink, SinkCommit, SinkCommitFailure, SinkCommitResult};
 use crate::source::{BufferSource, SourceBatch, SourceBudget};
 
@@ -135,7 +136,6 @@ pub struct Runtime {
     /// will populate N entries; the orchestration code already
     /// looks up by source id.
     coordinators: AckCoordinators,
-    idempotency: Arc<dyn IdempotencyContract>,
     options: RuntimeOptions,
     groups_since_flush: u32,
     progress_tx: watch::Sender<RuntimeProgress>,
@@ -146,7 +146,6 @@ pub struct RuntimeBuilder {
     source: Option<BufferSource>,
     decoder: Option<Arc<dyn Decoder>>,
     sink: Option<Arc<dyn Sink>>,
-    idempotency: Option<Arc<dyn IdempotencyContract>>,
     options: RuntimeOptions,
 }
 
@@ -156,7 +155,6 @@ impl Runtime {
             source: None,
             decoder: None,
             sink: None,
-            idempotency: None,
             options: RuntimeOptions::default(),
         }
     }
@@ -352,23 +350,13 @@ impl Runtime {
         high_sequence: u64,
         batch: DecodedBatch,
     ) -> SinkCommit {
-        let idempotency_key = self.idempotency.key(IdempotencyScope {
-            source: &source_id,
-            sink: self.sink.id(),
-            low_sequence,
-            high_sequence,
-            schema_version: batch.schema_version,
-            // Phase 7 wires sink-config-derived chunking fingerprint.
-            chunking_fingerprint: 0,
-        });
-        SinkCommit {
+        let identity = CommitIdentity {
             source: source_id,
             sink: self.sink.id().clone(),
-            low_sequence,
-            high_sequence,
-            batch,
-            idempotency_key,
-        }
+            range: SequenceRange::new(low_sequence, high_sequence),
+            schema_version: batch.schema_version,
+        };
+        SinkCommit { identity, batch }
     }
 
     async fn write_with_retry(&self, commit: SinkCommit) -> RuntimeResult<SinkCommitResult> {
@@ -385,7 +373,7 @@ impl Runtime {
                     attempt = attempt.saturating_add(1);
                 }
                 Err(SinkCommitFailure::MaybeCommitted(e)) => {
-                    match self.sink.check_committed(&commit.idempotency_key).await? {
+                    match self.sink.check_committed(&commit.identity).await? {
                         CommitStatus::Committed => {
                             // The sink confirmed an earlier attempt
                             // committed; we don't get a fresh
@@ -435,14 +423,6 @@ impl RuntimeBuilder {
         self
     }
 
-    pub fn with_idempotency<I>(mut self, contract: I) -> Self
-    where
-        I: IdempotencyContract + 'static,
-    {
-        self.idempotency = Some(Arc::new(contract));
-        self
-    }
-
     pub fn with_options(mut self, options: RuntimeOptions) -> Self {
         self.options = options;
         self
@@ -458,9 +438,6 @@ impl RuntimeBuilder {
         let sink = self
             .sink
             .ok_or_else(|| RuntimeError::Config("no sink configured".into()))?;
-        let idempotency = self
-            .idempotency
-            .unwrap_or_else(|| Arc::new(DefaultIdempotencyContract));
         let mut coordinators = AckCoordinators::new();
         coordinators.register_source(source.id().clone(), source.last_acked_sequence())?;
         let (progress_tx, progress_rx) = watch::channel(RuntimeProgress::default());
@@ -469,7 +446,6 @@ impl RuntimeBuilder {
             decoder,
             sink,
             coordinators,
-            idempotency,
             options: self.options,
             groups_since_flush: 0,
             progress_tx,

@@ -1,10 +1,13 @@
 //! INV-CLICKHOUSE-TOKEN-DETERMINISTIC contract tests for the
 //! `OtlpLogsClickHouseAdapter`'s `insert_deduplication_token`.
 //! Per Phase 5.0 design rev 6 §Test Plan > Idempotency-key /
-//! adapter-token contract tests.
+//! adapter-token contract tests; plus the chunking-fingerprint
+//! property relocated here from the runtime's
+//! `tests/idempotency_keys.rs` by impl-plan row 5.9 (the runtime
+//! no longer exposes a chunking fingerprint — it is a sink concern).
 //!
 //! The adapter's documented token shape (see `build_token` at
-//! `plugins/opendata-ingest-clickhouse/src/adapter/logs.rs:261`):
+//! `plugins/opendata-ingest-clickhouse/src/adapter/logs.rs`):
 //!
 //! ```text
 //! {manifest_path}:{database}.{table}:{low}-{high}:{adapter_version}:{fingerprint}:{chunk_index}
@@ -15,17 +18,18 @@
 //! `low_sequence`, `high_sequence`, `adapter_version`, the
 //! chunking-fingerprint input fields, or `chunk_index` must
 //! produce a different token. The runtime-level
-//! `IdempotencyKey` and this adapter token are **independent
+//! `CommitIdentity` and this adapter token are **independent
 //! key spaces** in v1 (the adapter computes its own token from
-//! the record stream, not from `SinkCommit.idempotency_key`);
-//! unification is Phase 7 schema/mapping work per design
-//! §Decisions Q6.
+//! its adapter configuration + the source range, not from
+//! `SinkCommit.identity`); unification is Phase 7 schema/mapping
+//! work per design §Decisions Q6.
 
 use std::collections::BTreeMap;
 
-use opendata_ingest_clickhouse::{Adapter, LogsAdapterConfig, OtlpLogsClickHouseAdapter};
-use opendata_ingest_otel::logs::{DecodedLogRecord, SourceCoordinates};
-use opendata_ingest_runtime::commit_group::CommitGroupBatch;
+use opendata_ingest_clickhouse::{
+    Adapter, ClickHouseAdapterBatch, LogsAdapterConfig, OtlpLogsClickHouseAdapter,
+};
+use opendata_ingest_otel::logs::{DecodedLogRecord, RowSourceCoordinates};
 
 fn make_record(
     manifest_path: &str,
@@ -34,8 +38,8 @@ fn make_record(
     record_index: u32,
 ) -> DecodedLogRecord {
     DecodedLogRecord {
-        source: SourceCoordinates {
-            sequence,
+        source: RowSourceCoordinates {
+            buffer_sequence: sequence,
             entry_index,
             record_index,
             manifest_path: manifest_path.to_string(),
@@ -61,18 +65,12 @@ fn batch(
     low_sequence: u64,
     high_sequence: u64,
     n_records: usize,
-) -> CommitGroupBatch<DecodedLogRecord> {
+) -> ClickHouseAdapterBatch<DecodedLogRecord> {
     let records: Vec<DecodedLogRecord> = (0..n_records as u32)
         .map(|i| make_record(manifest_path, low_sequence, 0, i))
         .collect();
-    let bytes = records
-        .iter()
-        .map(|r| {
-            use opendata_ingest_runtime::commit_group::RecordSize;
-            r.approx_size_bytes()
-        })
-        .sum();
-    CommitGroupBatch {
+    let bytes = records.iter().map(|r| r.approx_size_bytes()).sum();
+    ClickHouseAdapterBatch {
         records,
         low_sequence,
         high_sequence,

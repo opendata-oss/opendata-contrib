@@ -17,10 +17,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use opendata_ingest_otel::logs::DecodedLogRecord;
-use opendata_ingest_runtime::commit_group::{CommitGroupBatch, RecordSize};
 
 use crate::adapter::{
-    Adapter, AdapterError, AdapterResult, ClickHouseSettings, InsertChunk, RowValue,
+    Adapter, AdapterError, AdapterResult, ClickHouseAdapterBatch, ClickHouseSettings, InsertChunk,
+    RowValue,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -129,8 +129,8 @@ const COLUMNS: &[&str] = &[
 impl Adapter for OtlpLogsClickHouseAdapter {
     type Input = DecodedLogRecord;
 
-    fn plan(&self, batch: CommitGroupBatch<Self::Input>) -> AdapterResult<Vec<InsertChunk>> {
-        let CommitGroupBatch {
+    fn plan(&self, batch: ClickHouseAdapterBatch<Self::Input>) -> AdapterResult<Vec<InsertChunk>> {
+        let ClickHouseAdapterBatch {
             mut records,
             low_sequence,
             high_sequence,
@@ -144,7 +144,7 @@ impl Adapter for OtlpLogsClickHouseAdapter {
         // iteration order.
         records.sort_by_key(|r| {
             (
-                r.source.sequence,
+                r.source.buffer_sequence,
                 r.source.entry_index,
                 r.source.record_index,
             )
@@ -299,7 +299,7 @@ fn log_row(rec: &DecodedLogRecord, config: &LogsAdapterConfig) -> Vec<RowValue> 
         RowValue::StringMap(log_attrs),
         RowValue::String(rec.trace_id_hex.clone()),
         RowValue::String(rec.span_id_hex.clone()),
-        RowValue::UInt64(rec.source.sequence),
+        RowValue::UInt64(rec.source.buffer_sequence),
         RowValue::UInt32(rec.source.entry_index),
         RowValue::UInt32(rec.source.record_index),
         RowValue::LowCardinalityString(rec.source.manifest_path.clone()),
@@ -357,7 +357,7 @@ pub fn logs_table_ddl(config: &LogsAdapterConfig) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use opendata_ingest_otel::logs::SourceCoordinates;
+    use opendata_ingest_otel::logs::RowSourceCoordinates;
     use std::collections::BTreeMap;
 
     fn cfg() -> LogsAdapterConfig {
@@ -369,8 +369,8 @@ mod tests {
 
     fn rec(sequence: u64, entry_index: u32, record_index: u32) -> DecodedLogRecord {
         DecodedLogRecord {
-            source: SourceCoordinates {
-                sequence,
+            source: RowSourceCoordinates {
+                buffer_sequence: sequence,
                 entry_index,
                 record_index,
                 manifest_path: "ingest/test/manifest".into(),
@@ -395,7 +395,7 @@ mod tests {
     fn empty_batch_yields_no_chunks() {
         let adapter = OtlpLogsClickHouseAdapter::new(cfg());
         let chunks = adapter
-            .plan(CommitGroupBatch {
+            .plan(ClickHouseAdapterBatch {
                 records: Vec::new(),
                 low_sequence: 5,
                 high_sequence: 9,
@@ -410,7 +410,7 @@ mod tests {
         let adapter = OtlpLogsClickHouseAdapter::new(cfg());
         let records = vec![rec(1, 0, 0), rec(1, 0, 1), rec(2, 0, 0)];
         let chunks = adapter
-            .plan(CommitGroupBatch {
+            .plan(ClickHouseAdapterBatch {
                 records,
                 low_sequence: 1,
                 high_sequence: 2,
@@ -428,7 +428,7 @@ mod tests {
     fn token_format_includes_low_high_version_fingerprint_chunk() {
         let adapter = OtlpLogsClickHouseAdapter::new(cfg());
         let chunks = adapter
-            .plan(CommitGroupBatch {
+            .plan(ClickHouseAdapterBatch {
                 records: vec![rec(7, 0, 0), rec(7, 0, 1), rec(8, 0, 0)],
                 low_sequence: 7,
                 high_sequence: 8,
@@ -458,7 +458,7 @@ mod tests {
         let mut b = rec(1, 0, 1);
         b.source.manifest_path = "ingest/otel/logs-b/manifest".into();
         let err = adapter
-            .plan(CommitGroupBatch {
+            .plan(ClickHouseAdapterBatch {
                 records: vec![a, b],
                 low_sequence: 1,
                 high_sequence: 1,
@@ -485,7 +485,7 @@ mod tests {
         let mut b = rec(1, 0, 0);
         b.source.manifest_path = "ingest/otel/logs-b/manifest".into();
         let plan_a = adapter
-            .plan(CommitGroupBatch {
+            .plan(ClickHouseAdapterBatch {
                 records: vec![a],
                 low_sequence: 1,
                 high_sequence: 1,
@@ -493,7 +493,7 @@ mod tests {
             })
             .expect("plan a");
         let plan_b = adapter
-            .plan(CommitGroupBatch {
+            .plan(ClickHouseAdapterBatch {
                 records: vec![b],
                 low_sequence: 1,
                 high_sequence: 1,
@@ -517,7 +517,7 @@ mod tests {
             ..LogsAdapterConfig::default()
         });
         let chunks = adapter
-            .plan(CommitGroupBatch {
+            .plan(ClickHouseAdapterBatch {
                 records: vec![rec(1, 0, 0), rec(1, 0, 1), rec(1, 0, 2)],
                 low_sequence: 1,
                 high_sequence: 1,
@@ -547,7 +547,7 @@ mod tests {
             ..LogsAdapterConfig::default()
         });
         let loose = adapter_loose
-            .plan(CommitGroupBatch {
+            .plan(ClickHouseAdapterBatch {
                 records: records(),
                 low_sequence: 1,
                 high_sequence: 1,
@@ -555,7 +555,7 @@ mod tests {
             })
             .expect("plan loose");
         let strict = adapter_strict
-            .plan(CommitGroupBatch {
+            .plan(ClickHouseAdapterBatch {
                 records: records(),
                 low_sequence: 1,
                 high_sequence: 1,
@@ -576,7 +576,7 @@ mod tests {
         let adapter = OtlpLogsClickHouseAdapter::new(cfg());
 
         let plan_a = adapter
-            .plan(CommitGroupBatch {
+            .plan(ClickHouseAdapterBatch {
                 records: records(),
                 low_sequence: 7,
                 high_sequence: 8,
@@ -584,7 +584,7 @@ mod tests {
             })
             .expect("plan a");
         let plan_b = adapter
-            .plan(CommitGroupBatch {
+            .plan(ClickHouseAdapterBatch {
                 records: records(),
                 low_sequence: 7,
                 high_sequence: 8,
@@ -626,7 +626,7 @@ mod tests {
         });
         let r = rec(11, 3, 7);
         let chunks = adapter
-            .plan(CommitGroupBatch {
+            .plan(ClickHouseAdapterBatch {
                 records: vec![r.clone()],
                 low_sequence: 11,
                 high_sequence: 11,
@@ -673,7 +673,7 @@ mod tests {
         // shape.
         let records = vec![rec(2, 0, 0), rec(1, 0, 1), rec(1, 0, 0)];
         let chunks = adapter
-            .plan(CommitGroupBatch {
+            .plan(ClickHouseAdapterBatch {
                 records,
                 low_sequence: 1,
                 high_sequence: 2,

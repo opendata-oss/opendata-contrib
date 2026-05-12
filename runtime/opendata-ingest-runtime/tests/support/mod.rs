@@ -31,7 +31,7 @@ use opendata_ingest_runtime::decoded_batch::{
 use opendata_ingest_runtime::decoder::Decoder;
 use opendata_ingest_runtime::envelope::MetadataEnvelope;
 use opendata_ingest_runtime::error::{RuntimeError, RuntimeResult};
-use opendata_ingest_runtime::idempotency::{IdempotencyKey, SchemaVersion};
+use opendata_ingest_runtime::identity::{CommitIdentity, SchemaVersion};
 use opendata_ingest_runtime::sink::{
     CommitStatus, Sink, SinkBudget, SinkCommit, SinkCommitFailure, SinkCommitResult, SinkId,
 };
@@ -154,7 +154,7 @@ pub struct CapturedCommit {
     pub sink: String,
     pub low_sequence: u64,
     pub high_sequence: u64,
-    pub idempotency_key: String,
+    pub identity: String,
     pub record_count: usize,
 }
 
@@ -188,11 +188,11 @@ impl Sink for FakeSink {
             DecodedRecords::Typed(t) => t.record_count(),
         };
         self.captured.lock().unwrap().push(CapturedCommit {
-            source: commit.source.to_string(),
-            sink: commit.sink.to_string(),
-            low_sequence: commit.low_sequence,
-            high_sequence: commit.high_sequence,
-            idempotency_key: commit.idempotency_key.to_string(),
+            source: commit.identity.source.to_string(),
+            sink: commit.identity.sink.to_string(),
+            low_sequence: commit.identity.range.low,
+            high_sequence: commit.identity.range.high,
+            identity: commit.identity.to_string(),
             record_count,
         });
         Ok(SinkCommitResult {
@@ -200,7 +200,7 @@ impl Sink for FakeSink {
             rows_written: record_count as u64,
         })
     }
-    async fn check_committed(&self, _key: &IdempotencyKey) -> RuntimeResult<CommitStatus> {
+    async fn check_committed(&self, _identity: &CommitIdentity) -> RuntimeResult<CommitStatus> {
         Ok::<CommitStatus, RuntimeError>(CommitStatus::Unknown)
     }
 }
@@ -227,7 +227,7 @@ pub struct CapturedWrite {
     pub sink: String,
     pub low_sequence: u64,
     pub high_sequence: u64,
-    pub idempotency_key: String,
+    pub identity: String,
     pub record_count: usize,
 }
 
@@ -410,11 +410,11 @@ impl Sink for ProgrammableSink {
             DecodedRecords::Typed(t) => t.record_count(),
         };
         self.write_calls.lock().unwrap().push(CapturedWrite {
-            source: commit.source.to_string(),
-            sink: commit.sink.to_string(),
-            low_sequence: commit.low_sequence,
-            high_sequence: commit.high_sequence,
-            idempotency_key: commit.idempotency_key.to_string(),
+            source: commit.identity.source.to_string(),
+            sink: commit.identity.sink.to_string(),
+            low_sequence: commit.identity.range.low,
+            high_sequence: commit.identity.range.high,
+            identity: commit.identity.to_string(),
             record_count,
         });
 
@@ -443,11 +443,11 @@ impl Sink for ProgrammableSink {
         }
     }
 
-    async fn check_committed(&self, key: &IdempotencyKey) -> RuntimeResult<CommitStatus> {
+    async fn check_committed(&self, identity: &CommitIdentity) -> RuntimeResult<CommitStatus> {
         self.check_committed_calls
             .lock()
             .unwrap()
-            .push(key.to_string());
+            .push(identity.to_string());
         self.maybe_park(false).await;
         Ok::<CommitStatus, RuntimeError>(*self.check_committed_response.lock().unwrap())
     }

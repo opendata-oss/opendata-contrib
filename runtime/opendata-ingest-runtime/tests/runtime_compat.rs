@@ -373,9 +373,10 @@ async fn live_mode_writes_to_sink_and_advances_ack_frontier() {
         assert_eq!(c.low_sequence, i as u64);
         assert_eq!(c.high_sequence, i as u64);
         assert_eq!(c.record_count, 1);
-        // Default idempotency key shape: {source}:{sink}:{low}-{high}:{schema_version}:{chunking_fingerprint:016x}
-        let expected_key = format!("buffer:fake-sink:{i}-{i}:1:0000000000000000");
-        assert_eq!(c.idempotency_key, expected_key);
+        // CommitIdentity Display shape (RFC 0002 §Runtime/Sink
+        // Boundary): {source}:{sink}:{low}-{high}:{schema_version}.
+        let expected_identity = format!("buffer:fake-sink:{i}-{i}:1");
+        assert_eq!(c.identity, expected_identity);
     }
 
     fx.producer.close().await.expect("close producer");

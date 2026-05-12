@@ -136,9 +136,9 @@ async fn runtime_does_not_ack_until_sink_returns_ok() {
         checks.is_empty(),
         "NotCommitted does not trigger check_committed; got checks={checks:?}"
     );
-    let key = &writes[0].idempotency_key;
+    let key = &writes[0].identity;
     assert!(
-        writes.iter().all(|w| &w.idempotency_key == key),
+        writes.iter().all(|w| &w.identity == key),
         "INV-SINK-RETRY-IDEMPOTENT: all retries share the same key; got writes={writes:?}"
     );
 
@@ -467,8 +467,8 @@ async fn runtime_retry_budget_exhaustion_does_not_ack_failing_range() {
     // All target the same sequence with the same idempotency
     // key (INV-SINK-RETRY-IDEMPOTENT).
     assert!(writes.iter().all(|w| w.high_sequence == 0));
-    let key = &writes[0].idempotency_key;
-    assert!(writes.iter().all(|w| &w.idempotency_key == key));
+    let key = &writes[0].identity;
+    assert!(writes.iter().all(|w| &w.identity == key));
 
     let _ = shutdown;
     fx.producer.close().await.expect("close producer");
@@ -568,7 +568,7 @@ async fn runtime_fence_aborts_durable_ack_with_source_error() {
     let writes_a_snapshot = writes_a.lock().unwrap().clone();
     assert_eq!(writes_a_snapshot.len(), 1);
     assert_eq!(writes_a_snapshot[0].high_sequence, 0);
-    let key_a = writes_a_snapshot[0].idempotency_key.clone();
+    let key_a = writes_a_snapshot[0].identity.clone();
 
     // Build the replay runtime on B with a fresh ProgrammableSink
     // scripted Ok. The replay runtime's first next_descriptors
@@ -631,7 +631,7 @@ async fn runtime_fence_aborts_durable_ack_with_source_error() {
     );
     // INV-SINK-RETRY-IDEMPOTENT: B's commit shares A's key.
     assert_eq!(
-        writes_b_snapshot[0].idempotency_key, key_a,
+        writes_b_snapshot[0].identity, key_a,
         "B's replay must reuse A's IdempotencyKey for INV-SINK-RETRY-IDEMPOTENT"
     );
 
@@ -702,7 +702,7 @@ async fn replay_after_crash_before_sink_write_reissues_write_and_acks() {
     // but the runtime never advanced past it.
     let writes_a_snapshot = writes_a.lock().unwrap().clone();
     assert_eq!(writes_a_snapshot.len(), 1);
-    let key_a = writes_a_snapshot[0].idempotency_key.clone();
+    let key_a = writes_a_snapshot[0].identity.clone();
 
     // ----- Runtime B: replay on same store. -----
     let source_b =
@@ -748,7 +748,7 @@ async fn replay_after_crash_before_sink_write_reissues_write_and_acks() {
     assert_eq!(writes_b_snapshot.len(), 1);
     assert_eq!(writes_b_snapshot[0].high_sequence, 0);
     assert_eq!(
-        writes_b_snapshot[0].idempotency_key, key_a,
+        writes_b_snapshot[0].identity, key_a,
         "INV-SINK-RETRY-IDEMPOTENT: replay reuses A's key"
     );
 
@@ -827,7 +827,7 @@ async fn replay_after_crash_after_commit_before_flush_idempotently_completes() {
 
     let writes_a_snapshot = writes_a.lock().unwrap().clone();
     assert_eq!(writes_a_snapshot.len(), 1);
-    let key_a = writes_a_snapshot[0].idempotency_key.clone();
+    let key_a = writes_a_snapshot[0].identity.clone();
 
     // ----- Runtime B: replay on same store. -----
     let source_b =
@@ -880,7 +880,7 @@ async fn replay_after_crash_after_commit_before_flush_idempotently_completes() {
         "B must replay sequence 0 (durable manifest unadvanced past A's pre-crash state)"
     );
     assert_eq!(
-        writes_b_snapshot[0].idempotency_key, key_a,
+        writes_b_snapshot[0].identity, key_a,
         "INV-SINK-RETRY-IDEMPOTENT: replay reuses A's key"
     );
 
@@ -956,7 +956,7 @@ async fn replay_after_maybe_committed_unresolved_resolves_via_check_committed_on
     // check_committed call before the abort.
     assert_eq!(writes_a.lock().unwrap().len(), 1);
     assert_eq!(check_calls_a.lock().unwrap().len(), 1);
-    let key_a = writes_a.lock().unwrap()[0].idempotency_key.clone();
+    let key_a = writes_a.lock().unwrap()[0].identity.clone();
 
     // ----- Runtime B: replay on same store. -----
     let source_b =
@@ -1002,7 +1002,7 @@ async fn replay_after_maybe_committed_unresolved_resolves_via_check_committed_on
     assert_eq!(writes_b_snapshot.len(), 1);
     assert_eq!(writes_b_snapshot[0].high_sequence, 0);
     assert_eq!(
-        writes_b_snapshot[0].idempotency_key, key_a,
+        writes_b_snapshot[0].identity, key_a,
         "INV-SINK-RETRY-IDEMPOTENT: replay reuses A's key"
     );
 

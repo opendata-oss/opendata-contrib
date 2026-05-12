@@ -10,7 +10,7 @@ use std::any::Any;
 use std::fmt;
 use std::sync::Arc;
 
-use crate::idempotency::SchemaVersion;
+use crate::identity::SchemaVersion;
 use crate::source::SourceId;
 
 /// Schema descriptor exposed by typed records. Phase 7 fleshes this

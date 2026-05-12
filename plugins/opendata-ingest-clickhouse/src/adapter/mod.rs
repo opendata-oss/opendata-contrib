@@ -1,12 +1,15 @@
 //! Adapter trait + ClickHouse-shaped insert plan types.
 //!
-//! Adapters consume a drained [`CommitGroupBatch`] and produce a
+//! Adapters consume a drained [`ClickHouseAdapterBatch`] and produce a
 //! deterministic sequence of [`InsertChunk`]s. Each chunk carries a
 //! per-chunk idempotency token of the form
 //! `{manifest}:{database}.{table}:{low}-{high}:{adapter_version}:{chunking_fingerprint}:{chunk_index}`,
 //! so a replay of the same Buffer sequence range under the same
 //! configuration produces identical tokens (and therefore deduplicates
-//! cleanly at the table level).
+//! cleanly at the table level). Chunking shape and the chunking
+//! fingerprint are sink-internal concerns; the runtime hands the sink
+//! one [`opendata_ingest_runtime::sink::SinkCommit`] per source range
+//! and never inspects how the sink plans physical writes.
 
 pub mod logs;
 
@@ -14,7 +17,6 @@ use std::collections::BTreeMap;
 
 use serde_json::Value as JsonValue;
 
-use opendata_ingest_runtime::commit_group::CommitGroupBatch;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -208,18 +210,33 @@ impl InsertChunk {
     }
 }
 
+/// Planning batch handed to a ClickHouse [`Adapter`] — sink-internal
+/// shape that lifts a [`SinkCommit`]'s decoded records plus its
+/// source range into a form the adapter can chunk over. Mirrors the
+/// Phase 4 `CommitGroupBatch<R>` shape but lives in the plugin crate;
+/// the runtime no longer hosts a generic planning type.
+///
+/// [`SinkCommit`]: opendata_ingest_runtime::sink::SinkCommit
+#[derive(Debug, Clone)]
+pub struct ClickHouseAdapterBatch<R> {
+    pub records: Vec<R>,
+    pub low_sequence: u64,
+    pub high_sequence: u64,
+    pub bytes: usize,
+}
+
 pub trait Adapter {
     type Input;
 
-    /// Plan a deterministic sequence of insert chunks from the drained
-    /// commit-group batch. Implementations must satisfy:
+    /// Plan a deterministic sequence of insert chunks from the
+    /// adapter-internal batch. Implementations must satisfy:
     ///
     /// 1. Chunking is a pure function of `(records, configured_thresholds)`.
     /// 2. The same `(low_sequence, high_sequence, chunk_index)` tuple
     ///    always produces the same rows on a replay.
     /// 3. Each chunk's `idempotency_token` is unique within the batch and
     ///    follows the format documented in RFC 0003.
-    fn plan(&self, batch: CommitGroupBatch<Self::Input>) -> AdapterResult<Vec<InsertChunk>>;
+    fn plan(&self, batch: ClickHouseAdapterBatch<Self::Input>) -> AdapterResult<Vec<InsertChunk>>;
 }
 
 #[cfg(test)]

@@ -32,13 +32,13 @@ pub mod metrics_server;
 
 pub use opendata_ingest_clickhouse::{adapter, writer};
 pub use opendata_ingest_otel::logs as signal;
-pub use opendata_ingest_runtime::{commit_group, envelope, source};
+pub use opendata_ingest_runtime::{envelope, source};
 
 pub use adapter::logs::{LogsAdapterConfig, OtlpLogsClickHouseAdapter, logs_table_ddl};
 pub use adapter::{
-    Adapter, AdapterError, AdapterResult, ClickHouseSettings, InsertChunk, RowValue,
+    Adapter, AdapterError, AdapterResult, ClickHouseAdapterBatch, ClickHouseSettings, InsertChunk,
+    RowValue,
 };
-pub use commit_group::{CommitGroup, CommitGroupBatch, CommitGroupThresholds};
 pub use config::IngestorConfig;
 pub use envelope::{
     ConfiguredEnvelope, EnvelopeError, MetadataEnvelope, PayloadEncoding, SignalType,
@@ -47,7 +47,7 @@ pub use envelope::{
 pub use error::{IngestorError, IngestorResult};
 pub use opendata_ingest_clickhouse::ClickHouseSink;
 pub use signal::{
-    DecodedLogRecord, DecodedLogs, OtelDecodeError, OtlpLogsDecoder, SourceCoordinates,
+    DecodedLogRecord, DecodedLogs, OtelDecodeError, OtlpLogsDecoder, RowSourceCoordinates,
 };
 pub use source::{SourceBatch, SourceEntry, split_into_raw_entries};
 pub use writer::{ClickHouseWriter, WriterError, WriterErrorClass};

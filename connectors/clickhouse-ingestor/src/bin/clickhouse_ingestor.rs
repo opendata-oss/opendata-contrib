@@ -28,7 +28,7 @@ use opendata_ingest_clickhouse::ClickHouseSink;
 use opendata_ingest_otel::logs::OtlpLogsDecoder;
 use opendata_ingest_runtime::envelope::{ConfiguredEnvelope, PayloadEncoding, SignalType};
 use opendata_ingest_runtime::error::{RuntimeError, RuntimeResult};
-use opendata_ingest_runtime::idempotency::IdempotencyKey;
+use opendata_ingest_runtime::identity::CommitIdentity;
 use opendata_ingest_runtime::runtime::{AckFlushPolicy, Runtime, RuntimeOptions};
 use opendata_ingest_runtime::sink::{
     CommitStatus, Sink, SinkBudget, SinkCommit, SinkCommitFailure, SinkCommitResult, SinkId,
@@ -73,7 +73,7 @@ impl Sink for DryRunSink {
                 .into(),
         ))
     }
-    async fn check_committed(&self, _key: &IdempotencyKey) -> RuntimeResult<CommitStatus> {
+    async fn check_committed(&self, _identity: &CommitIdentity) -> RuntimeResult<CommitStatus> {
         Ok::<CommitStatus, RuntimeError>(CommitStatus::Unknown)
     }
 }

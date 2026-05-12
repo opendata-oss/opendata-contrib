@@ -19,14 +19,13 @@ use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue, any_value::Valu
 use prost::Message;
 use thiserror::Error;
 
-use opendata_ingest_runtime::commit_group::RecordSize;
 use opendata_ingest_runtime::decoded_batch::{
     BatchStats, DecodedBatch, DecodedRecords, SourceCoordinateColumns, TypedRecords, TypedSchema,
 };
 use opendata_ingest_runtime::decoder::Decoder;
 use opendata_ingest_runtime::envelope::{MetadataEnvelope, PayloadEncoding, SignalType};
 use opendata_ingest_runtime::error::{RuntimeError, RuntimeResult};
-use opendata_ingest_runtime::idempotency::SchemaVersion;
+use opendata_ingest_runtime::identity::SchemaVersion;
 use opendata_ingest_runtime::source::{SourceBatch, SourceEntry};
 
 #[derive(Debug, Error)]
@@ -40,10 +39,18 @@ pub enum OtelDecodeError {
     },
 }
 
-/// Buffer source coordinates carried forward to the adapter.
+/// Row-level Buffer source coordinates carried alongside each decoded
+/// log record. `buffer_sequence` is the Buffer batch sequence the row
+/// came from; combined with `entry_index` and `record_index` it forms
+/// the row-unique `(buffer_sequence, entry_index, record_index)`
+/// triple. The runtime's logical commit range uses the same Buffer
+/// sequence axis ([`SequenceRange`]); the ClickHouse `_odb_sequence`
+/// column carries `buffer_sequence` verbatim.
+///
+/// [`SequenceRange`]: opendata_ingest_runtime::identity::SequenceRange
 #[derive(Debug, Clone)]
-pub struct SourceCoordinates {
-    pub sequence: u64,
+pub struct RowSourceCoordinates {
+    pub buffer_sequence: u64,
     pub entry_index: u32,
     pub record_index: u32,
     pub manifest_path: String,
@@ -55,7 +62,7 @@ pub struct SourceCoordinates {
 /// and resource/scope/log attributes pre-merged into a single map.
 #[derive(Debug, Clone)]
 pub struct DecodedLogRecord {
-    pub source: SourceCoordinates,
+    pub source: RowSourceCoordinates,
     pub timestamp_unix_nano: u64,
     pub observed_timestamp_unix_nano: u64,
     pub severity_number: i32,
@@ -75,8 +82,12 @@ pub struct DecodedLogRecord {
 /// wrapper type.
 pub type DecodedLogs = Vec<DecodedLogRecord>;
 
-impl RecordSize for DecodedLogRecord {
-    fn approx_size_bytes(&self) -> usize {
+impl DecodedLogRecord {
+    /// Cheap approximate byte size for the ClickHouse adapter's
+    /// byte-aware chunker. Sink-side helper — kept here on the
+    /// record type so the sink can compute it without re-deriving
+    /// the OTLP layout.
+    pub fn approx_size_bytes(&self) -> usize {
         let mut sz = std::mem::size_of::<Self>();
         sz += self.severity_text.len();
         sz += self.body.len();
@@ -190,7 +201,7 @@ impl Decoder for OtlpLogsDecoder {
         let mut record_indices = Vec::with_capacity(record_count);
         let mut ingestion_time_ms = Vec::with_capacity(record_count);
         for r in &records {
-            sequences.push(r.source.sequence);
+            sequences.push(r.source.buffer_sequence);
             entry_indices.push(r.source.entry_index);
             record_indices.push(r.source.record_index);
             ingestion_time_ms.push(r.source.ingestion_time_ms);
@@ -265,8 +276,8 @@ fn decode_entry(
                 }
 
                 records.push(DecodedLogRecord {
-                    source: SourceCoordinates {
-                        sequence: batch.sequence,
+                    source: RowSourceCoordinates {
+                        buffer_sequence: batch.sequence,
                         entry_index: entry.entry_index,
                         record_index,
                         manifest_path: batch.manifest_path.clone(),
@@ -404,9 +415,9 @@ mod tests {
         // Resource attributes flow through.
         assert_eq!(decoded[0].service_name.as_deref(), Some("svc-0"));
         assert_eq!(decoded[2].service_name.as_deref(), Some("svc-1"));
-        // Source coordinates use the per-batch sequence and per-entry index.
+        // Source coordinates use the per-batch buffer sequence and per-entry index.
         for rec in &decoded {
-            assert_eq!(rec.source.sequence, 42);
+            assert_eq!(rec.source.buffer_sequence, 42);
             assert_eq!(rec.source.entry_index, 0);
             assert_eq!(rec.source.manifest_path, "ingest/test/manifest");
             assert_eq!(rec.source.ingestion_time_ms, 99);

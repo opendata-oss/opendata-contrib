@@ -19,17 +19,16 @@ use std::time::Duration;
 use async_trait::async_trait;
 use bytes::Bytes;
 use clickhouse_ingestor::{
-    Adapter, DecodedLogRecord, InsertChunk, LogsAdapterConfig, OtlpLogsClickHouseAdapter,
-    OtlpLogsDecoder,
+    Adapter, ClickHouseAdapterBatch, DecodedLogRecord, InsertChunk, LogsAdapterConfig,
+    OtlpLogsClickHouseAdapter, OtlpLogsDecoder,
 };
 use common::ObjectStoreConfig;
 use common::clock::SystemClock;
 use opendata_ingest_otel::logs::TypedDecodedLogs;
-use opendata_ingest_runtime::commit_group::{CommitGroupBatch, RecordSize};
 use opendata_ingest_runtime::decoded_batch::DecodedRecords;
 use opendata_ingest_runtime::envelope::{ConfiguredEnvelope, PayloadEncoding, SignalType};
 use opendata_ingest_runtime::error::{RuntimeError, RuntimeResult};
-use opendata_ingest_runtime::idempotency::IdempotencyKey;
+use opendata_ingest_runtime::identity::CommitIdentity;
 use opendata_ingest_runtime::runtime::{AckFlushPolicy, Runtime, RuntimeOptions};
 use opendata_ingest_runtime::sink::{
     CommitStatus, Sink, SinkBudget, SinkCommit, SinkCommitFailure, SinkCommitResult, SinkId,
@@ -121,7 +120,7 @@ impl Sink for DryRunSink {
                 .into(),
         ))
     }
-    async fn check_committed(&self, _key: &IdempotencyKey) -> RuntimeResult<CommitStatus> {
+    async fn check_committed(&self, _identity: &CommitIdentity) -> RuntimeResult<CommitStatus> {
         Ok::<CommitStatus, RuntimeError>(CommitStatus::Unknown)
     }
 }
@@ -159,7 +158,7 @@ impl Sink for RecordingSink {
             })?;
         let selected: Vec<DecodedLogRecord> = logs.records().to_vec();
         let bytes: usize = selected.iter().map(|r| r.approx_size_bytes()).sum();
-        let group = CommitGroupBatch {
+        let group = ClickHouseAdapterBatch {
             records: selected,
             low_sequence: batch.low_sequence,
             high_sequence: batch.high_sequence,
@@ -180,7 +179,7 @@ impl Sink for RecordingSink {
             rows_written,
         })
     }
-    async fn check_committed(&self, _key: &IdempotencyKey) -> RuntimeResult<CommitStatus> {
+    async fn check_committed(&self, _identity: &CommitIdentity) -> RuntimeResult<CommitStatus> {
         Ok::<CommitStatus, RuntimeError>(CommitStatus::Unknown)
     }
 }

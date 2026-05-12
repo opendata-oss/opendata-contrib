@@ -25,15 +25,14 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use opendata_ingest_otel::logs::{DecodedLogRecord, TypedDecodedLogs};
-use opendata_ingest_runtime::commit_group::{CommitGroupBatch, RecordSize};
 use opendata_ingest_runtime::decoded_batch::{DecodedBatch, DecodedRecords};
 use opendata_ingest_runtime::error::{RuntimeError, RuntimeResult};
-use opendata_ingest_runtime::idempotency::IdempotencyKey;
+use opendata_ingest_runtime::identity::CommitIdentity;
 use opendata_ingest_runtime::sink::{
     CommitStatus, Sink, SinkBudget, SinkCommit, SinkCommitFailure, SinkCommitResult, SinkId,
 };
 
-use crate::adapter::Adapter;
+use crate::adapter::{Adapter, ClickHouseAdapterBatch};
 use crate::writer::{ClickHouseWriter, WriterErrorClass};
 
 /// `Sink` impl backed by an [`Adapter`] (planning) + a
@@ -112,7 +111,7 @@ where
         let selected = logs.records().to_vec();
         let input_row_count = selected.len();
         let bytes: usize = selected.iter().map(|r| r.approx_size_bytes()).sum();
-        let group = CommitGroupBatch {
+        let group = ClickHouseAdapterBatch {
             records: selected,
             low_sequence,
             high_sequence,
@@ -168,12 +167,14 @@ where
         }
     }
 
-    async fn check_committed(&self, _key: &IdempotencyKey) -> RuntimeResult<CommitStatus> {
+    async fn check_committed(&self, _identity: &CommitIdentity) -> RuntimeResult<CommitStatus> {
         // Alpha ClickHouse dedupes at the table layer
         // (`ReplacingMergeTree(_adapter_version)`); the short-
         // window `insert_deduplication_token` is gone by the time
         // the runtime asks. Returning `Unknown` is RFC 0002 rev 6's
-        // documented contract for this case.
+        // documented contract for this case. A sink that wanted to
+        // answer could recompute its physical token from `identity`
+        // plus this adapter's configuration.
         let _ = &self.adapter;
         let _ = &self.writer;
         Ok::<CommitStatus, RuntimeError>(CommitStatus::Unknown)
@@ -187,9 +188,9 @@ mod tests {
 
     use crate::adapter::{AdapterError, AdapterResult, InsertChunk};
     use crate::writer::WriterConfig;
-    use opendata_ingest_otel::logs::SourceCoordinates;
+    use opendata_ingest_otel::logs::RowSourceCoordinates;
     use opendata_ingest_runtime::decoded_batch::{BatchStats, SourceCoordinateColumns};
-    use opendata_ingest_runtime::idempotency::SchemaVersion;
+    use opendata_ingest_runtime::identity::{SchemaVersion, SequenceRange};
     use opendata_ingest_runtime::source::SourceId;
 
     /// Adapter that drops every record (returns no chunks). Mirrors
@@ -199,15 +200,18 @@ mod tests {
 
     impl Adapter for DroppingAdapter {
         type Input = DecodedLogRecord;
-        fn plan(&self, _batch: CommitGroupBatch<Self::Input>) -> AdapterResult<Vec<InsertChunk>> {
+        fn plan(
+            &self,
+            _batch: ClickHouseAdapterBatch<Self::Input>,
+        ) -> AdapterResult<Vec<InsertChunk>> {
             Ok(Vec::new())
         }
     }
 
     fn fake_log_record(seq: u64) -> DecodedLogRecord {
         DecodedLogRecord {
-            source: SourceCoordinates {
-                sequence: seq,
+            source: RowSourceCoordinates {
+                buffer_sequence: seq,
                 entry_index: 0,
                 record_index: 0,
                 manifest_path: "test/manifest".into(),
@@ -231,7 +235,9 @@ mod tests {
     fn fake_sink_commit(records: Vec<DecodedLogRecord>) -> SinkCommit {
         let count = records.len();
         let source = SourceId::from("test");
+        let sink = SinkId::from("clickhouse_logs");
         let typed = Arc::new(TypedDecodedLogs::new(records));
+        let schema_version = SchemaVersion(1);
         let batch = DecodedBatch {
             source: source.clone(),
             low_sequence: 0,
@@ -250,17 +256,16 @@ mod tests {
                 source_byte_count: 0,
                 decoded_byte_estimate: 0,
             },
-            schema_version: SchemaVersion(1),
+            schema_version,
         };
         SinkCommit {
-            source,
-            sink: SinkId::from("clickhouse_logs"),
-            low_sequence: 0,
-            high_sequence: 0,
+            identity: CommitIdentity {
+                source,
+                sink,
+                range: SequenceRange::new(0, 0),
+                schema_version,
+            },
             batch,
-            idempotency_key: opendata_ingest_runtime::idempotency::IdempotencyKey(
-                "test-key".into(),
-            ),
         }
     }
 

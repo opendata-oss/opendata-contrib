@@ -12,7 +12,8 @@ pub mod writer;
 
 pub use adapter::logs::{LogsAdapterConfig, OtlpLogsClickHouseAdapter, logs_table_ddl};
 pub use adapter::{
-    Adapter, AdapterError, AdapterResult, ClickHouseSettings, InsertChunk, RowValue,
+    Adapter, AdapterError, AdapterResult, ClickHouseAdapterBatch, ClickHouseSettings, InsertChunk,
+    RowValue,
 };
 pub use sink::ClickHouseSink;
 pub use writer::{ClickHouseWriter, WriterError, WriterErrorClass};

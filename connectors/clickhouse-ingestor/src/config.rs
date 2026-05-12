@@ -27,11 +27,6 @@
 //!   retry_max_attempts: 6
 //!   retry_initial_backoff_ms: 100
 //!
-//! commit_group:
-//!   max_rows: 100000
-//!   max_bytes: 33554432
-//!   max_age_ms: 1000
-//!
 //! ack:
 //!   policy: every_commit_group
 //!
@@ -40,6 +35,11 @@
 //!   max_chunk_rows: 100000
 //!   max_chunk_bytes: 33554432
 //! ```
+//!
+//! Chunking thresholds live in the `adapter:` section — they are a
+//! sink-internal concern post the impl-plan row 5.9 runtime/sink
+//! boundary cleanup. Older YAMLs that still set a top-level
+//! `commit_group:` block parse cleanly; the section is ignored.
 
 use std::path::Path;
 use std::time::Duration;
@@ -49,7 +49,6 @@ use figment::providers::{Env, Format, Yaml};
 use serde::{Deserialize, Serialize};
 
 use crate::adapter::logs::LogsAdapterConfig;
-use crate::commit_group::CommitGroupThresholds;
 use crate::error::{IngestorError, IngestorResult};
 use crate::writer::WriterConfig;
 use opendata_ingest_runtime::runtime::AckFlushPolicy;
@@ -59,7 +58,6 @@ pub struct IngestorConfig {
     pub buffer: BufferSection,
     pub clickhouse: ClickHouseSection,
     pub runtime: RuntimeSection,
-    pub commit_group: CommitGroupSection,
     pub ack: AckSection,
     pub adapter: AdapterSection,
     #[serde(default)]
@@ -142,23 +140,6 @@ fn default_request_timeout_secs() -> u64 {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CommitGroupSection {
-    pub max_rows: usize,
-    pub max_bytes: usize,
-    pub max_age_ms: u64,
-}
-
-impl Default for CommitGroupSection {
-    fn default() -> Self {
-        Self {
-            max_rows: 100_000,
-            max_bytes: 32 * 1024 * 1024,
-            max_age_ms: 1000,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AckSection {
     pub policy: AckPolicyKind,
     #[serde(default)]
@@ -220,14 +201,6 @@ impl IngestorConfig {
         Ok(cfg)
     }
 
-    pub fn commit_group_thresholds(&self) -> CommitGroupThresholds {
-        CommitGroupThresholds {
-            max_rows: self.commit_group.max_rows,
-            max_bytes: self.commit_group.max_bytes,
-            max_age: Duration::from_millis(self.commit_group.max_age_ms),
-        }
-    }
-
     pub fn ack_flush_policy(&self) -> AckFlushPolicy {
         match self.ack.policy {
             AckPolicyKind::EveryCommitGroup => AckFlushPolicy::EveryCommitGroup,
@@ -267,6 +240,9 @@ mod tests {
 
     #[test]
     fn defaults_render_via_serde() {
+        // A `commit_group:` block from older YAMLs is parsed and
+        // silently ignored — chunking thresholds live under `adapter:`
+        // post the impl-plan row 5.9 runtime/sink boundary cleanup.
         let yaml = r#"
 buffer:
   manifest_path: ingest/otel/logs/manifest
@@ -300,9 +276,6 @@ adapter:
   max_chunk_bytes: 33554432
 "#;
         let cfg: IngestorConfig = serde_yaml::from_str(yaml).expect("parse");
-        let thresholds = cfg.commit_group_thresholds();
-        assert_eq!(thresholds.max_rows, 100_000);
-        assert_eq!(thresholds.max_age, Duration::from_secs(1));
 
         let writer = cfg.writer_config();
         assert_eq!(writer.endpoint, "http://localhost:8123");
