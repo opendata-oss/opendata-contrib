@@ -15,8 +15,22 @@ use crate::source::{SourceBatch, SourceId};
 pub trait Decoder: Send + Sync + 'static {
     fn accepts(&self, envelope: &MetadataEnvelope) -> bool;
 
-    /// Consume an entire source batch and produce zero or more
-    /// decoded batches. v1 returns at most one (RFC 0002 rev 5).
+    /// Consume an entire source batch and produce **at least one
+    /// [`DecodedBatch`]**. v1 returns exactly one (RFC 0002 rev 5);
+    /// a future v2 may return multiple, but each one must occupy
+    /// a distinct sub-range of the input sequence span and the
+    /// runtime admits them in order.
+    ///
+    /// Returning an empty `Vec` is a contract violation:
+    /// `Runtime::handle_source_batch` rejects it with
+    /// `RuntimeError::Decoder(_)` to preserve
+    /// **INV-ADMISSION-CONTIGUOUS** at the [`AckCoordinator`]
+    /// (see `plans/odb-high-throughput/phase05-ack-correctness-design.md`
+    /// rev 7). A decoder that has nothing to emit for an
+    /// input batch should still produce one
+    /// zero-record `DecodedBatch` covering the input
+    /// sequence, so the source range stays accounted for and
+    /// the Buffer ack frontier can advance.
     fn decode(&self, batch: SourceBatch) -> RuntimeResult<Vec<DecodedBatch>>;
 }
 

@@ -656,7 +656,7 @@ mod tests {
     #[test]
     fn frontier_stops_at_first_hole_when_commits_arrive_out_of_order() {
         let mut c = coord(None);
-        // Register 0, 1, 2 in order (INV-ADMISSION-ORDER).
+        // Register 0, 1, 2 contiguously (INV-ADMISSION-CONTIGUOUS).
         c.register_pending(0, 0).unwrap();
         c.register_pending(1, 1).unwrap();
         c.register_pending(2, 2).unwrap();
