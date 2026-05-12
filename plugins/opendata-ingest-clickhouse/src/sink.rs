@@ -88,13 +88,19 @@ where
     }
 
     async fn write(&self, commit: SinkCommit) -> Result<SinkCommitResult, SinkCommitFailure> {
-        let SinkCommit { batch, .. } = commit;
-        let DecodedBatch {
-            low_sequence,
-            high_sequence,
-            records,
-            ..
-        } = batch;
+        let SinkCommit { identity, batch } = commit;
+        // The runtime guarantees identity.range mirrors batch.low/high
+        // for the source range Phase 5.9 + RFC 0002 §Runtime/Sink
+        // Boundary specify; fail closed if a future runtime change
+        // ever breaks the invariant so the sink does not silently
+        // emit dedupe tokens that don't match the rows being written.
+        if identity.range.low != batch.low_sequence || identity.range.high != batch.high_sequence {
+            return Err(fatal(format!(
+                "SinkCommit identity range {}..={} disagrees with DecodedBatch range {}..={}",
+                identity.range.low, identity.range.high, batch.low_sequence, batch.high_sequence,
+            )));
+        }
+        let DecodedBatch { records, .. } = batch;
 
         let DecodedRecords::Typed(typed) = records;
         let logs = typed
@@ -112,9 +118,8 @@ where
         let input_row_count = selected.len();
         let bytes: usize = selected.iter().map(|r| r.approx_size_bytes()).sum();
         let group = ClickHouseAdapterBatch {
+            identity,
             records: selected,
-            low_sequence,
-            high_sequence,
             bytes,
         };
 

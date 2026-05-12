@@ -131,11 +131,17 @@ impl Adapter for OtlpLogsClickHouseAdapter {
 
     fn plan(&self, batch: ClickHouseAdapterBatch<Self::Input>) -> AdapterResult<Vec<InsertChunk>> {
         let ClickHouseAdapterBatch {
+            identity,
             mut records,
-            low_sequence,
-            high_sequence,
             bytes: _,
         } = batch;
+        // RFC 0002 §Runtime/Sink Boundary: the source-range segment
+        // of the dedupe token comes from the runtime's CommitIdentity,
+        // not from any per-record / per-DecodedBatch field. The
+        // adapter never reads `batch.{low,high}_sequence` for token
+        // construction.
+        let low_sequence = identity.range.low;
+        let high_sequence = identity.range.high;
 
         // Stable order: (entry_index, record_index) within a sequence,
         // then sequence ascending. Records from the same Buffer entry
@@ -358,12 +364,24 @@ pub fn logs_table_ddl(config: &LogsAdapterConfig) -> String {
 mod tests {
     use super::*;
     use opendata_ingest_otel::logs::RowSourceCoordinates;
+    use opendata_ingest_runtime::identity::{CommitIdentity, SchemaVersion, SequenceRange};
+    use opendata_ingest_runtime::sink::SinkId;
+    use opendata_ingest_runtime::source::SourceId;
     use std::collections::BTreeMap;
 
     fn cfg() -> LogsAdapterConfig {
         LogsAdapterConfig {
             max_chunk_rows: 2,
             ..LogsAdapterConfig::default()
+        }
+    }
+
+    fn ident(low: u64, high: u64) -> CommitIdentity {
+        CommitIdentity {
+            source: SourceId::from("test"),
+            sink: SinkId::from("clickhouse_logs"),
+            range: SequenceRange::new(low, high),
+            schema_version: SchemaVersion(1),
         }
     }
 
@@ -397,8 +415,7 @@ mod tests {
         let chunks = adapter
             .plan(ClickHouseAdapterBatch {
                 records: Vec::new(),
-                low_sequence: 5,
-                high_sequence: 9,
+                identity: ident(5, 9),
                 bytes: 0,
             })
             .expect("plan");
@@ -412,8 +429,7 @@ mod tests {
         let chunks = adapter
             .plan(ClickHouseAdapterBatch {
                 records,
-                low_sequence: 1,
-                high_sequence: 2,
+                identity: ident(1, 2),
                 bytes: 0,
             })
             .expect("plan");
@@ -430,8 +446,7 @@ mod tests {
         let chunks = adapter
             .plan(ClickHouseAdapterBatch {
                 records: vec![rec(7, 0, 0), rec(7, 0, 1), rec(8, 0, 0)],
-                low_sequence: 7,
-                high_sequence: 8,
+                identity: ident(7, 8),
                 bytes: 0,
             })
             .expect("plan");
@@ -460,8 +475,7 @@ mod tests {
         let err = adapter
             .plan(ClickHouseAdapterBatch {
                 records: vec![a, b],
-                low_sequence: 1,
-                high_sequence: 1,
+                identity: ident(1, 1),
                 bytes: 0,
             })
             .unwrap_err();
@@ -487,16 +501,14 @@ mod tests {
         let plan_a = adapter
             .plan(ClickHouseAdapterBatch {
                 records: vec![a],
-                low_sequence: 1,
-                high_sequence: 1,
+                identity: ident(1, 1),
                 bytes: 0,
             })
             .expect("plan a");
         let plan_b = adapter
             .plan(ClickHouseAdapterBatch {
                 records: vec![b],
-                low_sequence: 1,
-                high_sequence: 1,
+                identity: ident(1, 1),
                 bytes: 0,
             })
             .expect("plan b");
@@ -519,8 +531,7 @@ mod tests {
         let chunks = adapter
             .plan(ClickHouseAdapterBatch {
                 records: vec![rec(1, 0, 0), rec(1, 0, 1), rec(1, 0, 2)],
-                low_sequence: 1,
-                high_sequence: 1,
+                identity: ident(1, 1),
                 bytes: 0,
             })
             .expect("plan");
@@ -549,16 +560,14 @@ mod tests {
         let loose = adapter_loose
             .plan(ClickHouseAdapterBatch {
                 records: records(),
-                low_sequence: 1,
-                high_sequence: 1,
+                identity: ident(1, 1),
                 bytes: 0,
             })
             .expect("plan loose");
         let strict = adapter_strict
             .plan(ClickHouseAdapterBatch {
                 records: records(),
-                low_sequence: 1,
-                high_sequence: 1,
+                identity: ident(1, 1),
                 bytes: 0,
             })
             .expect("plan strict");
@@ -578,16 +587,14 @@ mod tests {
         let plan_a = adapter
             .plan(ClickHouseAdapterBatch {
                 records: records(),
-                low_sequence: 7,
-                high_sequence: 8,
+                identity: ident(7, 8),
                 bytes: 0,
             })
             .expect("plan a");
         let plan_b = adapter
             .plan(ClickHouseAdapterBatch {
                 records: records(),
-                low_sequence: 7,
-                high_sequence: 8,
+                identity: ident(7, 8),
                 bytes: 0,
             })
             .expect("plan b");
@@ -628,8 +635,7 @@ mod tests {
         let chunks = adapter
             .plan(ClickHouseAdapterBatch {
                 records: vec![r.clone()],
-                low_sequence: 11,
-                high_sequence: 11,
+                identity: ident(11, 11),
                 bytes: 0,
             })
             .expect("plan");
@@ -675,8 +681,7 @@ mod tests {
         let chunks = adapter
             .plan(ClickHouseAdapterBatch {
                 records,
-                low_sequence: 1,
-                high_sequence: 2,
+                identity: ident(1, 2),
                 bytes: 0,
             })
             .expect("plan");

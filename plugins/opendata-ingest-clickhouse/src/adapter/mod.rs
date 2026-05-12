@@ -15,6 +15,7 @@ pub mod logs;
 
 use std::collections::BTreeMap;
 
+use opendata_ingest_runtime::identity::CommitIdentity;
 use serde_json::Value as JsonValue;
 
 use thiserror::Error;
@@ -212,16 +213,19 @@ impl InsertChunk {
 
 /// Planning batch handed to a ClickHouse [`Adapter`] — sink-internal
 /// shape that lifts a [`SinkCommit`]'s decoded records plus its
-/// source range into a form the adapter can chunk over. Mirrors the
-/// Phase 4 `CommitGroupBatch<R>` shape but lives in the plugin crate;
-/// the runtime no longer hosts a generic planning type.
+/// runtime commit identity into a form the adapter can chunk over.
+/// The source range carried inside `identity.range` is the canonical
+/// `low`/`high` for token construction (RFC 0002 §Runtime/Sink
+/// Boundary: sinks derive physical tokens from `CommitIdentity` plus
+/// the sink's own adapter configuration). `bytes` is the cumulative
+/// approximate decoded byte size, used by the adapter's byte-aware
+/// chunker.
 ///
 /// [`SinkCommit`]: opendata_ingest_runtime::sink::SinkCommit
 #[derive(Debug, Clone)]
 pub struct ClickHouseAdapterBatch<R> {
+    pub identity: CommitIdentity,
     pub records: Vec<R>,
-    pub low_sequence: u64,
-    pub high_sequence: u64,
     pub bytes: usize,
 }
 

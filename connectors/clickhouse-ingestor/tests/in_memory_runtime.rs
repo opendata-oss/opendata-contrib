@@ -146,7 +146,7 @@ impl Sink for RecordingSink {
         SinkBudget::default()
     }
     async fn write(&self, commit: SinkCommit) -> Result<SinkCommitResult, SinkCommitFailure> {
-        let SinkCommit { batch, .. } = commit;
+        let SinkCommit { identity, batch } = commit;
         let DecodedRecords::Typed(records) = batch.records;
         let logs = records
             .as_any()
@@ -159,9 +159,8 @@ impl Sink for RecordingSink {
         let selected: Vec<DecodedLogRecord> = logs.records().to_vec();
         let bytes: usize = selected.iter().map(|r| r.approx_size_bytes()).sum();
         let group = ClickHouseAdapterBatch {
+            identity,
             records: selected,
-            low_sequence: batch.low_sequence,
-            high_sequence: batch.high_sequence,
             bytes,
         };
         let chunks = self

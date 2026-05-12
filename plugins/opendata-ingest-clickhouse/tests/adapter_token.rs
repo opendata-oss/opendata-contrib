@@ -14,15 +14,16 @@
 //! ```
 //!
 //! These tests pin the format AND its per-field sensitivity:
-//! any change in `manifest_path`, `database`, `table`,
-//! `low_sequence`, `high_sequence`, `adapter_version`, the
+//! any change in `manifest_path`, `database`, `table`, the
+//! `CommitIdentity.range` low/high, `adapter_version`, the
 //! chunking-fingerprint input fields, or `chunk_index` must
-//! produce a different token. The runtime-level
-//! `CommitIdentity` and this adapter token are **independent
-//! key spaces** in v1 (the adapter computes its own token from
-//! its adapter configuration + the source range, not from
-//! `SinkCommit.identity`); unification is Phase 7 schema/mapping
-//! work per design §Decisions Q6.
+//! produce a different token. The runtime hands the adapter
+//! its planning shape as `ClickHouseAdapterBatch { identity,
+//! records, bytes }`, so the `low-high` segment of every token
+//! is the identity's `SequenceRange` projected verbatim. The
+//! adapter's chunking fingerprint (max_chunk_rows / max_chunk_bytes /
+//! insert_quorum) is sink-internal and the runtime never inspects
+//! it (RFC 0002 §Runtime/Sink Boundary).
 
 use std::collections::BTreeMap;
 
@@ -30,6 +31,9 @@ use opendata_ingest_clickhouse::{
     Adapter, ClickHouseAdapterBatch, LogsAdapterConfig, OtlpLogsClickHouseAdapter,
 };
 use opendata_ingest_otel::logs::{DecodedLogRecord, RowSourceCoordinates};
+use opendata_ingest_runtime::identity::{CommitIdentity, SchemaVersion, SequenceRange};
+use opendata_ingest_runtime::sink::SinkId;
+use opendata_ingest_runtime::source::SourceId;
 
 fn make_record(
     manifest_path: &str,
@@ -60,6 +64,15 @@ fn make_record(
     }
 }
 
+fn identity(low: u64, high: u64) -> CommitIdentity {
+    CommitIdentity {
+        source: SourceId::from("buffer"),
+        sink: SinkId::from("clickhouse_logs"),
+        range: SequenceRange::new(low, high),
+        schema_version: SchemaVersion(1),
+    }
+}
+
 fn batch(
     manifest_path: &str,
     low_sequence: u64,
@@ -71,9 +84,8 @@ fn batch(
         .collect();
     let bytes = records.iter().map(|r| r.approx_size_bytes()).sum();
     ClickHouseAdapterBatch {
+        identity: identity(low_sequence, high_sequence),
         records,
-        low_sequence,
-        high_sequence,
         bytes,
     }
 }
@@ -310,4 +322,67 @@ fn adapter_token_chunk_index_increments_within_a_single_plan() {
             chunk.idempotency_token,
         );
     }
+}
+
+/// INV-CLICKHOUSE-TOKEN-DETERMINISTIC + RFC 0002 §Runtime/Sink
+/// Boundary: the source-range segment of every per-chunk token
+/// comes from `ClickHouseAdapterBatch.identity.range`, not from
+/// any incidental field on the decoded records. Pinning this
+/// property at the integration level forces a future refactor
+/// that started passing some other "range" field into the adapter
+/// to fail loud here.
+#[test]
+fn adapter_token_range_comes_from_commit_identity_range() {
+    let adapter = OtlpLogsClickHouseAdapter::new(LogsAdapterConfig::default());
+
+    // Build a batch whose records sit at buffer_sequence = 100 but
+    // whose `CommitIdentity.range` claims `7..=9`. The records'
+    // buffer_sequence is what flows into the `_odb_sequence`
+    // column; the token's `low-high` segment must come from the
+    // identity, not from the records.
+    let records = vec![make_record("manifests/range-prov", 100, 0, 0)];
+    let bytes = records.iter().map(|r| r.approx_size_bytes()).sum();
+    let chunks = adapter
+        .plan(ClickHouseAdapterBatch {
+            identity: identity(7, 9),
+            records,
+            bytes,
+        })
+        .expect("plan");
+    assert_eq!(chunks.len(), 1);
+    let token = &chunks[0].idempotency_token;
+    assert!(
+        token.contains(":7-9:"),
+        "token's low-high segment must be the identity range, got {token}",
+    );
+    assert!(
+        !token.contains(":100-100:"),
+        "token must not derive its range from record buffer_sequence; got {token}",
+    );
+}
+
+/// Companion property: two `CommitIdentity` ranges that differ
+/// produce different tokens even when the records and adapter
+/// config are byte-identical. Without identity threading, this
+/// case would have collided on the rev-1 adapter shape.
+#[test]
+fn adapter_token_changes_with_commit_identity_range() {
+    let adapter = OtlpLogsClickHouseAdapter::new(LogsAdapterConfig::default());
+    let records = || vec![make_record("manifests/range-shift", 1, 0, 0)];
+    let bytes = records().iter().map(|r| r.approx_size_bytes()).sum();
+    let plan_a = adapter
+        .plan(ClickHouseAdapterBatch {
+            identity: identity(0, 0),
+            records: records(),
+            bytes,
+        })
+        .expect("plan a");
+    let plan_b = adapter
+        .plan(ClickHouseAdapterBatch {
+            identity: identity(0, 1),
+            records: records(),
+            bytes,
+        })
+        .expect("plan b");
+    assert_ne!(plan_a[0].idempotency_token, plan_b[0].idempotency_token);
 }
