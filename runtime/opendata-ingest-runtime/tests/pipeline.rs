@@ -359,6 +359,70 @@ mod large_records {
     }
 }
 
+/// Row 6.5 metrics smoke: drives a 10-batch pipeline through the
+/// full stage matrix so every metric emission site (queue depth,
+/// latency, inflight bytes, ack frontier, pending ranges, sink
+/// commits, descriptors handed out, ack lag) runs at least once.
+/// We don't snapshot the values — `metrics::with_local_recorder`
+/// is thread-local while the workers are spawned via
+/// `tokio::spawn`, so a `DebuggingRecorder`-based assertion is
+/// brittle across the worker boundary. The benchmark harness in
+/// row 6.6 lands a process-level recorder against a real
+/// Prometheus endpoint where the named series are visible end to
+/// end.
+#[tokio::test]
+async fn pipeline_metric_emission_smoke_10_batches() {
+    let fx = in_memory_buffer_source(
+        "ingest/test/pipeline/metrics-smoke/manifest",
+        "ingest/test/pipeline/metrics-smoke/data",
+    )
+    .await;
+    for i in 0..10u64 {
+        fx.producer
+            .produce(
+                vec![Bytes::from(format!("payload-{i}").into_bytes())],
+                logs_envelope(),
+            )
+            .await
+            .expect("produce");
+        fx.producer.flush().await.expect("flush");
+    }
+
+    let sink = FakeSink::new("fake-sink");
+
+    let runtime = Runtime::builder()
+        .add_source(fx.source)
+        .add_decoder(FakeDecoder::permissive())
+        .set_sink(sink)
+        .with_options(options_with_fetch_concurrency(4))
+        .build()
+        .expect("build");
+    let mut progress_rx = runtime.progress();
+
+    let shutdown = CancellationToken::new();
+    let shutdown_run = shutdown.clone();
+    let handle = tokio::spawn(async move { runtime.run(shutdown_run).await });
+
+    timeout(Duration::from_secs(10), async {
+        loop {
+            progress_rx.changed().await.expect("progress closed");
+            if progress_rx.borrow().source_ranges_committed >= 10 {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("runtime should commit all 10 batches");
+
+    shutdown.cancel();
+    handle
+        .await
+        .expect("runtime task join")
+        .expect("runtime exited cleanly");
+
+    fx.producer.close().await.expect("close producer");
+}
+
 /// Row 6.4 `pipeline_graceful_drain_completes_inflight_commits`.
 ///
 /// Run the pipeline against 20 source batches; gate the sink so

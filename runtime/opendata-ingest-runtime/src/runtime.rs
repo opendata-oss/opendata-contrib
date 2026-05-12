@@ -780,6 +780,7 @@ async fn per_source_actor(
             completion = completion_rx.recv(), if in_flight > 0 => {
                 match completion {
                     Some(WriteCompletion::Committed(report)) => {
+                        let ack_lag_start = std::time::Instant::now();
                         let (low, high) = report.range;
                         coordinator.mark_committed(low, high)?;
                         coordinator.advance_frontier();
@@ -817,10 +818,32 @@ async fn per_source_actor(
                                     groups_since_flush = 0;
                                 }
                                 progress.last_acked_sequence = Some(f);
+                                metrics::histogram!(
+                                    crate::metrics::ACK_LAG_SECONDS,
+                                    "source" => source_id.0.clone(),
+                                )
+                                .record(ack_lag_start.elapsed().as_secs_f64());
                             }
+                            metrics::gauge!(
+                                crate::metrics::ACK_FRONTIER,
+                                "source" => source_id.0.clone(),
+                            )
+                            .set(f as f64);
                         }
                         progress.pending_ranges_total = coordinator.pending_count();
                         let _ = progress_tx.send(progress);
+
+                        metrics::gauge!(
+                            crate::metrics::PENDING_RANGES,
+                            "source" => source_id.0.clone(),
+                        )
+                        .set(coordinator.pending_count() as f64);
+                        metrics::gauge!(
+                            crate::metrics::STAGE_INFLIGHT_BYTES,
+                            "stage" => "source",
+                            "source" => source_id.0.clone(),
+                        )
+                        .set(budget.in_flight() as f64);
                     }
                     Some(WriteCompletion::Fatal(e)) => {
                         return Err(e);
@@ -1347,6 +1370,11 @@ async fn writer_worker(
             reservation,
             batch_permit,
         } = envelope;
+        metrics::gauge!(
+            crate::metrics::SINK_INFLIGHT_BYTES,
+            "sink" => sink_label.clone(),
+        )
+        .set(reservation.held() as f64);
         let stage_start = std::time::Instant::now();
         let result = write_with_retry(&sink, commit, &options).await;
         metrics::histogram!(
