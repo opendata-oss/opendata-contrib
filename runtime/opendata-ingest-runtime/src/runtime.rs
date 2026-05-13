@@ -57,6 +57,26 @@
 //!   on `NotCommitted` / `MaybeCommitted`.
 //! - INV-MAYBE-COMMITTED-RESOLVES — `MaybeCommitted` triggers
 //!   `Sink::check_committed(&identity)` before retry.
+//!
+//! # Hard-abort cancellation exception: synchronous decode
+//!
+//! `hard_abort_token` propagates through every blocking `.await`
+//! the worker tasks own — `descriptor_rx.recv()`,
+//! `fetch_handle.fetch(...)`, `sink.write(...)`,
+//! `sink.check_committed(...)`, the inter-attempt retry sleep —
+//! by wrapping each in `tokio::select!`. The one stage it
+//! **cannot** preempt mid-execution is the synchronous
+//! `Decoder::decode(SourceBatch)` call inside `decode_one`. The
+//! decode worker wraps the helper in `select!` against the abort
+//! token, but a synchronous body inside that future runs to its
+//! first suspension point before the abort branch can fire — for
+//! a pure CPU-bound decoder, that's the end of the call. The
+//! runtime assumes microsecond-scale decode time (the OTel logs
+//! decoder is structural mapping over an already-parsed protobuf
+//! tree); a decoder that needs slow CPU work belongs behind a
+//! future async-decode contract paired with `spawn_blocking` at
+//! this layer. See `decoder::Decoder::decode` for the trait-level
+//! note.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -706,11 +726,27 @@ impl RuntimeBuilder {
         let sink = self
             .sink
             .ok_or_else(|| RuntimeError::Config("no sink configured".into()))?;
+
+        // Validate the byte-budget shape per source. The admission
+        // arm pessimistically reserves `estimated_max_batch_bytes`
+        // against the per-source `SourceByteBudget` whose capacity
+        // is `max_inflight_bytes`. If the reservation can never fit
+        // (estimated > capacity), `SourceByteBudget::reserve` parks
+        // forever and admission deadlocks before the first
+        // descriptor enters the pipeline. Reject the config at
+        // build time so the operator sees a typed
+        // `RuntimeError::Config` rather than a silent hang.
+        let primary_bp = self.options.backpressure_for(source.id());
+        validate_backpressure(source.id(), &primary_bp)?;
+        for (override_source, override_bp) in &self.options.source_overrides {
+            validate_backpressure(override_source, override_bp)?;
+        }
+
         let mut coordinators = AckCoordinators::new();
         coordinators.register_source(source.id().clone(), source.last_acked_sequence())?;
         let (progress_tx, progress_rx) = watch::channel(RuntimeProgress::default());
-        let bp = self.options.backpressure_for(source.id());
-        let source_byte_budget = SourceByteBudget::new(source.id().clone(), bp.max_inflight_bytes);
+        let source_byte_budget =
+            SourceByteBudget::new(source.id().clone(), primary_bp.max_inflight_bytes);
         Ok(Runtime {
             source,
             decoder,
@@ -724,6 +760,44 @@ impl RuntimeBuilder {
             test_fetch_delay: self.test_fetch_delay,
         })
     }
+}
+
+/// Reject `SourceBackpressureOptions` shapes that would deadlock
+/// admission on the per-source byte budget. The admission arm calls
+/// `SourceByteBudget::reserve(estimated_max_batch_bytes)` against a
+/// budget whose capacity is `max_inflight_bytes`; if the
+/// reservation exceeds the capacity, `reserve` parks forever before
+/// the first descriptor flows.
+///
+/// Also rejects pool-sizing knobs set to zero (the runtime treats
+/// zero as one via `.max(1)`, but documenting "zero is silently
+/// treated as one" in a Config error is friendlier than letting it
+/// pass).
+fn validate_backpressure(source: &SourceId, bp: &SourceBackpressureOptions) -> RuntimeResult<()> {
+    if bp.estimated_max_batch_bytes > bp.max_inflight_bytes {
+        return Err(RuntimeError::Config(format!(
+            "source {source}: estimated_max_batch_bytes ({}) > max_inflight_bytes ({}); \
+             admission would deadlock on SourceByteBudget::reserve. Raise max_inflight_bytes \
+             or lower estimated_max_batch_bytes so the pessimistic reservation fits.",
+            bp.estimated_max_batch_bytes, bp.max_inflight_bytes,
+        )));
+    }
+    if bp.max_inflight_batches == 0 {
+        return Err(RuntimeError::Config(format!(
+            "source {source}: max_inflight_batches must be >= 1",
+        )));
+    }
+    if bp.fetch_concurrency == 0 {
+        return Err(RuntimeError::Config(format!(
+            "source {source}: fetch_concurrency must be >= 1",
+        )));
+    }
+    if bp.decode_concurrency == 0 {
+        return Err(RuntimeError::Config(format!(
+            "source {source}: decode_concurrency must be >= 1",
+        )));
+    }
+    Ok(())
 }
 
 // =========================================================================
@@ -1684,5 +1758,53 @@ mod tests {
                 .max_inflight_batches,
             64,
         );
+    }
+
+    #[test]
+    fn validate_backpressure_rejects_oversized_reservation() {
+        // estimated > capacity → admission would deadlock on reserve.
+        let bp = SourceBackpressureOptions {
+            max_inflight_bytes: 1024,
+            estimated_max_batch_bytes: 4096,
+            ..SourceBackpressureOptions::default()
+        };
+        let err = validate_backpressure(&SourceId::from("hot"), &bp).expect_err("must reject");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("estimated_max_batch_bytes"),
+            "error should call out the oversize reservation: {msg}",
+        );
+        assert!(matches!(err, RuntimeError::Config(_)));
+    }
+
+    #[test]
+    fn validate_backpressure_rejects_zero_concurrency() {
+        for field in [
+            "max_inflight_batches",
+            "fetch_concurrency",
+            "decode_concurrency",
+        ] {
+            let mut bp = SourceBackpressureOptions::default();
+            match field {
+                "max_inflight_batches" => bp.max_inflight_batches = 0,
+                "fetch_concurrency" => bp.fetch_concurrency = 0,
+                "decode_concurrency" => bp.decode_concurrency = 0,
+                _ => unreachable!(),
+            }
+            let err = validate_backpressure(&SourceId::from("s"), &bp)
+                .expect_err(&format!("must reject {field} = 0"));
+            assert!(
+                format!("{err}").contains(field),
+                "error should name {field}: {err}",
+            );
+        }
+    }
+
+    #[test]
+    fn validate_backpressure_accepts_default() {
+        validate_backpressure(&SourceId::from("s"), &SourceBackpressureOptions::default())
+            .expect("library defaults must validate");
+        validate_backpressure(&SourceId::from("s"), &SourceBackpressureOptions::serial())
+            .expect("serial profile must validate");
     }
 }

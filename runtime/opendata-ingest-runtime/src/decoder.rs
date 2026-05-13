@@ -31,6 +31,23 @@ pub trait Decoder: Send + Sync + 'static {
     /// zero-record `DecodedBatch` covering the input
     /// sequence, so the source range stays accounted for and
     /// the Buffer ack frontier can advance.
+    ///
+    /// # Hard-abort cancellation
+    ///
+    /// `decode` is **synchronous**; Phase 6's `hard_abort_token`
+    /// cannot preempt a `decode` call mid-execution. The decode
+    /// worker wraps the call in `tokio::select!` against the abort
+    /// token, but the synchronous future runs to its first
+    /// suspension point before the abort branch can fire — for a
+    /// pure CPU-bound decoder, that means it runs to completion.
+    /// Implementations are expected to be **fast** (the runtime's
+    /// per-stage latency budget assumes microsecond-scale decode);
+    /// a decoder that needs to do slow CPU work (e.g. complex
+    /// transforms, regex compilation) should pre-compute and cache
+    /// at construction. Long-running CPU work belongs in a future
+    /// async-decode contract (likely paired with `spawn_blocking`
+    /// at the runtime layer) — see phase06 design §Open Questions
+    /// for the deferral.
     fn decode(&self, batch: SourceBatch) -> RuntimeResult<Vec<DecodedBatch>>;
 }
 

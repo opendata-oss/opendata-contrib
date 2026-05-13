@@ -822,15 +822,20 @@ mod hard_abort_sink {
     };
     use tokio::sync::Notify;
 
-    /// Custom sink for `pipeline_hard_abort_during_parked_sink_unwinds_pipeline`:
-    /// the write call for sequence 0 parks on a notify forever (until
-    /// the writer worker's `select!` against `hard_abort_token` drops
-    /// the future); every other sequence returns `Fatal` so a peer
-    /// worker triggers the abort path.
+    /// Custom sink for `pipeline_hard_abort_during_parked_sink_unwinds_pipeline`.
+    ///
+    /// **Call-order-based**, not sequence-based, so the test is
+    /// deterministic under any fetch/decode worker schedule: the
+    /// *first* `Sink::write` call (whichever sequence reaches the
+    /// sink first) parks on a `Notify` forever; every subsequent
+    /// call returns `Fatal`. With W writer workers and ≥ 2 batches
+    /// admitted, one writer parks and another fires Fatal —
+    /// regardless of which source sequence each picks up.
     pub struct GatePeerSink {
         pub id: SinkId,
         pub parked_gate: Arc<Notify>,
         pub parked_entry_count: Arc<AtomicUsize>,
+        pub write_call_count: Arc<AtomicUsize>,
         pub write_calls: Arc<Mutex<Vec<u64>>>,
     }
 
@@ -840,6 +845,7 @@ mod hard_abort_sink {
                 id: SinkId::from("gate-peer"),
                 parked_gate: Arc::new(Notify::new()),
                 parked_entry_count: Arc::new(AtomicUsize::new(0)),
+                write_call_count: Arc::new(AtomicUsize::new(0)),
                 write_calls: Arc::new(Mutex::new(Vec::new())),
             }
         }
@@ -856,10 +862,12 @@ mod hard_abort_sink {
         async fn write(&self, commit: SinkCommit) -> Result<SinkCommitResult, SinkCommitFailure> {
             let seq = commit.identity.range.high;
             self.write_calls.lock().unwrap().push(seq);
-            if seq == 0 {
-                // Park forever. The writer worker awaits this future
-                // wrapped in `select!` against the abort token; when
-                // the supervisor cancels, the select! drops this
+            let call_idx = self.write_call_count.fetch_add(1, Ordering::SeqCst);
+            if call_idx == 0 {
+                // First call into the sink: park forever. The
+                // writer worker awaits this future wrapped in
+                // `select!` against the abort token; when the
+                // supervisor cancels, the select! drops this
                 // future and the sink call unwinds.
                 self.parked_entry_count.fetch_add(1, Ordering::SeqCst);
                 self.parked_gate.notified().await;
@@ -868,7 +876,7 @@ mod hard_abort_sink {
                 ))
             } else {
                 Err(SinkCommitFailure::Fatal(
-                    format!("test peer fatal on seq={seq}").into(),
+                    format!("test peer fatal on call {call_idx} (seq={seq})").into(),
                 ))
             }
         }
@@ -880,16 +888,19 @@ mod hard_abort_sink {
 
 /// HIGH finding: hard abort must propagate through parked workers.
 ///
-/// Two batches admitted; sink writes them under `W=4` writers. The
-/// custom `GatePeerSink::write(seq=0)` parks forever on a `Notify`;
-/// `write(seq=1)` returns `Fatal`. Peer worker B emits Fatal → actor
-/// returns `Err(RuntimeError::Sink)` → supervisor cancels
-/// `hard_abort_token` → worker A's parked `sink.write` future is
-/// dropped by the `select!` arm and unwinds within bounded time. The
-/// runtime must exit with the typed `Sink` error (not a generic
-/// `Pipeline("hard abort …")`) and the exit must happen quickly
-/// (under 2 seconds) — proving the parked worker doesn't block
-/// supervisor join.
+/// Two batches admitted; the sink gates by **call order**, not
+/// sequence — the first `Sink::write` call parks on a `Notify`
+/// forever, every subsequent call returns `Fatal`. With multiple
+/// writer workers, one parks and another fires Fatal regardless of
+/// which source sequence reached the sink first (eliminating the
+/// schedule-sensitive seq-0-before-seq-1 ordering assumption).
+/// `Fatal` → actor returns `Err(RuntimeError::Sink)` → supervisor
+/// cancels `hard_abort_token` → the parked worker's `sink.write`
+/// future is dropped by the `select!` arm and unwinds within
+/// bounded time. The runtime must exit with the typed `Sink` error
+/// (not a generic `Pipeline("hard abort …")`) and the exit must
+/// happen quickly (under 2 seconds) — proving the parked worker
+/// doesn't block supervisor join.
 #[tokio::test]
 async fn pipeline_hard_abort_during_parked_sink_unwinds_pipeline() {
     use hard_abort_sink::GatePeerSink;
@@ -913,17 +924,24 @@ async fn pipeline_hard_abort_during_parked_sink_unwinds_pipeline() {
 
     let sink = GatePeerSink::new();
     let parked_entry_count = Arc::clone(&sink.parked_entry_count);
+    let write_call_count = Arc::clone(&sink.write_call_count);
     let write_calls = Arc::clone(&sink.write_calls);
 
-    let mut opts = options_with_fetch_concurrency(2);
+    // Use single fetch + decode concurrency so the actor admits in
+    // strict source-sequence order and the first `Sink::write` is
+    // unambiguously seq=0. Keep `W=2` writer workers so the second
+    // batch can be processed in parallel to the parked one —
+    // otherwise the test would only exercise the recv-loop abort
+    // path, not the parked-`sink.write` abort path.
+    let mut opts = options_with_fetch_concurrency(1);
     opts.source_defaults = SourceBackpressureOptions {
         max_inflight_batches: 4,
-        fetch_concurrency: 2,
-        decode_concurrency: 2,
+        fetch_concurrency: 1,
+        decode_concurrency: 1,
         ..SourceBackpressureOptions::default()
     };
     opts.sink = SinkPoolOptions {
-        max_concurrent_commits: 4,
+        max_concurrent_commits: 2,
         retry_max_attempts: 0,
         retry_initial_backoff_ms: 0,
     };
@@ -941,14 +959,20 @@ async fn pipeline_hard_abort_during_parked_sink_unwinds_pipeline() {
     let start = std::time::Instant::now();
     let handle = tokio::spawn(async move { runtime.run(shutdown_run).await });
 
-    // Wait until seq=0's write parks before declaring victory on the
-    // setup. Otherwise a fast Fatal could race the park.
+    // Wait until the first `Sink::write` call has actually parked
+    // before declaring victory on the setup. The parked_entry_count
+    // is incremented inside the gate, after the call lands. A
+    // higher write_call_count without the parked counter advancing
+    // would mean we're in trouble (call entered but isn't the
+    // gated one).
     let parked_wait_start = std::time::Instant::now();
     while parked_entry_count.load(std::sync::atomic::Ordering::SeqCst) == 0 {
         if parked_wait_start.elapsed() > Duration::from_secs(2) {
             panic!(
-                "seq=0 sink.write never entered the parked state; write_calls so far: {:?}",
-                write_calls.lock().unwrap()
+                "first sink.write call never entered the parked state; \
+                 write_call_count={}, write_calls={:?}",
+                write_call_count.load(std::sync::atomic::Ordering::SeqCst),
+                write_calls.lock().unwrap(),
             );
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
