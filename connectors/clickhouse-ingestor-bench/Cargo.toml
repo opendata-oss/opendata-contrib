@@ -1,0 +1,33 @@
+[package]
+name = "clickhouse-ingestor-bench"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "clickhouse_ingestor_bench"
+path = "src/lib.rs"
+
+[[bin]]
+name = "clickhouse-ingestor-bench"
+path = "src/main.rs"
+
+[dependencies]
+async-channel = { workspace = true }
+async-trait = "0.1"
+buffer = { workspace = true }
+bytes = { workspace = true }
+chrono = { workspace = true }
+clap = { workspace = true }
+common = { workspace = true }
+futures = { workspace = true }
+metrics = { workspace = true }
+metrics-util = { workspace = true }
+opendata-ingest-runtime = { path = "../../runtime/opendata-ingest-runtime" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+slatedb = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "connectors/clickhouse-ingestor",
+    "connectors/clickhouse-ingestor-bench",
     "plugins/opendata-ingest-clickhouse",
     "plugins/opendata-ingest-otel",
     "runtime/opendata-ingest-runtime",
@@ -17,14 +18,17 @@ common = { package = "opendata-common", version = "0.1.14" }
 
 anyhow = "1.0"
 async-channel = "2"
+async-trait = "0.1"
 axum = "0.8"
 bytes = "1.0"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 clap = { version = "4", features = ["derive", "env"] }
 figment = { version = "0.10", features = ["yaml"] }
 futures = { version = "0.3", features = ["std"] }
 hex = "0.4"
 metrics = "0.24"
 metrics-exporter-prometheus = "0.16"
+metrics-util = "0.19"
 opentelemetry-proto = { version = "0.28", default-features = false, features = ["logs", "metrics", "trace", "gen-tonic-messages"] }
 prost = "0.13"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
