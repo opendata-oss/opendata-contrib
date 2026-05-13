@@ -76,6 +76,7 @@ impl SourceByteBudget {
             return ByteReservation {
                 budget: Arc::clone(self),
                 held: 0,
+                stage: None,
             };
         }
 
@@ -98,6 +99,7 @@ impl SourceByteBudget {
                 return ByteReservation {
                     budget: Arc::clone(self),
                     held: bytes,
+                    stage: None,
                 };
             }
             notified.await;
@@ -114,9 +116,20 @@ impl SourceByteBudget {
 /// Drop-on-end byte reservation. `held()` reflects the bytes
 /// currently accounted to this reservation against
 /// `budget.in_flight`.
+///
+/// Optionally carries a "stage" atomic that mirrors `held` —
+/// `attach_stage(s)` adds `held` to `s` and detaches the prior
+/// stage (subtracts `held` from the previous atomic if any); the
+/// reconcile path adjusts the attached stage by the same delta it
+/// applies to `budget.in_flight`; `Drop` decrements the attached
+/// stage before clearing the budget. Used by Phase 6.x §1.4 to
+/// drive per-stage `runtime_stage_inflight_bytes{stage=...}`
+/// gauges without manual decrement bookkeeping on every error /
+/// drop path.
 pub struct ByteReservation {
     budget: Arc<SourceByteBudget>,
     held: u64,
+    stage: Option<Arc<AtomicU64>>,
 }
 
 impl ByteReservation {
@@ -126,6 +139,22 @@ impl ByteReservation {
 
     pub fn budget(&self) -> &Arc<SourceByteBudget> {
         &self.budget
+    }
+
+    /// Attach the reservation to `stage`, which gets `held` added
+    /// to it. If a prior stage was attached, it's detached first
+    /// (its atomic gets `held` subtracted). Idempotent — attaching
+    /// the same atomic twice is a no-op net delta.
+    pub fn attach_stage(&mut self, stage: Arc<AtomicU64>) {
+        if let Some(prev) = self.stage.take()
+            && self.held > 0
+        {
+            prev.fetch_sub(self.held, Ordering::SeqCst);
+        }
+        if self.held > 0 {
+            stage.fetch_add(self.held, Ordering::SeqCst);
+        }
+        self.stage = Some(stage);
     }
 
     /// Adjust the reservation to `actual_bytes`. **Synchronous,
@@ -144,6 +173,9 @@ impl ByteReservation {
     ///   (admission is the only path that drains the budget via
     ///   downstream sink commit). Admission's `reserve` is the
     ///   only gate.
+    ///
+    /// The attached stage atomic (if any) tracks the delta on
+    /// each call so the per-stage gauge follows the reconcile.
     pub fn reconcile(&mut self, actual_bytes: u64) {
         if actual_bytes == self.held {
             return;
@@ -151,6 +183,9 @@ impl ByteReservation {
         if actual_bytes < self.held {
             let delta = self.held - actual_bytes;
             self.budget.in_flight.fetch_sub(delta, Ordering::SeqCst);
+            if let Some(stage) = self.stage.as_ref() {
+                stage.fetch_sub(delta, Ordering::SeqCst);
+            }
             self.held = actual_bytes;
             self.budget.notify.notify_waiters();
         } else {
@@ -159,6 +194,9 @@ impl ByteReservation {
             // `capacity`. Bounded by the oversize-fault gate in
             // the decode worker.
             self.budget.in_flight.fetch_add(delta, Ordering::SeqCst);
+            if let Some(stage) = self.stage.as_ref() {
+                stage.fetch_add(delta, Ordering::SeqCst);
+            }
             self.held = actual_bytes;
         }
     }
@@ -167,6 +205,9 @@ impl ByteReservation {
 impl Drop for ByteReservation {
     fn drop(&mut self) {
         if self.held > 0 {
+            if let Some(stage) = self.stage.take() {
+                stage.fetch_sub(self.held, Ordering::SeqCst);
+            }
             self.budget.in_flight.fetch_sub(self.held, Ordering::SeqCst);
             self.budget.notify.notify_waiters();
         }
@@ -334,6 +375,38 @@ mod tests {
         release_tx.send(()).unwrap();
         waiter.await.expect("task panicked");
         drop(r2);
+        assert_eq!(b.in_flight(), 0);
+    }
+
+    #[tokio::test]
+    async fn attach_stage_moves_held_bytes_between_stages() {
+        let b = budget(200);
+        let mut r = b.reserve(100).await;
+        let stage_a = Arc::new(AtomicU64::new(0));
+        let stage_b = Arc::new(AtomicU64::new(0));
+
+        r.attach_stage(Arc::clone(&stage_a));
+        assert_eq!(stage_a.load(Ordering::SeqCst), 100);
+        assert_eq!(stage_b.load(Ordering::SeqCst), 0);
+
+        r.attach_stage(Arc::clone(&stage_b));
+        assert_eq!(stage_a.load(Ordering::SeqCst), 0);
+        assert_eq!(stage_b.load(Ordering::SeqCst), 100);
+
+        // reconcile-shrink follows the attached stage.
+        r.reconcile(60);
+        assert_eq!(stage_b.load(Ordering::SeqCst), 60);
+        assert_eq!(b.in_flight(), 60);
+
+        // reconcile-grow likewise.
+        r.reconcile(150);
+        assert_eq!(stage_b.load(Ordering::SeqCst), 150);
+        assert_eq!(b.in_flight(), 150);
+
+        // Drop decrements the attached stage and the budget.
+        drop(r);
+        assert_eq!(stage_a.load(Ordering::SeqCst), 0);
+        assert_eq!(stage_b.load(Ordering::SeqCst), 0);
         assert_eq!(b.in_flight(), 0);
     }
 

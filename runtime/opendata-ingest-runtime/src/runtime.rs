@@ -71,7 +71,10 @@
 //! note.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -93,6 +96,85 @@ use crate::source::{
     SourceId,
 };
 use crate::source_budget::{ByteReservation, SourceByteBudget};
+
+/// Per-stage in-flight byte counters for the
+/// `runtime_stage_inflight_bytes{stage=...}` gauge. Each stage's
+/// `Arc<AtomicU64>` is attached to a `ByteReservation` (see
+/// [`ByteReservation::attach_stage`]) when the unit enters the
+/// stage; the reservation's `Drop` and `reconcile` impls keep the
+/// atomic in sync without manual decrement bookkeeping on every
+/// early-return / error path. The sum across all four atomics
+/// matches `budget.in_flight()` modulo a single-instruction
+/// window during a stage transition.
+///
+/// For the single-sink runtime today, `sink_dispatch` also drives
+/// `runtime_sink_inflight_bytes{sink}` — the gauge samples
+/// `sink_dispatch.load()` in the writer worker, which gives the
+/// sum across concurrent in-flight commits (replaces the row-6.5
+/// per-envelope `set(reservation.held())` that only showed the
+/// last commit's reservation size).
+#[derive(Clone)]
+struct StageInflightBytes {
+    /// Reservations admitted by the actor (descriptor channel or
+    /// just before sending). Detaches when a fetch worker calls
+    /// `attach_stage(stage.fetch.clone())`.
+    source: Arc<AtomicU64>,
+    /// Held by fetch workers + bytes parked in `fetched_rx`.
+    fetch: Arc<AtomicU64>,
+    /// Held by decode workers + bytes parked in `sink_commit_rx`.
+    /// Reconcile-grow / shrink reflects here via the reservation.
+    decode: Arc<AtomicU64>,
+    /// Held by writer workers from `sink_commit_rx.recv()` until
+    /// the reservation drops at the end of the write. Doubles as
+    /// the source of `runtime_sink_inflight_bytes{sink}`.
+    sink_dispatch: Arc<AtomicU64>,
+}
+
+impl StageInflightBytes {
+    fn new() -> Self {
+        Self {
+            source: Arc::new(AtomicU64::new(0)),
+            fetch: Arc::new(AtomicU64::new(0)),
+            decode: Arc::new(AtomicU64::new(0)),
+            sink_dispatch: Arc::new(AtomicU64::new(0)),
+        }
+    }
+}
+
+/// Threshold for `runtime_backpressure_reason` emission, per
+/// design §Observability ("≥ 10 ms park-time gating").
+const BACKPRESSURE_TIMER_THRESHOLD: Duration = Duration::from_millis(10);
+
+/// Wrap a backpressure-prone `.await` so the runtime emits
+/// `runtime_backpressure_reason{source,reason}` once when the
+/// future hasn't resolved within 10 ms. Returns the wrapped
+/// future's output unchanged.
+///
+/// Implementation: a single `select!` polls the wrapped future
+/// (pinned in place so the timer arm can drop in and continue
+/// awaiting it). The counter increments at most once per call —
+/// after the timer fires the function re-awaits the inner future
+/// without arming a second timer.
+async fn with_backpressure_timer<T>(
+    source_id: &SourceId,
+    reason: crate::metrics::BackpressureReason,
+    fut: impl Future<Output = T>,
+) -> T {
+    let mut fut = std::pin::pin!(fut);
+    tokio::select! {
+        biased;
+        out = &mut fut => out,
+        () = tokio::time::sleep(BACKPRESSURE_TIMER_THRESHOLD) => {
+            metrics::counter!(
+                crate::metrics::BACKPRESSURE_REASON,
+                "source" => source_id.0.clone(),
+                "reason" => reason.as_label(),
+            )
+            .increment(1);
+            fut.await
+        }
+    }
+}
 
 /// Test instrumentation: record each `(source_id, sequence)` pair the
 /// per-source actor passes to
@@ -545,6 +627,13 @@ impl Runtime {
         // checks it via `select!` and exits immediately.
         let hard_abort_token = CancellationToken::new();
 
+        // Per-stage in-flight byte counters. Each stage's atomic
+        // is attached to the in-stage reservation via
+        // `ByteReservation::attach_stage`; Drop / reconcile keep
+        // the atomic in sync without manual decrement bookkeeping
+        // on early-return paths.
+        let stage_bytes = StageInflightBytes::new();
+
         // N fetch workers — RFC 0003 §Concurrency Model: `fetch(&self,
         // ...)` is safe to call from N tasks against distinct
         // descriptors. The descriptor channel is async_channel
@@ -560,6 +649,7 @@ impl Runtime {
                 worker_idx,
                 test_fetch_delay.clone(),
                 test_fetch_killswitch.clone(),
+                stage_bytes.clone(),
                 hard_abort_token.clone(),
             )));
         }
@@ -581,6 +671,7 @@ impl Runtime {
                 fetched_rx.clone(),
                 sink_commit_tx.clone(),
                 completion_tx.clone(),
+                stage_bytes.clone(),
                 hard_abort_token.clone(),
             )));
         }
@@ -607,6 +698,7 @@ impl Runtime {
                 worker_idx,
                 sink_commit_rx.clone(),
                 completion_tx.clone(),
+                stage_bytes.clone(),
                 hard_abort_token.clone(),
             )));
         }
@@ -627,6 +719,7 @@ impl Runtime {
             progress_tx.clone(),
             admission_recorder,
             ack_through_recorder,
+            stage_bytes.clone(),
         )
         .await;
 
@@ -894,6 +987,7 @@ async fn per_source_actor(
     progress_tx: watch::Sender<RuntimeProgress>,
     admission_recorder: Option<AdmissionRecorder>,
     ack_through_recorder: Option<AckThroughRecorder>,
+    stage_bytes: StageInflightBytes,
 ) -> RuntimeResult<()> {
     let source_id = source.id().clone();
     let bp = options.backpressure_for(&source_id);
@@ -1019,12 +1113,14 @@ async fn per_source_actor(
                             "source" => source_id.0.clone(),
                         )
                         .set(coordinator.pending_count() as f64);
-                        metrics::gauge!(
-                            crate::metrics::STAGE_INFLIGHT_BYTES,
-                            "stage" => "source",
-                            "source" => source_id.0.clone(),
-                        )
-                        .set(budget.in_flight() as f64);
+                        // Per-stage breakdown (§1.4 closeout). Each
+                        // stage atomic tracks the bytes attached to
+                        // reservations currently owned by that
+                        // stage; `Drop` / `reconcile` keep them in
+                        // sync without manual decrement on early-
+                        // return paths. Sum equals
+                        // `budget.in_flight()` under quiescence.
+                        emit_stage_inflight_gauges(&stage_bytes, &source_id);
                     }
                     Some(WriteCompletion::Fatal(e)) => {
                         return Err(e);
@@ -1042,14 +1138,24 @@ async fn per_source_actor(
 
             // 3. Admission arm — only when admission is open AND
             //    backpressure permits.
-            biased_arm = admission_attempt(
+            biased_arm = with_backpressure_timer(
                 &source_id,
-                &budget,
-                &batch_semaphore,
-                in_flight,
-                &bp,
+                crate::metrics::BackpressureReason::SourceBudget,
+                admission_attempt(
+                    &source_id,
+                    &budget,
+                    &batch_semaphore,
+                    in_flight,
+                    &bp,
+                ),
             ), if admission_open => {
-                let AdmissionGate { batch_permit, reservation } = biased_arm;
+                let AdmissionGate { batch_permit, mut reservation } = biased_arm;
+                // Attach the reservation to the source-stage atomic
+                // so it shows up in `runtime_stage_inflight_bytes{
+                // stage=source}` until the fetch worker calls
+                // `attach_stage(stage.fetch)` on recv. Drop /
+                // reconcile keep the atomic in sync automatically.
+                reservation.attach_stage(Arc::clone(&stage_bytes.source));
 
                 // K=1: register every descriptor before it leaves
                 // the synchronous arm.
@@ -1107,6 +1213,28 @@ async fn per_source_actor(
     progress.pending_ranges_total = coordinator.pending_count();
     let _ = progress_tx.send(progress);
     Ok(())
+}
+
+/// Emit the four `runtime_stage_inflight_bytes{stage=...,source}`
+/// gauges from the stage-counter snapshot. Called by the actor's
+/// completion arm after every committed unit; covers all stages
+/// (`source` / `fetch` / `decode` / `sink_dispatch`) and is the
+/// canonical emission site for the per-stage breakdown.
+fn emit_stage_inflight_gauges(stage_bytes: &StageInflightBytes, source_id: &SourceId) {
+    let source_label = source_id.0.clone();
+    for (stage_label, atomic) in [
+        ("source", &stage_bytes.source),
+        ("fetch", &stage_bytes.fetch),
+        ("decode", &stage_bytes.decode),
+        ("sink_dispatch", &stage_bytes.sink_dispatch),
+    ] {
+        metrics::gauge!(
+            crate::metrics::STAGE_INFLIGHT_BYTES,
+            "stage" => stage_label,
+            "source" => source_label.clone(),
+        )
+        .set(atomic.load(Ordering::SeqCst) as f64);
+    }
 }
 
 /// Output of a successful admission attempt: the actor still has to
@@ -1168,6 +1296,7 @@ async fn fetch_worker(
     worker_idx: usize,
     test_fetch_delay: Option<TestFetchDelayFn>,
     test_fetch_killswitch: Option<TestFetchKillswitch>,
+    stage_bytes: StageInflightBytes,
     hard_abort_token: CancellationToken,
 ) -> RuntimeResult<()> {
     let source_label = source_id.0.clone();
@@ -1178,6 +1307,12 @@ async fn fetch_worker(
             "source" => source_label.clone(),
         )
         .set(descriptor_rx.len() as f64);
+        metrics::gauge!(
+            crate::metrics::STAGE_INFLIGHT_BYTES,
+            "stage" => "fetch",
+            "source" => source_label.clone(),
+        )
+        .set(stage_bytes.fetch.load(Ordering::SeqCst) as f64);
 
         let admitted = tokio::select! {
             biased;
@@ -1203,9 +1338,15 @@ async fn fetch_worker(
         };
         let AdmittedDescriptor {
             descriptor,
-            reservation,
+            mut reservation,
             batch_permit,
         } = admitted;
+        // Transition the reservation from `source` to `fetch`
+        // stage. `attach_stage` detaches the prior atomic
+        // (subtracts `held` from `source`) and adds `held` to
+        // `fetch`. If the worker errors before forwarding, Drop
+        // decrements `fetch` automatically.
+        reservation.attach_stage(Arc::clone(&stage_bytes.fetch));
         let admitted_sequence = descriptor.sequence;
 
         if let Some(delay_fn) = test_fetch_delay.as_ref() {
@@ -1241,17 +1382,22 @@ async fn fetch_worker(
         )
         .record(stage_start.elapsed().as_secs_f64());
 
-        if fetched_tx
-            .send(FetchedBatch {
+        let send_result = with_backpressure_timer(
+            &source_id,
+            crate::metrics::BackpressureReason::DecodeBudget,
+            fetched_tx.send(FetchedBatch {
                 source_batch,
                 reservation,
                 batch_permit,
                 admitted_sequence,
-            })
-            .await
-            .is_err()
-        {
+            }),
+        )
+        .await;
+        if send_result.is_err() {
             // Decode stage closed unexpectedly. INV-DESCRIPTOR-LOSS-FATAL.
+            // The rejected FetchedBatch is dropped along with its
+            // reservation; the fetch-stage atomic decrements
+            // automatically via the reservation's Drop impl.
             let _ = completion_tx
                 .send(WriteCompletion::Fatal(RuntimeError::Pipeline(format!(
                     "fetched-batch lost: source={source_id} seq={admitted_sequence} cause=decode-stage-closed",
@@ -1302,6 +1448,7 @@ async fn decode_worker(
     fetched_rx: async_channel::Receiver<FetchedBatch>,
     sink_commit_tx: async_channel::Sender<SinkCommitEnvelope>,
     completion_tx: mpsc::Sender<WriteCompletion>,
+    stage_bytes: StageInflightBytes,
     hard_abort_token: CancellationToken,
 ) -> RuntimeResult<()> {
     let source_label = source_id.0.clone();
@@ -1313,6 +1460,12 @@ async fn decode_worker(
             "source" => source_label.clone(),
         )
         .set(fetched_rx.len() as f64);
+        metrics::gauge!(
+            crate::metrics::STAGE_INFLIGHT_BYTES,
+            "stage" => "decode",
+            "source" => source_label.clone(),
+        )
+        .set(stage_bytes.decode.load(Ordering::SeqCst) as f64);
 
         let fetched = tokio::select! {
             biased;
@@ -1328,6 +1481,11 @@ async fn decode_worker(
             batch_permit,
             admitted_sequence,
         } = fetched;
+        // Transition from `fetch` to `decode` stage. `attach_stage`
+        // detaches the fetch atomic and adds `held` to decode;
+        // subsequent `reconcile` calls adjust the decode atomic by
+        // the same delta they apply to `budget.in_flight`.
+        reservation.attach_stage(Arc::clone(&stage_bytes.decode));
 
         let stage_start = std::time::Instant::now();
         let outcome = tokio::select! {
@@ -1352,17 +1510,21 @@ async fn decode_worker(
 
         match outcome {
             Ok(DecodeOutcome::Live { commit, range }) => {
-                if sink_commit_tx
-                    .send(SinkCommitEnvelope {
+                let send_result = with_backpressure_timer(
+                    &source_id,
+                    crate::metrics::BackpressureReason::SinkBudget,
+                    sink_commit_tx.send(SinkCommitEnvelope {
                         commit: *commit,
                         range,
                         reservation,
                         batch_permit,
-                    })
-                    .await
-                    .is_err()
-                {
-                    // Sink stage closed unexpectedly.
+                    }),
+                )
+                .await;
+                if send_result.is_err() {
+                    // Sink stage closed unexpectedly. Rejected
+                    // envelope drops; the reservation's Drop
+                    // decrements `decode` automatically.
                     let _ = completion_tx
                         .send(WriteCompletion::Fatal(RuntimeError::Pipeline(format!(
                             "sink-commit lost: source={source_id} seq={admitted_sequence} cause=sink-stage-closed",
@@ -1555,6 +1717,7 @@ async fn writer_worker(
     worker_idx: usize,
     sink_commit_rx: async_channel::Receiver<SinkCommitEnvelope>,
     completion_tx: mpsc::Sender<WriteCompletion>,
+    stage_bytes: StageInflightBytes,
     hard_abort_token: CancellationToken,
 ) -> RuntimeResult<()> {
     let source_label = source_id.0.clone();
@@ -1565,6 +1728,12 @@ async fn writer_worker(
             "sink" => sink_label.clone(),
         )
         .set(sink_commit_rx.len() as f64);
+        metrics::gauge!(
+            crate::metrics::STAGE_INFLIGHT_BYTES,
+            "stage" => "sink_dispatch",
+            "source" => source_label.clone(),
+        )
+        .set(stage_bytes.sink_dispatch.load(Ordering::SeqCst) as f64);
 
         let envelope = tokio::select! {
             biased;
@@ -1578,16 +1747,24 @@ async fn writer_worker(
         let SinkCommitEnvelope {
             commit,
             range,
-            reservation,
+            mut reservation,
             batch_permit,
         } = envelope;
+        // Transition from `decode` to `sink_dispatch` stage. After
+        // attach, `stage_bytes.sink_dispatch` reflects the sum of
+        // held bytes across every concurrent writer worker — the
+        // sink-side "in-flight summed across commits" the §1.4
+        // closeout calls for. Drop on the success path / error
+        // path / abort path decrements automatically.
+        reservation.attach_stage(Arc::clone(&stage_bytes.sink_dispatch));
         metrics::gauge!(
             crate::metrics::SINK_INFLIGHT_BYTES,
             "sink" => sink_label.clone(),
         )
-        .set(reservation.held() as f64);
+        .set(stage_bytes.sink_dispatch.load(Ordering::SeqCst) as f64);
         let stage_start = std::time::Instant::now();
-        let attempt = write_with_retry(&sink, commit, &options, &hard_abort_token).await;
+        let attempt =
+            write_with_retry(&sink, commit, &options, &source_id, &hard_abort_token).await;
         metrics::histogram!(
             crate::metrics::STAGE_LATENCY_SECONDS,
             "stage" => "sink_dispatch",
@@ -1688,6 +1865,7 @@ async fn write_with_retry(
     sink: &Arc<dyn Sink>,
     commit: SinkCommit,
     options: &RuntimeOptions,
+    source_id: &SourceId,
     hard_abort_token: &CancellationToken,
 ) -> WriteAttempt {
     use crate::metrics::SinkCommitOutcome;
@@ -1732,7 +1910,13 @@ async fn write_with_retry(
                         outcome: SinkCommitOutcome::FailedRetryable,
                     };
                 }
-                if !sleep_with_abort(backoff, hard_abort_token).await {
+                let slept = with_backpressure_timer(
+                    source_id,
+                    crate::metrics::BackpressureReason::Retrying,
+                    sleep_with_abort(backoff, hard_abort_token),
+                )
+                .await;
+                if !slept {
                     return WriteAttempt {
                         inner: Err(RuntimeError::Pipeline(
                             "hard abort during retry sleep".into(),
