@@ -886,31 +886,29 @@ mod hard_abort_sink {
     }
 }
 
-/// §1.3b closeout: INV-FRONTIER-NEVER-OVER-HOLE under runtime-level
-/// out-of-order completion.
+/// §1.3b closeout (post-review HARDENED): INV-FRONTIER-NEVER-OVER-HOLE
+/// under runtime-level out-of-order completion.
 ///
-/// `ProgrammableSink::set_per_sequence_latency` makes seq=0 the
-/// slowest write (200 ms) while every other sequence completes
-/// immediately. With `max_concurrent_commits = 4`, one writer
-/// parks on seq=0 while peer writers run seqs 1..4 to completion.
-/// The coordinator's `mark_committed` records the peer
-/// completions as pending but `advance_frontier` cannot advance
-/// past the seq=0 hole, so `ack_through` is NOT called until
-/// seq=0's write returns. Once it does, `advance_frontier`
-/// collapses every contiguous pending range in one pass and
-/// `ack_through` fires exactly once with the highest committed
-/// sequence.
+/// Deterministic gating: `ProgrammableSink::set_per_sequence_block(0)`
+/// explicitly holds seq=0's commit on a `Notify` while peer
+/// sequences 1..N flow through W=4 writers and complete. The
+/// coordinator marks each peer as committed but `advance_frontier`
+/// cannot cross the seq=0 hole, so the actor's
+/// `ack_through_recorder` MUST stay empty for the duration of
+/// the hold. Once the test calls `cancel()` to release
+/// seq=0, the actor sees its completion last and
+/// `advance_frontier` collapses [0..N-1] in one pass — emitting
+/// exactly one `ack_through(N-1)`.
 ///
-/// Structurally exercised today by
-/// `concurrent_50_batches_advance_frontier_under_writer_pool` in
-/// `tests/ack_correctness_concurrent.rs`, but that test pins the
-/// invariant via the AckCoordinator state-machine surface; this
-/// one observes it through the actor's `ack_through_recorder`
-/// hook so the pipeline-level emission timing is also pinned.
+/// The previous revision used 200 ms of latency on seq=0; on a
+/// fast scheduler peer completions could still land in source
+/// order and the test would pass without ever exercising the
+/// hole-in-frontier path. The explicit block makes the sequence
+/// unambiguous regardless of timing.
 #[tokio::test]
 async fn pipeline_runtime_level_out_of_order_completion_no_frontier_hole() {
     use opendata_ingest_runtime::sink::{CommitStatus, SinkId};
-    use support::{ProgrammableSink, ScriptedWrite, SinkLatencyFn};
+    use support::{ProgrammableSink, ScriptedWrite};
 
     let fx = in_memory_buffer_source(
         "ingest/test/pipeline/out-of-order-completion/manifest",
@@ -936,18 +934,7 @@ async fn pipeline_runtime_level_out_of_order_completion_no_frontier_hole() {
             .collect(),
         CommitStatus::Unknown,
     );
-    // Asymmetric latency: seq=0 sleeps long enough that every
-    // peer write completes first under `W=4`. Without the
-    // imbalance the test reduces to in-order completion and the
-    // out-of-order path isn't exercised.
-    let latency_fn: SinkLatencyFn = Arc::new(|seq: u64| {
-        if seq == 0 {
-            Some(Duration::from_millis(200))
-        } else {
-            None
-        }
-    });
-    sink.set_per_sequence_latency(latency_fn);
+    let release_seq_0 = sink.set_per_sequence_block(0);
     let write_calls = Arc::clone(&sink.write_calls);
 
     let ack_recorder: AckThroughRecorder = Arc::new(Mutex::new(Vec::new()));
@@ -980,6 +967,54 @@ async fn pipeline_runtime_level_out_of_order_completion_no_frontier_hole() {
     let shutdown_run = shutdown.clone();
     let handle = tokio::spawn(async move { runtime.run(shutdown_run).await });
 
+    // Wait until every peer sequence (1..N) has its write call
+    // captured AND has resolved Ok (write_calls captures the call
+    // entering BenchSink::write, but ProgrammableSink records the
+    // call BEFORE awaiting maybe_park / latency; a captured-write
+    // doesn't yet mean "committed"). For ProgrammableSink the
+    // write_calls Vec only grows after the sink resolves the
+    // script — wait for `>= batch_count - 1` distinct peer high-
+    // sequences to land before snapshotting the ack recorder.
+    timeout(Duration::from_secs(10), async {
+        loop {
+            let seen: std::collections::HashSet<u64> = write_calls
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|w| w.high_sequence)
+                .collect();
+            // Wait for peer writes to have all hit `write_calls`;
+            // every one of them will have completed past `write`'s
+            // tail since seq=0 is the ONLY blocked sequence and
+            // none of them park.
+            if (1..batch_count).all(|s| seen.contains(&s)) {
+                // Give the actor a moment to process those peer
+                // completions before we snapshot the recorder.
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                return;
+            }
+            drop(seen);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("peer commits should resolve while seq=0 is held");
+
+    // STRICT CHECK: no ack fired while the hole was open. A
+    // runtime that violated INV-FRONTIER-NEVER-OVER-HOLE would
+    // have advanced frontier past seq=0 and the recorder would
+    // be non-empty here.
+    let acks_during_hole = ack_recorder.lock().unwrap().clone();
+    assert!(
+        acks_during_hole.is_empty(),
+        "no ack must fire while the seq=0 hole is open; saw {acks_during_hole:?}",
+    );
+
+    // Release seq=0. The actor processes its completion, the
+    // coordinator walks the entire contiguous run, and a single
+    // `ack_through(N-1)` fires.
+    release_seq_0.cancel();
+
     timeout(Duration::from_secs(10), async {
         loop {
             progress_rx
@@ -992,7 +1027,7 @@ async fn pipeline_runtime_level_out_of_order_completion_no_frontier_hole() {
         }
     })
     .await
-    .expect("runtime should drain after seq=0 finally completes");
+    .expect("runtime should drain after release");
 
     shutdown.cancel();
     handle
@@ -1000,9 +1035,7 @@ async fn pipeline_runtime_level_out_of_order_completion_no_frontier_hole() {
         .expect("runtime task join")
         .expect("runtime exited cleanly");
 
-    // Sanity: every sequence reached the sink exactly once. Writes
-    // arrive in completion-order (peer writes first, seq=0 last),
-    // so sort for the range check.
+    // Sanity: every sequence reached the sink exactly once.
     let mut writes = write_calls.lock().unwrap().clone();
     writes.sort_by_key(|w| w.high_sequence);
     assert_eq!(
@@ -1014,54 +1047,57 @@ async fn pipeline_runtime_level_out_of_order_completion_no_frontier_hole() {
         assert_eq!(w.high_sequence, i as u64);
     }
 
-    // INV-FRONTIER-NEVER-OVER-HOLE: the recorder must NOT contain
-    // any value before seq=0 commits. With W=4 writers and seq=0
-    // the slow one, peer completions for seq=1..7 land first; the
-    // actor marks them committed but `advance_frontier` cannot
-    // cross the seq=0 hole, so `ack_through` is skipped. Only
-    // when seq=0 commits does the coordinator collapse the run.
+    // Strict invariant assertion: recorder shows EXACTLY one ack,
+    // jumping straight to N-1. Anything else (multiple acks, an
+    // intermediate ack, a stuck frontier) flags a regression.
     let recorded = ack_recorder.lock().unwrap().clone();
-    assert!(
-        !recorded.is_empty(),
-        "ack_through must fire at least once after seq=0 commits",
-    );
-    for window in recorded.windows(2) {
-        let (prev, next) = (window[0], window[1]);
-        assert!(
-            next > prev,
-            "recorder must be strictly monotonic: saw {prev} \
-             followed by {next} in {recorded:?}",
-        );
-    }
     assert_eq!(
-        recorded.last().copied(),
-        Some(batch_count - 1),
-        "final ack_through reaches the highest committed sequence",
+        recorded.len(),
+        1,
+        "expected exactly one ack_through call (the single jump \
+         after seq=0's release); saw {recorded:?}",
+    );
+    assert_eq!(
+        recorded[0],
+        batch_count - 1,
+        "single ack must jump straight to the highest sequence",
     );
 
     fx.producer.close().await.expect("close");
 }
 
-/// §1.3b closeout: INV-BACKPRESSURE-BOUNDED-MEMORY under sink
-/// outage.
+/// §1.3b closeout (post-review HARDENED): INV-BACKPRESSURE-BOUNDED-MEMORY
+/// under sink outage.
 ///
-/// One sequence in the middle of a stream injects a long sink
-/// latency (1500 ms). Peer writes flow through the pool, the
-/// pipeline backpressures admission against the per-source byte
-/// budget, and `budget.in_flight()` never exceeds the bound
-/// pinned by the design:
+/// Deterministic gating via `ProgrammableSink::set_per_sequence_block(4)`:
+/// seq=4's commit parks on a `Notify` indefinitely while peer
+/// writes flow through the pool. Backpressure engages against
+/// the per-source byte budget (admission parks once
+/// `max_inflight_bytes` is consumed); `budget.in_flight()` is
+/// sampled by a background poller every 10 ms throughout the
+/// hold. After the test asserts the peak observed against the
+/// design bound, `notify_waiters()` releases seq=4 and the
+/// runtime drains.
 ///
-///   max_inflight_bytes
-///     + decode_concurrency × (oversize_fault_multiplier - 1)
-///       × estimated_max_batch_bytes
+/// Bound (design §Algorithms > Per-Source Decode Workers):
 ///
-/// Once the slow write returns the pipeline resumes; the durable
-/// ack frontier reaches the highest produced sequence.
+///   peak in-flight bytes per source
+///     ≤ max_inflight_bytes
+///       + decode_concurrency
+///         × (oversize_fault_multiplier - 1)
+///         × estimated_max_batch_bytes
+///
+/// Strict additions (post-review):
+///   - assert peak ≥ `max_inflight_bytes` while the hole was
+///     open (i.e. backpressure DID engage — latency-based gating
+///     left this as a possibility, not a guarantee).
+///   - assert final `budget.in_flight()` is zero after drain.
+///   - assert frontier reaches N-1 after release.
 #[tokio::test]
 async fn pipeline_slow_sink_injection_caps_inflight_bytes_and_recovers() {
     use large_records::LargeDecoder;
     use opendata_ingest_runtime::sink::{CommitStatus, SinkId};
-    use support::{ProgrammableSink, ScriptedWrite, SinkLatencyFn};
+    use support::{ProgrammableSink, ScriptedWrite};
 
     let fx = in_memory_buffer_source(
         "ingest/test/pipeline/slow-sink-injection/manifest",
@@ -1087,17 +1123,17 @@ async fn pipeline_slow_sink_injection_caps_inflight_bytes_and_recovers() {
             .collect(),
         CommitStatus::Unknown,
     );
-    // Long stall on a single mid-stream sequence — peer writes
-    // flow normally so backpressure has to come from upstream
-    // stages (admission budget, decode reservation), not from
-    // sink-pool capacity.
-    let latency_fn: SinkLatencyFn = Arc::new(|seq: u64| {
-        if seq == 4 {
-            Some(Duration::from_millis(1500))
-        } else {
-            None
-        }
-    });
+    // Deterministic gating on seq=4 — peer writes flow normally
+    // so backpressure has to come from upstream stages (admission
+    // budget, decode reservation), not from sink-pool capacity.
+    let release_seq_4 = sink.set_per_sequence_block(4);
+    // Add a small latency to every write so admission saturates
+    // for a sample window long enough that the 1 ms poller can
+    // observe the peak. Without this the in-memory `Ok` returns
+    // sub-millisecond and the budget bounce is invisible to the
+    // poller; the bound assertion would trivially hold against a
+    // peak of 1×estimated_max_batch_bytes (the held seq=4 alone).
+    let latency_fn: support::SinkLatencyFn = Arc::new(|_seq: u64| Some(Duration::from_millis(20)));
     sink.set_per_sequence_latency(latency_fn);
     let write_calls = Arc::clone(&sink.write_calls);
 
@@ -1150,9 +1186,14 @@ async fn pipeline_slow_sink_injection_caps_inflight_bytes_and_recovers() {
     let shutdown_run = shutdown.clone();
     let handle = tokio::spawn(async move { runtime.run(shutdown_run).await });
 
-    // Spawn a poller that samples `budget.in_flight()` every 10 ms
+    // Spawn a poller that samples `budget.in_flight()` every 1 ms
     // throughout the run. Peak is the maximum sample observed
-    // before the actor exits.
+    // before the actor exits. The 10 ms sampling that the prior
+    // revision used was too coarse: with an in-memory sink the
+    // admission → completion cycle is sub-millisecond, so the
+    // saturated-budget window was easy to miss. 1 ms keeps the
+    // poller cheap (10× more samples over a few-second run) but
+    // catches the brief peaks reliably.
     let peak = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let peak_poller = Arc::clone(&peak);
     let budget_poller = Arc::clone(&budget);
@@ -1163,7 +1204,7 @@ async fn pipeline_slow_sink_injection_caps_inflight_bytes_and_recovers() {
             tokio::select! {
                 biased;
                 _ = poller_stop_inner.cancelled() => return,
-                _ = tokio::time::sleep(Duration::from_millis(10)) => {
+                _ = tokio::time::sleep(Duration::from_millis(1)) => {
                     let now = budget_poller.in_flight();
                     let prev = peak_poller.load(std::sync::atomic::Ordering::SeqCst);
                     if now > prev {
@@ -1174,8 +1215,31 @@ async fn pipeline_slow_sink_injection_caps_inflight_bytes_and_recovers() {
         }
     });
 
-    // Wait for full drain — frontier must reach the highest
-    // sequence even though seq=4 took 1.5 s.
+    // Wait for backpressure to engage: at least `max_inflight_bytes`
+    // worth of bytes must be in flight at some point during the
+    // hold. This proves the test actually exercised the budget
+    // saturation path — the prior revision only asserted "peak
+    // ≤ bound" which can trivially hold even when backpressure
+    // never engaged (e.g. if all writes complete in source order
+    // before the budget fills).
+    timeout(Duration::from_secs(10), async {
+        loop {
+            if peak.load(std::sync::atomic::Ordering::SeqCst) >= max_inflight_bytes {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect(
+        "backpressure must engage while seq=4 is held: peak in-flight \
+         should reach max_inflight_bytes",
+    );
+
+    // Release seq=4 and wait for full drain. Frontier must reach
+    // batch_count-1 once seq=4 completes.
+    release_seq_4.cancel();
+
     timeout(Duration::from_secs(10), async {
         loop {
             progress_rx
@@ -1188,7 +1252,7 @@ async fn pipeline_slow_sink_injection_caps_inflight_bytes_and_recovers() {
         }
     })
     .await
-    .expect("runtime should recover and drain after slow seq=4 completes");
+    .expect("runtime should recover and drain after seq=4 is released");
 
     shutdown.cancel();
     handle
@@ -1212,6 +1276,12 @@ async fn pipeline_slow_sink_injection_caps_inflight_bytes_and_recovers() {
         decode_concurrency,
         oversize_fault_multiplier,
         pessimistic,
+    );
+    assert!(
+        peak_in_flight >= max_inflight_bytes,
+        "backpressure must have engaged during the seq=4 hold: \
+         peak in_flight ({peak_in_flight}) should be at least \
+         max_inflight_bytes ({max_inflight_bytes})",
     );
 
     // Sanity: every sequence reached the sink and the final

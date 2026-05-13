@@ -315,6 +315,16 @@ pub struct ProgrammableSink {
     gate_active: Arc<Mutex<bool>>,
     gate_writes: Arc<Mutex<bool>>,
     per_sequence_latency: Arc<Mutex<Option<SinkLatencyFn>>>,
+    /// Per-sequence block. `write` for a sequence with a registered
+    /// `CancellationToken` parks on `token.cancelled().await`
+    /// before consulting the script. Tests use this to
+    /// deterministically hold a specific commit while assertions
+    /// run on peer-sequence state. `CancellationToken` is
+    /// lost-wakeup-safe — `cancel()` resolves all waiters
+    /// (current and future), so releasing before the writer
+    /// parks still bypasses the block.
+    per_sequence_block:
+        Arc<Mutex<std::collections::HashMap<u64, tokio_util::sync::CancellationToken>>>,
 }
 
 impl ProgrammableSink {
@@ -335,6 +345,34 @@ impl ProgrammableSink {
             gate_active: Arc::new(Mutex::new(false)),
             gate_writes: Arc::new(Mutex::new(false)),
             per_sequence_latency: Arc::new(Mutex::new(None)),
+            per_sequence_block: Arc::new(Mutex::new(std::collections::HashMap::new())),
+        }
+    }
+
+    /// Install a per-sequence block. Returns the
+    /// `CancellationToken` controlling the gate — test releases
+    /// the block by calling `token.cancel()`. `CancellationToken`
+    /// is lost-wakeup-safe: cancelling before the writer reaches
+    /// the await still resolves the future immediately.
+    pub fn set_per_sequence_block(&self, seq: u64) -> tokio_util::sync::CancellationToken {
+        let token = tokio_util::sync::CancellationToken::new();
+        self.per_sequence_block
+            .lock()
+            .unwrap()
+            .insert(seq, token.clone());
+        token
+    }
+
+    /// Remove the block for `seq` so subsequent writes against
+    /// it bypass the gate.
+    pub fn clear_per_sequence_block(&self, seq: u64) {
+        self.per_sequence_block.lock().unwrap().remove(&seq);
+    }
+
+    async fn await_per_sequence_block(&self, seq: u64) {
+        let token = self.per_sequence_block.lock().unwrap().get(&seq).cloned();
+        if let Some(t) = token {
+            t.cancelled().await;
         }
     }
 
@@ -456,6 +494,9 @@ impl Sink for ProgrammableSink {
         if let Some(latency) = self.lookup_latency(commit.identity.range.high) {
             tokio::time::sleep(latency).await;
         }
+
+        self.await_per_sequence_block(commit.identity.range.high)
+            .await;
 
         self.maybe_park(true).await;
 

@@ -373,13 +373,22 @@ async fn run_out_of_order_completion_no_frontier_hole(
     produce_n_batches(&fx.producer, batch_count).await;
 
     let sink = BenchSink::new(SINK_LABEL);
-    // Latency on seq=0 so peer writes complete first under W=4.
-    sink.set_latency_fn(Arc::new(|seq: u64| {
-        if seq == 0 {
-            Some(Duration::from_millis(150))
-        } else {
-            None
-        }
+    // Deterministic gating: explicitly hold seq=0's commit so
+    // peer commits land first under W=4. Latency-based gating
+    // (the prior revision used 150 ms on seq=0) was racy — a
+    // fast scheduler could deliver completions in source order
+    // and the test would pass without exercising the hole-in-
+    // frontier path. The explicit Notify makes the sequence
+    // unambiguous.
+    let release_seq_0 = sink.set_per_sequence_block(0);
+
+    // Track which sequences have committed at the sink so the
+    // test can wait for peers before sampling the ack recorder.
+    let commits_seen: Arc<Mutex<std::collections::HashSet<u64>>> =
+        Arc::new(Mutex::new(std::collections::HashSet::new()));
+    let commits_seen_observer = Arc::clone(&commits_seen);
+    sink.set_commit_observer(Arc::new(move |seq| {
+        commits_seen_observer.lock().unwrap().insert(seq);
     }));
 
     let ack_recorder: AckThroughRecorder = Arc::new(Mutex::new(Vec::new()));
@@ -399,6 +408,35 @@ async fn run_out_of_order_completion_no_frontier_hole(
     let shutdown_run = shutdown.clone();
     let handle = tokio::spawn(async move { runtime.run(shutdown_run).await });
 
+    // Wait until every peer sequence (1..batch_count) has
+    // committed at the sink. seq=0 is still parked at the
+    // per-seq block. The actor has been receiving / processing
+    // those peer completions during the wait; the coordinator
+    // has marked each one but `advance_frontier` cannot cross
+    // the seq=0 hole, so the recorder should still be empty.
+    timeout(Duration::from_secs(15), async {
+        loop {
+            let all_seen = {
+                let seen = commits_seen.lock().unwrap();
+                (1..batch_count).all(|s| seen.contains(&s))
+            };
+            if all_seen {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("peer commits should land while seq=0 is held");
+
+    let acks_before_release = ack_recorder.lock().unwrap().clone();
+
+    // Release seq=0. After this, the actor sees seq=0's
+    // completion last; `advance_frontier` walks the full
+    // contiguous run [0..batch_count-1] in one pass and
+    // emits exactly one `ack_through(batch_count - 1)` event.
+    release_seq_0.cancel();
+
     timeout(Duration::from_secs(15), async {
         loop {
             progress_rx
@@ -411,33 +449,45 @@ async fn run_out_of_order_completion_no_frontier_hole(
         }
     })
     .await
-    .expect("scenario should drain");
+    .expect("scenario should drain after release");
 
     shutdown.cancel();
     handle.await.expect("join").expect("clean exit");
 
-    let acks = ack_recorder.lock().unwrap().clone();
+    let acks_after_release = ack_recorder.lock().unwrap().clone();
 
+    // Witness the transitions.
     let mut prev: Option<u64> = None;
-    let mut monotonic = true;
-    for ack in &acks {
+    for ack in &acks_after_release {
         witness
             .write_event(&FrontierTransition {
                 from: prev,
                 to: *ack,
             })
             .map_err(io_err)?;
-        if let Some(p) = prev
-            && *ack <= p
-        {
-            monotonic = false;
-        }
         prev = Some(*ack);
     }
     witness.close().map_err(io_err)?;
 
-    let passed = monotonic && acks.last().copied() == Some(batch_count - 1) && !acks.is_empty();
+    // Strict invariant: NO ack while the seq=0 hole was open
+    // (acks_before_release is empty), THEN exactly one ack
+    // jumping straight to batch_count-1.
+    let mut monotonic = true;
+    let mut prev_check: Option<u64> = None;
+    for ack in &acks_after_release {
+        if let Some(p) = prev_check
+            && *ack <= p
+        {
+            monotonic = false;
+        }
+        prev_check = Some(*ack);
+    }
+    let no_ack_during_hole = acks_before_release.is_empty();
+    let exact_jump = acks_after_release.first().copied() == Some(batch_count - 1);
+    let terminal_ack = acks_after_release.last().copied() == Some(batch_count - 1);
+    let passed = monotonic && no_ack_during_hole && exact_jump && terminal_ack;
 
+    let acks = acks_after_release;
     let evidence = relative_evidence(&witness_path);
     let check = AckInvariantCheck {
         name: CheckName::OutOfOrderCompletionNoFrontierHole

@@ -27,6 +27,7 @@ use opendata_ingest_runtime::sink::{
 };
 use opendata_ingest_runtime::source::BufferSource;
 use slatedb::object_store::ObjectStore;
+use tokio_util::sync::CancellationToken;
 
 /// 4-byte metadata envelope matching the runtime's configured
 /// shape: version=1, signal=Logs, encoding=OtlpProtobuf.
@@ -161,6 +162,15 @@ pub struct BenchSink {
     /// install one that pushes a SinkCommitOk event onto a shared
     /// ordered log.
     commit_observer: Arc<Mutex<Option<CommitObserver>>>,
+    /// Per-sequence block. `write` for a sequence with a
+    /// registered `CancellationToken` parks on
+    /// `token.cancelled().await` BEFORE consulting the script.
+    /// Tests use this to deterministically hold a specific
+    /// sequence's commit until they've made assertions about
+    /// peer-sequence state; releasing via `token.cancel()`
+    /// resolves any current / future waiter (lost-wakeup safe,
+    /// unlike `Notify::notify_waiters`).
+    per_sequence_block: Arc<Mutex<std::collections::HashMap<u64, CancellationToken>>>,
     /// Every successful `write` call's identity, in call order.
     pub write_calls: Arc<Mutex<Vec<CapturedWrite>>>,
     check_committed_response: Arc<Mutex<CommitStatus>>,
@@ -174,6 +184,7 @@ impl BenchSink {
             per_sequence_script: Arc::new(Mutex::new(std::collections::HashMap::new())),
             latency_fn: Arc::new(Mutex::new(None)),
             commit_observer: Arc::new(Mutex::new(None)),
+            per_sequence_block: Arc::new(Mutex::new(std::collections::HashMap::new())),
             write_calls: Arc::new(Mutex::new(Vec::new())),
             check_committed_response: Arc::new(Mutex::new(CommitStatus::Unknown)),
         }
@@ -203,6 +214,33 @@ impl BenchSink {
     /// `no_ack_before_sink_commit` scenario relies on.
     pub fn set_commit_observer(&self, f: CommitObserver) {
         *self.commit_observer.lock().unwrap() = Some(f);
+    }
+
+    /// Insert a per-sequence block. Returns the
+    /// `CancellationToken` controlling the gate — test releases
+    /// the block by calling `token.cancel()`. `CancellationToken`
+    /// is lost-wakeup-safe: cancelling before the writer reaches
+    /// the await still resolves the future immediately.
+    pub fn set_per_sequence_block(&self, seq: u64) -> CancellationToken {
+        let token = CancellationToken::new();
+        self.per_sequence_block
+            .lock()
+            .unwrap()
+            .insert(seq, token.clone());
+        token
+    }
+
+    /// Remove the block for `seq` so subsequent writes against
+    /// it bypass the gate. Useful for retry paths.
+    pub fn clear_per_sequence_block(&self, seq: u64) {
+        self.per_sequence_block.lock().unwrap().remove(&seq);
+    }
+
+    async fn await_per_sequence_block(&self, seq: u64) {
+        let token = self.per_sequence_block.lock().unwrap().get(&seq).cloned();
+        if let Some(t) = token {
+            t.cancelled().await;
+        }
     }
 
     pub fn set_check_committed_response(&self, r: CommitStatus) {
@@ -242,6 +280,7 @@ impl Sink for BenchSink {
         if let Some(d) = self.lookup_latency(seq) {
             tokio::time::sleep(d).await;
         }
+        self.await_per_sequence_block(seq).await;
         match self.next_response(seq) {
             ScriptedWrite::Ok { rows_written } => {
                 // Fire the post-Ok observer SYNCHRONOUSLY with the
