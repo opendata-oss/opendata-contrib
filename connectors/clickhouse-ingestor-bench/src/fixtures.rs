@@ -68,6 +68,94 @@ impl TypedRecords for FakeRecords {
     }
 }
 
+/// `TypedRecords` impl that reports a configurable
+/// `estimated_bytes`. Used by the
+/// `sink_outage_backpressure_bounded` scenario to drive the
+/// post-decode reservation up to (and at) `max_inflight_bytes`
+/// so the bound assertion is meaningful — `FakeRecords`
+/// reports ~16 bytes/record, which would shrink the reservation
+/// far below the budget and never trigger backpressure.
+#[derive(Debug)]
+pub struct LargeRecords {
+    schema: TypedSchema,
+    count: usize,
+    bytes: usize,
+}
+
+impl LargeRecords {
+    pub fn new(count: usize, bytes: usize) -> Self {
+        Self {
+            schema: TypedSchema {
+                name: "bench.large.v1".into(),
+                version: SchemaVersion(1),
+            },
+            count,
+            bytes,
+        }
+    }
+}
+
+impl TypedRecords for LargeRecords {
+    fn record_count(&self) -> usize {
+        self.count
+    }
+    fn estimated_bytes(&self) -> usize {
+        self.bytes
+    }
+    fn schema(&self) -> &TypedSchema {
+        &self.schema
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+/// Decoder that emits one `DecodedBatch` whose
+/// `estimated_bytes` is the configured value. Mirrors the
+/// runtime test's `large_records::LargeDecoder`.
+pub struct LargeDecoder {
+    pub bytes_per_batch: usize,
+}
+
+impl Decoder for LargeDecoder {
+    fn accepts(&self, _envelope: &MetadataEnvelope) -> bool {
+        true
+    }
+
+    fn decode(
+        &self,
+        batch: opendata_ingest_runtime::source::SourceBatch,
+    ) -> RuntimeResult<Vec<DecodedBatch>> {
+        let entry_count = batch.entries.len();
+        let source = batch.source.clone();
+        let sequence = batch.sequence;
+        let source_columns = SourceCoordinateColumns {
+            manifest_path: batch.manifest_path.clone(),
+            data_path: batch.data_object_path.clone(),
+            sequences: vec![sequence; entry_count],
+            entry_indices: (0..entry_count as u32).collect(),
+            record_indices: vec![0; entry_count],
+            ingestion_time_ms: batch.entries.iter().map(|e| e.ingestion_time_ms).collect(),
+        };
+        Ok(vec![DecodedBatch {
+            source,
+            low_sequence: sequence,
+            high_sequence: sequence,
+            source_entry_count: entry_count as u32,
+            records: DecodedRecords::Typed(Arc::new(LargeRecords::new(
+                entry_count,
+                self.bytes_per_batch,
+            ))),
+            source_columns,
+            stats: BatchStats {
+                source_byte_count: 0,
+                decoded_byte_estimate: self.bytes_per_batch as u64,
+            },
+            schema_version: SchemaVersion(1),
+        }])
+    }
+}
+
 /// Permissive decoder that emits one `DecodedBatch` per
 /// `SourceBatch`. The bench scenarios drive small synthetic
 /// payloads; correctness checks don't depend on schema shape.

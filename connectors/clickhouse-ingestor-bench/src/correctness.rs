@@ -26,7 +26,8 @@ use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
 use crate::fixtures::{
-    BenchSink, CommitObserver, FakeDecoder, ScriptedWrite, in_memory_fixture, produce_n_batches,
+    BenchSink, CommitObserver, FakeDecoder, LargeDecoder, ScriptedWrite, in_memory_fixture,
+    produce_n_batches,
 };
 use crate::output::{
     AckInvariantCheck, CorrectnessReport, ExperimentMeta, PerSourceCorrectness, RunMetadata,
@@ -760,16 +761,17 @@ async fn run_sink_outage_backpressure_bounded(
     produce_n_batches(&fx.producer, batch_count).await;
 
     let sink = BenchSink::new(SINK_LABEL);
-    // 1.5 s outage on seq=5 — enough for upstream stages to
-    // backpressure against the per-source byte budget without
-    // dragging the smoke run.
-    sink.set_latency_fn(Arc::new(|seq: u64| {
-        if seq == 5 {
-            Some(Duration::from_millis(1500))
-        } else {
-            None
-        }
-    }));
+    // Deterministic gating on seq=5 (was 1.5 s latency in the
+    // prior revision). The latency-based outage could complete
+    // BEFORE the byte budget saturated under a fast scheduler,
+    // and the `peak <= bound` assertion would trivially hold
+    // without exercising the backpressure path. Explicit block
+    // holds seq=5 until the test confirms backpressure has
+    // engaged. 20 ms latency on every other write so admission
+    // saturation lasts long enough for the 1 ms poller to
+    // capture the peak.
+    let release_seq_5 = sink.set_per_sequence_block(5);
+    sink.set_latency_fn(Arc::new(|_seq: u64| Some(Duration::from_millis(20))));
 
     let mut opts = pipelined_options(2);
     // Tight byte budget so the bound assertion has teeth.
@@ -791,10 +793,18 @@ async fn run_sink_outage_backpressure_bounded(
         + bp.decode_concurrency as u64
             * (bp.oversize_fault_multiplier as u64 - 1)
             * bp.estimated_max_batch_bytes;
+    let max_inflight_bytes = bp.max_inflight_bytes;
 
     let runtime = Runtime::builder()
         .add_source(fx.source)
-        .add_decoder(FakeDecoder)
+        // LargeDecoder so the post-decode bytes match the
+        // pessimistic admission size — otherwise `FakeDecoder`'s
+        // ~16 bytes/record reconciles the reservation way down
+        // and the budget never saturates, hiding the
+        // backpressure path.
+        .add_decoder(LargeDecoder {
+            bytes_per_batch: bp.estimated_max_batch_bytes as usize,
+        })
         .set_sink(sink)
         .with_options(opts)
         .build()
@@ -809,25 +819,59 @@ async fn run_sink_outage_backpressure_bounded(
     let started = std::time::Instant::now();
     let samples = Arc::new(Mutex::new(Vec::<SinkOutageSample>::new()));
     let samples_poller = Arc::clone(&samples);
+    let peak = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let peak_poller = Arc::clone(&peak);
     let budget_poller = Arc::clone(&budget);
     let poller_stop = CancellationToken::new();
     let poller_stop_inner = poller_stop.clone();
+    // 1 ms sampling — 50 ms was too coarse to catch the
+    // peak window when the in-memory sink resolves writes in
+    // microseconds.
     let poller_handle = tokio::spawn(async move {
         loop {
             tokio::select! {
                 biased;
                 _ = poller_stop_inner.cancelled() => return,
-                _ = tokio::time::sleep(Duration::from_millis(50)) => {
+                _ = tokio::time::sleep(Duration::from_millis(1)) => {
+                    let now = budget_poller.in_flight();
                     samples_poller.lock().unwrap().push(SinkOutageSample {
                         elapsed_ms: started.elapsed().as_millis(),
-                        budget_in_flight_bytes: budget_poller.in_flight(),
+                        budget_in_flight_bytes: now,
                     });
+                    let prev = peak_poller.load(std::sync::atomic::Ordering::SeqCst);
+                    if now > prev {
+                        peak_poller.store(now, std::sync::atomic::Ordering::SeqCst);
+                    }
                 }
             }
         }
     });
 
-    timeout(Duration::from_secs(30), async {
+    // Strict: wait for the peak to reach `max_inflight_bytes`
+    // before releasing seq=5. Without this the assertion peak
+    // <= bound trivially holds when backpressure never engaged
+    // (e.g. all writes complete in source order before the
+    // budget fills). This is the bench equivalent of the
+    // hardening that landed in
+    // `pipeline_slow_sink_injection_caps_inflight_bytes_and_recovers`.
+    timeout(Duration::from_secs(15), async {
+        loop {
+            if peak.load(std::sync::atomic::Ordering::SeqCst) >= max_inflight_bytes {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect(
+        "backpressure must engage while seq=5 is held: peak in-flight \
+         should reach max_inflight_bytes",
+    );
+
+    // Release seq=5 and wait for full drain.
+    release_seq_5.cancel();
+
+    timeout(Duration::from_secs(15), async {
         loop {
             progress_rx
                 .changed()
@@ -839,7 +883,7 @@ async fn run_sink_outage_backpressure_bounded(
         }
     })
     .await
-    .expect("scenario should recover and drain");
+    .expect("scenario should recover and drain after release");
 
     shutdown.cancel();
     handle.await.expect("join").expect("clean exit");
@@ -847,17 +891,20 @@ async fn run_sink_outage_backpressure_bounded(
     let _ = poller_handle.await;
 
     let samples_vec = samples.lock().unwrap().clone();
-    let peak = samples_vec
-        .iter()
-        .map(|s| s.budget_in_flight_bytes)
-        .max()
-        .unwrap_or(0);
+    let peak_in_flight = peak.load(std::sync::atomic::Ordering::SeqCst);
     for s in &samples_vec {
         witness.write_event(s).map_err(io_err)?;
     }
     witness.close().map_err(io_err)?;
 
-    let passed = peak <= bound;
+    // Strict invariant set:
+    //   1. peak <= bound (INV-BACKPRESSURE-BOUNDED-MEMORY)
+    //   2. peak >= max_inflight_bytes (backpressure DID engage)
+    //   3. final budget.in_flight() == 0 (no leaked reservations)
+    let bound_ok = peak_in_flight <= bound;
+    let engaged = peak_in_flight >= max_inflight_bytes;
+    let drained = budget.in_flight() == 0;
+    let passed = bound_ok && engaged && drained;
 
     let evidence = relative_evidence(&witness_path);
     let check = AckInvariantCheck {
