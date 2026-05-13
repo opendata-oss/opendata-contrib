@@ -12,32 +12,24 @@
 //! token's graceful-drain semantics.
 //!
 //! ```text
-//!   actor    fetch pool (N)              decode pool (M)              sink writer
-//!   ─────    ──────────────              ───────────────              ───────────
+//!   actor       fetch pool (N)         decode pool (M)         writer pool (W)
+//!   ─────       ──────────────         ───────────────         ───────────────
 //!   admit ─▶ [desc rx MPMC] ──▶ N tasks ─▶ [fetched rx MPMC] ──▶ M tasks
 //!                                                              ─▶ reconcile bytes
-//!                                                              ─▶ [SinkCommit rx] ─▶ 1 task
-//!                                                                                  ─▶ write_with_retry
-//!   actor ◀────────────────────────[WriteCompletion mpsc]───────────────────────────
+//!                                                              ─▶ [SinkCommit rx MPMC] ─▶ W tasks
+//!                                                                                       ─▶ write_with_retry
+//!   actor ◀────────────────────────────[WriteCompletion mpsc]─────────────────────────────
 //! ```
 //!
 //! The actor owns `&mut BufferSource` and `&mut AckCoordinator`;
 //! admission and completion both run as `select!` arms on the same
 //! task, so `register_pending` (admission arm) and
 //! `mark_committed` / `advance_frontier` / `ack_through` /
-//! `flush_acks` (completion arm) need no `Arc<Mutex<_>>`. The
-//! channels are 1-element-deep `async_channel::bounded` (descriptor
-//! side) and `tokio::sync::mpsc` (completion side, single
-//! consumer).
-//!
-//! Why two channels and a separate worker instead of an inline body?
-//! 6.2 will replace the single internal worker with N fetch workers
-//! that share a bounded MPMC descriptor channel; 6.3 layers M decode
-//! workers; 6.4 lifts the sink write into a shared writer pool. The
-//! actor's `select!` shape and its `register_pending`-before-send
-//! contract carry through unchanged. Landing the scaffolding here
-//! lets the Phase 5 test matrix flush out the topology before
-//! parallelism arrives.
+//! `flush_acks` (completion arm) need no `Arc<Mutex<_>>`. All four
+//! channels are `async_channel::bounded` (MPMC; cloneable
+//! receivers fan into the worker pools) sized to
+//! `source_defaults.max_inflight_batches`; the completion channel
+//! is `tokio::sync::mpsc` since the actor is its sole consumer.
 //!
 //! Invariants pinned in this row:
 //!
@@ -554,8 +546,14 @@ impl Runtime {
 
         // W writer workers — share `sink_commit_rx` MPMC. Each runs
         // `write_with_retry` and emits `WriteCompletion` back to
-        // the actor. On a non-recoverable error, the worker cancels
-        // `hard_abort_token` so peers exit promptly.
+        // the actor. On a non-recoverable error the worker sends
+        // `WriteCompletion::Fatal(e)` to the actor with the typed
+        // `RuntimeError` and exits; the supervisor cancels
+        // `hard_abort_token` after the actor returns `Err(...)` so
+        // peer workers unwind via their `select!` arms (worker-driven
+        // cancel would race the completion send and turn a typed
+        // `RuntimeError::Sink(...)` into a generic
+        // `Pipeline("hard abort …")`).
         let mut writer_handles = Vec::with_capacity(writer_pool_size);
         for worker_idx in 0..writer_pool_size {
             writer_handles.push(tokio::spawn(writer_worker(
@@ -1432,11 +1430,18 @@ async fn decode_one(
 // support arrives.
 //
 // Each worker:
-// - runs `write_with_retry` against the configured sink
+// - runs `write_with_retry` against the configured sink (the retry
+//   loop wraps `sink.write` / `sink.check_committed` / the
+//   inter-attempt sleep in `select!` against `hard_abort_token` so
+//   a peer worker's Fatal unwinds this one promptly)
 // - emits `WriteCompletion::Committed` on success, threading the
 //   range + rows_written back to the per-source actor
-// - on retry-budget exhaustion / Fatal, cancels
-//   `hard_abort_token` so peer workers + the actor unwind
+// - on retry-budget exhaustion / Fatal, sends
+//   `WriteCompletion::Fatal(e)` with the typed `RuntimeError` so
+//   the actor's completion arm surfaces the original error
+//   (the supervisor cancels `hard_abort_token` after the actor
+//   returns `Err(...)`, which is what wakes peer workers parked
+//   on slow I/O)
 //   immediately
 // - emits `runtime_sink_commits_total{source,sink,result}` per
 //   outcome; samples `runtime_sink_queue_depth{sink}` pre-recv
