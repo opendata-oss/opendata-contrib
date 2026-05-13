@@ -1869,6 +1869,18 @@ async fn writer_worker(
 
         drop(reservation);
         drop(batch_permit);
+        // Re-emit the sink-side gauge AFTER the reservation
+        // dropped — without this, the gauge keeps the last
+        // non-zero value the writer set when the envelope
+        // arrived, and post-drain snapshots read stale state.
+        // The post-drop read of `stage_bytes.sink_dispatch` is
+        // the now-decremented total (the reservation's Drop
+        // updated the atomic before this line ran).
+        metrics::gauge!(
+            crate::metrics::SINK_INFLIGHT_BYTES,
+            "sink" => sink_label.clone(),
+        )
+        .set(stage_bytes.sink_dispatch.load(Ordering::SeqCst) as f64);
     }
 }
 

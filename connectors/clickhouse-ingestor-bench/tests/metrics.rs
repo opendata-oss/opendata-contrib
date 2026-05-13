@@ -266,6 +266,33 @@ async fn process_recorder_captures_all_named_series_after_10_batches() {
         "descriptors_handed_out_total for source={source_label} \
          should equal the 10 produced batches; saw {descriptors_total:?}",
     );
+
+    // Review fix-up MEDIUM: after the pipeline fully drains, the
+    // sink-inflight gauge must read zero. Previously the writer
+    // worker only set the gauge when an envelope arrived, leaving
+    // the last non-zero value sticky in the snapshot — a
+    // post-drain reader would see stale data. The writer now
+    // re-emits the gauge after every reservation drop; the
+    // process-final value reads the post-drain
+    // `stage_bytes.sink_dispatch` (which is 0).
+    let sink_inflight_final: Option<f64> = snapshot_vec
+        .iter()
+        .find(|(k, _, _, _)| {
+            k.key().name() == runtime_metrics::SINK_INFLIGHT_BYTES
+                && k.key()
+                    .labels()
+                    .any(|l| l.key() == "sink" && l.value() == "metrics-bench-sink-named-series")
+        })
+        .and_then(|(_, _, _, value)| match value {
+            DebugValue::Gauge(g) => Some(g.into_inner()),
+            _ => None,
+        });
+    assert_eq!(
+        sink_inflight_final,
+        Some(0.0),
+        "runtime_sink_inflight_bytes{{sink=metrics-bench-sink-named-series}} \
+         must read 0 after the pipeline drains; saw {sink_inflight_final:?}",
+    );
 }
 
 /// §1.4 / §1.2 sanity: forcing a sink-side retry produces a
