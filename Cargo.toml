@@ -28,7 +28,7 @@ futures = { version = "0.3", features = ["std"] }
 hex = "0.4"
 metrics = "0.24"
 metrics-exporter-prometheus = "0.16"
-metrics-util = "0.19"
+metrics-util = "0.20"
 opentelemetry-proto = { version = "0.28", default-features = false, features = ["logs", "metrics", "trace", "gen-tonic-messages"] }
 prost = "0.13"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }

@@ -1953,7 +1953,13 @@ async fn write_with_retry(
                                 outcome: SinkCommitOutcome::FailedRetryable,
                             };
                         }
-                        if !sleep_with_abort(backoff, hard_abort_token).await {
+                        let slept = with_backpressure_timer(
+                            source_id,
+                            crate::metrics::BackpressureReason::Retrying,
+                            sleep_with_abort(backoff, hard_abort_token),
+                        )
+                        .await;
+                        if !slept {
                             return WriteAttempt {
                                 inner: Err(RuntimeError::Pipeline(
                                     "hard abort during retry sleep".into(),
