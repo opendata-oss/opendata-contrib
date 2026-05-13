@@ -123,6 +123,7 @@ struct IdempotentReplayEvent {
     attempt_index: usize,
 }
 
+#[allow(dead_code)] // Used by the deferred multi-source scenario; see run_smoke comment.
 #[derive(Debug, Serialize)]
 struct SourceIsolationEvent {
     source: String,
@@ -163,8 +164,22 @@ pub async fn run_smoke(run_dir: &Path) -> RuntimeResult<CorrectnessReport> {
         run_maybe_committed_replay_idempotent(&raw_dir, summary_records_per_source).await?;
     checks.push(check);
 
-    let (check, _) = run_multi_source_ack_isolation(&raw_dir, summary_records_per_source).await?;
-    checks.push(check);
+    // `multi_source_ack_isolation` is the fifth named check in
+    // `benchmarks.md` §correctness.json, but the runtime is
+    // single-source today (multi-source `RuntimeBuilder`
+    // promotion is §2 "future consideration" per
+    // `next-session.md`). Running the check against a single
+    // source would degenerate to self-consistency and report
+    // `passed: true` without actually exercising the
+    // multi-source invariant — which is what the post-review
+    // LOW finding flagged. Omitting the check in Phase 6 keeps
+    // the artifact honest: only invariants actually exercised
+    // are reported. Phase 10 (multi-source single-sink e2e)
+    // wires the scenario into `run_smoke` once the runtime
+    // gains `Vec<BufferSource>` support. The
+    // `run_multi_source_ack_isolation` function and
+    // `CheckName::MultiSourceAckIsolation` variant stay defined
+    // so that landing is a drop-in re-add, not a re-port.
 
     let (check, _) =
         run_sink_outage_backpressure_bounded(&raw_dir, summary_records_per_source).await?;
@@ -629,8 +644,14 @@ async fn run_maybe_committed_replay_idempotent(
 
 // =========================================================================
 // Scenario 4: `multi_source_ack_isolation`
+//
+// Deferred — single-source runtime today. Kept defined so the
+// Phase 10 multi-source landing is a drop-in re-add, not a
+// re-port. The `#[allow(dead_code)]` suppresses the
+// unused-function warning until `run_smoke` calls it again.
 // =========================================================================
 
+#[allow(dead_code)]
 async fn run_multi_source_ack_isolation(
     raw_dir: &Path,
     batch_count: u64,
