@@ -127,6 +127,13 @@ pub struct CapturedWrite {
 /// `type_complexity` lint.
 pub type LatencyFn = Arc<dyn Fn(u64) -> Option<Duration> + Send + Sync>;
 
+/// Callback fired AFTER the sink resolves a write to `Ok(...)`.
+/// Receives the committed sequence. Used by the bench harness's
+/// `no_ack_before_sink_commit` scenario to push a SinkCommitOk
+/// event onto the same shared ordered log the runtime's
+/// `AckThroughObserver` pushes Ack events to.
+pub type CommitObserver = Arc<dyn Fn(u64) + Send + Sync>;
+
 /// Sink used by the bench's correctness scenarios. Records every
 /// `write` call (so a scenario can assert byte-identical identity
 /// across retries), supports per-sequence latency injection (so a
@@ -149,6 +156,11 @@ pub struct BenchSink {
     /// Per-sequence latency. The sink sleeps `latency_fn(seq)`
     /// (if `Some(d)`) before consulting the script.
     latency_fn: Arc<Mutex<Option<LatencyFn>>>,
+    /// Optional callback fired AFTER a write resolves to `Ok`. The
+    /// scenarios that care about temporal ordering (`no_ack_before_sink_commit`)
+    /// install one that pushes a SinkCommitOk event onto a shared
+    /// ordered log.
+    commit_observer: Arc<Mutex<Option<CommitObserver>>>,
     /// Every successful `write` call's identity, in call order.
     pub write_calls: Arc<Mutex<Vec<CapturedWrite>>>,
     check_committed_response: Arc<Mutex<CommitStatus>>,
@@ -161,6 +173,7 @@ impl BenchSink {
             default_response: Arc::new(Mutex::new(ScriptedWrite::Ok { rows_written: 1 })),
             per_sequence_script: Arc::new(Mutex::new(std::collections::HashMap::new())),
             latency_fn: Arc::new(Mutex::new(None)),
+            commit_observer: Arc::new(Mutex::new(None)),
             write_calls: Arc::new(Mutex::new(Vec::new())),
             check_committed_response: Arc::new(Mutex::new(CommitStatus::Unknown)),
         }
@@ -179,6 +192,17 @@ impl BenchSink {
 
     pub fn set_latency_fn(&self, f: LatencyFn) {
         *self.latency_fn.lock().unwrap() = Some(f);
+    }
+
+    /// Install a callback fired after each successful `write`
+    /// (i.e. one that resolves to `Ok(SinkCommitResult)`). The
+    /// callback fires synchronously with the sink's response
+    /// before the writer worker emits `WriteCompletion::Committed`
+    /// upstream, so events pushed here are temporally ordered
+    /// before the matching ack — that's the property the
+    /// `no_ack_before_sink_commit` scenario relies on.
+    pub fn set_commit_observer(&self, f: CommitObserver) {
+        *self.commit_observer.lock().unwrap() = Some(f);
     }
 
     pub fn set_check_committed_response(&self, r: CommitStatus) {
@@ -219,10 +243,22 @@ impl Sink for BenchSink {
             tokio::time::sleep(d).await;
         }
         match self.next_response(seq) {
-            ScriptedWrite::Ok { rows_written } => Ok(SinkCommitResult {
-                bytes_written: 0,
-                rows_written,
-            }),
+            ScriptedWrite::Ok { rows_written } => {
+                // Fire the post-Ok observer SYNCHRONOUSLY with the
+                // sink's response so the event lands in the shared
+                // log before the writer worker emits the
+                // `WriteCompletion::Committed` (which in turn
+                // triggers `ack_through`) — proving the temporal
+                // ordering required by INV-NO-ACK-BEFORE-COMMIT.
+                let observer = self.commit_observer.lock().unwrap().clone();
+                if let Some(cb) = observer {
+                    cb(seq);
+                }
+                Ok(SinkCommitResult {
+                    bytes_written: 0,
+                    rows_written,
+                })
+            }
             ScriptedWrite::MaybeCommitted { message } => {
                 Err(SinkCommitFailure::MaybeCommitted(message.into()))
             }

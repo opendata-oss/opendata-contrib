@@ -199,6 +199,23 @@ pub type AdmissionRecorder = Arc<std::sync::Mutex<Vec<(SourceId, u64)>>>;
 /// Plain `pub` for the same reason as [`AdmissionRecorder`].
 pub type AckThroughRecorder = Arc<std::sync::Mutex<Vec<u64>>>;
 
+/// Test instrumentation: callback fired immediately before the
+/// per-source actor calls [`BufferSource::ack_through(f)`]. Lets
+/// a test push the ack event onto a shared ordered event log
+/// alongside sink-side commit events emitted by a programmable
+/// sink — the resulting interleaved log proves the temporal
+/// invariant `INV-NO-ACK-BEFORE-COMMIT` (every `ack_through(f)`
+/// is preceded in the log by `sink_commit_ok(s)` for every
+/// `s ∈ [low..=f]`).
+///
+/// The §1.3c [`AckThroughRecorder`] is sufficient for the
+/// monotonicity / final-value checks, but cannot pin the temporal
+/// relationship to sink commits because it doesn't observe sink-
+/// side events. The bench harness's
+/// `no_ack_before_sink_commit` scenario uses an observer that
+/// pushes onto the same `Arc<Mutex<Vec<_>>>` the sink writes to.
+pub type AckThroughObserver = Arc<dyn Fn(u64) + Send + Sync>;
+
 /// Test instrumentation: inject artificial latency at the fetch
 /// stage so a test can stress the actor's admission ordering under
 /// uneven fetch completion times (row 6.2 §Test Plan
@@ -525,6 +542,7 @@ pub struct Runtime {
     source_byte_budget: Arc<SourceByteBudget>,
     admission_recorder: Option<AdmissionRecorder>,
     ack_through_recorder: Option<AckThroughRecorder>,
+    ack_through_observer: Option<AckThroughObserver>,
     test_fetch_delay: Option<TestFetchDelayFn>,
     test_fetch_killswitch: Option<TestFetchKillswitch>,
 }
@@ -536,6 +554,7 @@ pub struct RuntimeBuilder {
     options: RuntimeOptions,
     admission_recorder: Option<AdmissionRecorder>,
     ack_through_recorder: Option<AckThroughRecorder>,
+    ack_through_observer: Option<AckThroughObserver>,
     test_fetch_delay: Option<TestFetchDelayFn>,
     test_fetch_killswitch: Option<TestFetchKillswitch>,
 }
@@ -549,6 +568,7 @@ impl Runtime {
             options: RuntimeOptions::default(),
             admission_recorder: None,
             ack_through_recorder: None,
+            ack_through_observer: None,
             test_fetch_delay: None,
             test_fetch_killswitch: None,
         }
@@ -589,6 +609,7 @@ impl Runtime {
             source_byte_budget,
             admission_recorder,
             ack_through_recorder,
+            ack_through_observer,
             test_fetch_delay,
             test_fetch_killswitch,
         } = self;
@@ -719,6 +740,7 @@ impl Runtime {
             progress_tx.clone(),
             admission_recorder,
             ack_through_recorder,
+            ack_through_observer,
             stage_bytes.clone(),
         )
         .await;
@@ -855,6 +877,17 @@ impl RuntimeBuilder {
         self
     }
 
+    /// Attach a test-only [`AckThroughObserver`] callback. Invoked
+    /// synchronously immediately before each
+    /// [`BufferSource::ack_through(f)`] call. Use when a test needs
+    /// to record the ack event onto a shared ordered log
+    /// alongside sink-side events (the bench harness's
+    /// `no_ack_before_sink_commit` scenario does exactly this).
+    pub fn with_ack_through_observer(mut self, observer: AckThroughObserver) -> Self {
+        self.ack_through_observer = Some(observer);
+        self
+    }
+
     /// Attach a test-only [`TestFetchDelayFn`]. Each fetch worker
     /// sleeps for `delay(descriptor.sequence)` before invoking the
     /// underlying `BufferSourceFetchHandle::fetch`. Used to stress
@@ -920,6 +953,7 @@ impl RuntimeBuilder {
             source_byte_budget,
             admission_recorder: self.admission_recorder,
             ack_through_recorder: self.ack_through_recorder,
+            ack_through_observer: self.ack_through_observer,
             test_fetch_delay: self.test_fetch_delay,
             test_fetch_killswitch: self.test_fetch_killswitch,
         })
@@ -987,6 +1021,7 @@ async fn per_source_actor(
     progress_tx: watch::Sender<RuntimeProgress>,
     admission_recorder: Option<AdmissionRecorder>,
     ack_through_recorder: Option<AckThroughRecorder>,
+    ack_through_observer: Option<AckThroughObserver>,
     stage_bytes: StageInflightBytes,
 ) -> RuntimeResult<()> {
     let source_id = source.id().clone();
@@ -1075,9 +1110,21 @@ async fn per_source_actor(
                                 // exactly the same sequence of
                                 // values the source observes —
                                 // strictly monotonic by the
-                                // `f > prev` guard above.
+                                // `f > prev` guard above. The
+                                // observer callback fires at the
+                                // same point — used by the bench
+                                // harness to push onto a shared
+                                // ordered event log alongside sink
+                                // commit events (pins
+                                // INV-NO-ACK-BEFORE-COMMIT
+                                // temporally rather than via the
+                                // looser "all writes ever
+                                // happened" property).
                                 if let Some(recorder) = ack_through_recorder.as_ref() {
                                     recorder.lock().unwrap().push(f);
+                                }
+                                if let Some(observer) = ack_through_observer.as_ref() {
+                                    observer(f);
                                 }
                                 source.ack_through(f).await?;
                                 last_ack_sent = Some(f);

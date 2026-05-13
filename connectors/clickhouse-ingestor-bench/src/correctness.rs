@@ -18,15 +18,15 @@ use std::time::Duration;
 use opendata_ingest_runtime::envelope::{ConfiguredEnvelope, PayloadEncoding, SignalType};
 use opendata_ingest_runtime::error::RuntimeResult;
 use opendata_ingest_runtime::runtime::{
-    AckFlushPolicy, AckThroughRecorder, AdmissionRecorder, Runtime, RuntimeOptions,
-    SinkPoolOptions, SourceBackpressureOptions,
+    AckFlushPolicy, AckThroughObserver, AckThroughRecorder, AdmissionRecorder, Runtime,
+    RuntimeOptions, SinkPoolOptions, SourceBackpressureOptions,
 };
 use serde::Serialize;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
 use crate::fixtures::{
-    BenchSink, FakeDecoder, ScriptedWrite, in_memory_fixture, produce_n_batches,
+    BenchSink, CommitObserver, FakeDecoder, ScriptedWrite, in_memory_fixture, produce_n_batches,
 };
 use crate::output::{
     AckInvariantCheck, CorrectnessReport, ExperimentMeta, PerSourceCorrectness, RunMetadata,
@@ -90,11 +90,25 @@ fn pipelined_options(fetch_concurrency: u32) -> RuntimeOptions {
     }
 }
 
-#[derive(Debug, Serialize)]
-struct AckEvent {
-    seq: u64,
-    sources_written_to_sink: Vec<u64>,
+/// Shared ordered event log used by the temporal
+/// `no_ack_before_sink_commit` check. BenchSink pushes a
+/// `SinkCommitOk` event synchronously after each successful `Ok`
+/// response; the runtime's `AckThroughObserver` pushes an
+/// `AckThrough` event synchronously before each `ack_through(f)`
+/// call. The Mutex serializes pushes — the in-Vec order matches
+/// the runtime's actual temporal order (commit happens-before
+/// the completion send, which happens-before the actor's
+/// ack_through). The validator walks the Vec in order and asserts
+/// every Ack(f) was preceded by SinkCommitOk(s) for every
+/// s ∈ [0..=f].
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum CorrectnessEvent {
+    SinkCommitOk { sequence: u64 },
+    AckThrough { frontier: u64 },
 }
+
+type CorrectnessEventLog = Arc<Mutex<Vec<CorrectnessEvent>>>;
 
 #[derive(Debug, Serialize)]
 struct FrontierTransition {
@@ -231,18 +245,41 @@ async fn run_no_ack_before_sink_commit(
     .await;
     produce_n_batches(&fx.producer, batch_count).await;
 
-    let sink = BenchSink::new(SINK_LABEL);
-    let writes = Arc::clone(&sink.write_calls);
+    // Shared ordered event log. BenchSink pushes a SinkCommitOk
+    // event synchronously after each Ok response; the runtime's
+    // AckThroughObserver pushes an AckThrough event synchronously
+    // before each ack_through call. The Mutex serializes pushes
+    // and the in-Vec order matches the runtime's actual temporal
+    // order (sink commits happens-before the completion send,
+    // which happens-before the actor's ack_through). Used to pin
+    // INV-NO-ACK-BEFORE-COMMIT *temporally*, not via the looser
+    // "all writes ever happened" check the prior revision did.
+    let event_log: CorrectnessEventLog = Arc::new(Mutex::new(Vec::new()));
 
-    let ack_recorder: AckThroughRecorder = Arc::new(Mutex::new(Vec::new()));
-    let ack_runtime = Arc::clone(&ack_recorder);
+    let sink = BenchSink::new(SINK_LABEL);
+    let sink_log = Arc::clone(&event_log);
+    let commit_observer: CommitObserver = Arc::new(move |seq: u64| {
+        sink_log
+            .lock()
+            .unwrap()
+            .push(CorrectnessEvent::SinkCommitOk { sequence: seq });
+    });
+    sink.set_commit_observer(commit_observer);
+
+    let actor_log = Arc::clone(&event_log);
+    let ack_observer: AckThroughObserver = Arc::new(move |f: u64| {
+        actor_log
+            .lock()
+            .unwrap()
+            .push(CorrectnessEvent::AckThrough { frontier: f });
+    });
 
     let runtime = Runtime::builder()
         .add_source(fx.source)
         .add_decoder(FakeDecoder)
         .set_sink(sink)
         .with_options(pipelined_options(2))
-        .with_ack_through_recorder(ack_runtime)
+        .with_ack_through_observer(ack_observer)
         .build()
         .expect("build");
     let mut progress_rx = runtime.progress();
@@ -268,44 +305,44 @@ async fn run_no_ack_before_sink_commit(
     shutdown.cancel();
     handle.await.expect("join").expect("clean exit");
 
-    let writes_seen: Vec<u64> = writes
-        .lock()
-        .unwrap()
-        .iter()
-        .map(|w| w.identity.range.high)
-        .collect();
-    let acks = ack_recorder.lock().unwrap().clone();
-
-    // Witness: one event per ack_through call, with the cumulative
-    // set of sequences the sink had already written by that point.
-    // The scenario passes if every ack's `seq` is contained in the
-    // cumulative write set when the ack fires; structurally the
-    // bench checks the looser "every seq ≤ ack must have been
-    // written" property at the end (acks fire in completion order
-    // so by-call cumulative containment is implied).
-    let mut all_writes: std::collections::HashSet<u64> = std::collections::HashSet::new();
-    for w in writes.lock().unwrap().iter() {
-        all_writes.insert(w.identity.range.high);
-    }
-    for ack in &acks {
-        witness
-            .write_event(&AckEvent {
-                seq: *ack,
-                sources_written_to_sink: writes_seen.clone(),
-            })
-            .map_err(io_err)?;
+    let events = event_log.lock().unwrap().clone();
+    for event in &events {
+        witness.write_event(event).map_err(io_err)?;
     }
     witness.close().map_err(io_err)?;
 
-    let mut passed = !acks.is_empty();
-    for ack in &acks {
-        for s in 0..=*ack {
-            if !all_writes.contains(&s) {
-                passed = false;
-                break;
+    // INV-NO-ACK-BEFORE-COMMIT temporal validator: walk the log
+    // in order; track the set of sequences with a SinkCommitOk
+    // event seen so far; on each AckThrough(f), assert every
+    // s ∈ [0..=f] is in the committed set. A broken runtime
+    // (acking before the sink commit lands) would fail here.
+    let mut committed: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    let mut highest_ack: Option<u64> = None;
+    let mut violation: Option<String> = None;
+    for event in &events {
+        match event {
+            CorrectnessEvent::SinkCommitOk { sequence } => {
+                committed.insert(*sequence);
+            }
+            CorrectnessEvent::AckThrough { frontier } => {
+                for s in 0..=*frontier {
+                    if !committed.contains(&s) {
+                        violation = Some(format!(
+                            "ack_through({frontier}) preceded by no SinkCommitOk({s})"
+                        ));
+                        break;
+                    }
+                }
+                if violation.is_some() {
+                    break;
+                }
+                highest_ack = Some(*frontier);
             }
         }
     }
+    let saw_ack = highest_ack.is_some();
+    let saw_terminal_ack = highest_ack == Some(batch_count - 1);
+    let passed = violation.is_none() && saw_ack && saw_terminal_ack;
 
     let evidence = relative_evidence(&witness_path);
     let check = AckInvariantCheck {
@@ -313,7 +350,7 @@ async fn run_no_ack_before_sink_commit(
         passed,
         evidence,
     };
-    let per_source = per_source_summary(batch_count, batch_count - 1, acks.last().copied());
+    let per_source = per_source_summary(batch_count, batch_count - 1, highest_ack);
     Ok((check, per_source))
 }
 
