@@ -113,6 +113,27 @@ pub type AdmissionRecorder = Arc<std::sync::Mutex<Vec<(SourceId, u64)>>>;
 /// `BufferSourceFetchHandle::fetch`. Not used in production.
 pub type TestFetchDelayFn = Arc<dyn Fn(u64) -> Duration + Send + Sync>;
 
+/// Test instrumentation: ungracefully unwind every fetch worker
+/// without going through the supervisor's `hard_abort_token`. When
+/// the token is cancelled, each fetch worker's `select!` fires the
+/// killswitch arm at its next descriptor-recv suspension point,
+/// returns `Ok(())`, and drops its `descriptor_rx` clone. With
+/// `fetch_concurrency = 1`, the channel then has zero receivers and
+/// the actor's next `descriptor_tx.send` fails — that's the
+/// `pipeline_dropped_descriptor_send_halts_runtime` (§1.3a) path
+/// that pins INV-DESCRIPTOR-LOSS-FATAL.
+///
+/// Distinct from `hard_abort_token` because the killswitch leaves
+/// the actor and writer-pool tasks untouched — they only see the
+/// failure mode the test is trying to provoke (a closed descriptor
+/// channel), not a generic hard-abort cascade.
+///
+/// Plain `pub` for the same reason as
+/// [`AdmissionRecorder`] / [`TestFetchDelayFn`]: integration tests
+/// link the runtime as an external crate where `#[cfg(test)]`
+/// items are invisible.
+pub type TestFetchKillswitch = CancellationToken;
+
 // =========================================================================
 // Public configuration types
 // =========================================================================
@@ -409,6 +430,7 @@ pub struct Runtime {
     source_byte_budget: Arc<SourceByteBudget>,
     admission_recorder: Option<AdmissionRecorder>,
     test_fetch_delay: Option<TestFetchDelayFn>,
+    test_fetch_killswitch: Option<TestFetchKillswitch>,
 }
 
 pub struct RuntimeBuilder {
@@ -418,6 +440,7 @@ pub struct RuntimeBuilder {
     options: RuntimeOptions,
     admission_recorder: Option<AdmissionRecorder>,
     test_fetch_delay: Option<TestFetchDelayFn>,
+    test_fetch_killswitch: Option<TestFetchKillswitch>,
 }
 
 impl Runtime {
@@ -429,6 +452,7 @@ impl Runtime {
             options: RuntimeOptions::default(),
             admission_recorder: None,
             test_fetch_delay: None,
+            test_fetch_killswitch: None,
         }
     }
 
@@ -467,6 +491,7 @@ impl Runtime {
             source_byte_budget,
             admission_recorder,
             test_fetch_delay,
+            test_fetch_killswitch,
         } = self;
 
         info!(
@@ -517,6 +542,7 @@ impl Runtime {
                 source_id.clone(),
                 worker_idx,
                 test_fetch_delay.clone(),
+                test_fetch_killswitch.clone(),
                 hard_abort_token.clone(),
             )));
         }
@@ -714,6 +740,20 @@ impl RuntimeBuilder {
         self
     }
 
+    /// Attach a test-only [`TestFetchKillswitch`]. When the token is
+    /// cancelled, every fetch worker observes it at its next
+    /// `descriptor_rx.recv` suspension point, returns `Ok(())`, and
+    /// drops its `descriptor_rx` clone. With `fetch_concurrency = 1`,
+    /// the descriptor channel then has zero receivers and the actor's
+    /// next admission send fails — that's the
+    /// `pipeline_dropped_descriptor_send_halts_runtime` (§1.3a) shape
+    /// that pins INV-DESCRIPTOR-LOSS-FATAL without a `#[cfg(test)]`
+    /// fetch-worker variant.
+    pub fn with_test_fetch_killswitch(mut self, killswitch: TestFetchKillswitch) -> Self {
+        self.test_fetch_killswitch = Some(killswitch);
+        self
+    }
+
     pub fn build(self) -> RuntimeResult<Runtime> {
         let source = self
             .source
@@ -756,6 +796,7 @@ impl RuntimeBuilder {
             source_byte_budget,
             admission_recorder: self.admission_recorder,
             test_fetch_delay: self.test_fetch_delay,
+            test_fetch_killswitch: self.test_fetch_killswitch,
         })
     }
 }
@@ -1083,6 +1124,7 @@ async fn fetch_worker(
     source_id: SourceId,
     worker_idx: usize,
     test_fetch_delay: Option<TestFetchDelayFn>,
+    test_fetch_killswitch: Option<TestFetchKillswitch>,
     hard_abort_token: CancellationToken,
 ) -> RuntimeResult<()> {
     let source_label = source_id.0.clone();
@@ -1097,6 +1139,20 @@ async fn fetch_worker(
         let admitted = tokio::select! {
             biased;
             _ = hard_abort_token.cancelled() => return Ok(()),
+            // Test-only killswitch (§1.3a). In production
+            // `test_fetch_killswitch` is `None` and the arm parks
+            // forever (`std::future::pending`), never preempting
+            // the recv. When `Some(token)`, cancelling the token
+            // unwinds this worker without going through the
+            // supervisor's hard_abort_token — the actor and writer
+            // pool stay live and observe the descriptor-channel
+            // closure as the failure mode.
+            _ = async {
+                match test_fetch_killswitch.as_ref() {
+                    Some(token) => token.cancelled().await,
+                    None => std::future::pending::<()>().await,
+                }
+            } => return Ok(()),
             recv = descriptor_rx.recv() => match recv {
                 Ok(a) => a,
                 Err(_) => return Ok(()), // descriptor channel closed; graceful exit

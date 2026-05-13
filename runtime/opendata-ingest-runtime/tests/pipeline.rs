@@ -17,7 +17,7 @@ use bytes::Bytes;
 use opendata_ingest_runtime::envelope::{ConfiguredEnvelope, PayloadEncoding, SignalType};
 use opendata_ingest_runtime::runtime::{
     AckFlushPolicy, AdmissionRecorder, Runtime, RuntimeOptions, SinkPoolOptions,
-    SourceBackpressureOptions,
+    SourceBackpressureOptions, TestFetchKillswitch,
 };
 use opendata_ingest_runtime::source::SourceId;
 use tokio::time::timeout;
@@ -884,6 +884,148 @@ mod hard_abort_sink {
             Ok::<CommitStatus, RuntimeError>(CommitStatus::Unknown)
         }
     }
+}
+
+/// §1.3a closeout: INV-DESCRIPTOR-LOSS-FATAL.
+///
+/// When the actor's admission arm calls `descriptor_tx.send` and
+/// every fetch worker has dropped its `descriptor_rx` clone, the
+/// channel is closed and `send` returns `Err`. The actor must
+/// surface this as `RuntimeError::Pipeline("descriptor lost: ...")`
+/// rather than hang or swallow the failure.
+///
+/// Setup:
+/// - Produce 8 batches.
+/// - `fetch_concurrency = 1`, `max_inflight_batches = 4`, gated
+///   `ProgrammableSink` (writes parked).
+/// - The actor admits the first 4 sequences synchronously while
+///   the sink is gated; in-flight = 4 = max so admission then
+///   parks on the budget.
+/// - Test trips `TestFetchKillswitch`: the single fetch worker's
+///   `select!` fires the killswitch arm, returns `Ok(())`, and
+///   drops the only `descriptor_rx` clone.
+/// - Test releases the sink. Completions drain; admission unparks
+///   and tries to admit seq=4; `descriptor_tx.send` returns Err
+///   (channel closed); the actor halts with the typed Pipeline
+///   error.
+///
+/// The killswitch is the test-only path that avoids introducing a
+/// `#[cfg(test)]` fetch-worker variant — production code never
+/// supplies one, the worker's `select!` arm parks on
+/// `std::future::pending` in that case (no behavior change).
+#[tokio::test]
+async fn pipeline_dropped_descriptor_send_halts_runtime() {
+    use opendata_ingest_runtime::error::RuntimeError;
+    use opendata_ingest_runtime::sink::{CommitStatus, SinkId};
+    use support::{ProgrammableSink, ScriptedWrite};
+
+    let fx = in_memory_buffer_source(
+        "ingest/test/pipeline/dropped-descriptor/manifest",
+        "ingest/test/pipeline/dropped-descriptor/data",
+    )
+    .await;
+    let batch_count = 8u64;
+    for i in 0..batch_count {
+        fx.producer
+            .produce(
+                vec![Bytes::from(format!("payload-{i}").into_bytes())],
+                logs_envelope(),
+            )
+            .await
+            .expect("produce");
+        fx.producer.flush().await.expect("flush");
+    }
+
+    let sink = ProgrammableSink::new(
+        SinkId::from("programmable"),
+        (0..batch_count)
+            .map(|_| ScriptedWrite::Ok { rows_written: 1 })
+            .collect(),
+        CommitStatus::Unknown,
+    );
+    let gate = sink.block_until_released(true);
+
+    let killswitch: TestFetchKillswitch = TestFetchKillswitch::new();
+    let killswitch_runtime = killswitch.clone();
+    let recorder: AdmissionRecorder = Arc::new(Mutex::new(Vec::new()));
+    let recorder_runtime = Arc::clone(&recorder);
+
+    let mut opts = options_with_fetch_concurrency(1);
+    opts.source_defaults = SourceBackpressureOptions {
+        max_inflight_batches: 4,
+        fetch_concurrency: 1,
+        decode_concurrency: 1,
+        ..SourceBackpressureOptions::default()
+    };
+    opts.sink = SinkPoolOptions {
+        max_concurrent_commits: 4,
+        retry_max_attempts: 0,
+        retry_initial_backoff_ms: 0,
+    };
+
+    let runtime = Runtime::builder()
+        .add_source(fx.source)
+        .add_decoder(FakeDecoder::permissive())
+        .set_sink(sink)
+        .with_options(opts)
+        .with_admission_recorder(recorder_runtime)
+        .with_test_fetch_killswitch(killswitch_runtime)
+        .build()
+        .expect("build");
+
+    let shutdown = CancellationToken::new();
+    let shutdown_run = shutdown.clone();
+    let handle = tokio::spawn(async move { runtime.run(shutdown_run).await });
+
+    // Wait until in-flight hits the max (4) — fetch worker has
+    // drained the descriptor channel into the parked sink writes
+    // and is now parked on `descriptor_rx.recv` with the channel
+    // empty.
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if recorder.lock().unwrap().len() >= 4 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("4 admissions while sink gated");
+
+    // Trip the killswitch. The fetch worker's select! fires the
+    // killswitch arm at its next suspension (already parked on
+    // recv) and exits, dropping its descriptor_rx clone.
+    killswitch.cancel();
+
+    // Give the scheduler a moment to run the fetch worker to its
+    // killswitch-arm exit BEFORE we release the sink. Without this
+    // step the actor could observe a sink completion, attempt to
+    // admit seq=4, and succeed (the channel still has a live
+    // receiver) — that's not the failure mode under test.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Release the gated sink writes. Completions drain into the
+    // actor; in_flight decrements; admission unblocks and tries to
+    // admit seq=4 — descriptor_tx.send fails (zero receivers).
+    drop(gate);
+
+    let join = timeout(Duration::from_secs(5), handle)
+        .await
+        .expect("runtime must halt within 5s after killswitch + sink release")
+        .expect("runtime task join");
+    let err = join.expect_err("runtime must return Pipeline(descriptor lost)");
+    let msg = format!("{err}");
+    assert!(
+        matches!(err, RuntimeError::Pipeline(_)),
+        "expected RuntimeError::Pipeline, got {err:?}: {msg}",
+    );
+    assert!(
+        msg.contains("descriptor lost"),
+        "expected descriptor-lost message, got: {msg}",
+    );
+
+    let _ = shutdown;
+    fx.producer.close().await.expect("close");
 }
 
 /// HIGH finding: hard abort must propagate through parked workers.
