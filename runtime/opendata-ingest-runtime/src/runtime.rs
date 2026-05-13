@@ -280,6 +280,31 @@ impl RuntimeOptions {
             .copied()
             .unwrap_or(self.source_defaults)
     }
+
+    /// Resolved per-`SinkCommit` retry budget. `sink.retry_max_attempts`
+    /// shadows the legacy `max_retry_attempts` when set to a
+    /// non-default value (phase06 design §SinkPoolOptions); the
+    /// legacy field stays for backwards compatibility with Phase 5
+    /// fixtures that constructed `RuntimeOptions` field-by-field.
+    pub fn effective_retry_max_attempts(&self) -> u32 {
+        let default_sink_attempts = SinkPoolOptions::default().retry_max_attempts;
+        if self.sink.retry_max_attempts != default_sink_attempts {
+            self.sink.retry_max_attempts
+        } else {
+            self.max_retry_attempts
+        }
+    }
+
+    /// Resolved per-`SinkCommit` retry backoff. Same shadowing rules
+    /// as [`effective_retry_max_attempts`](Self::effective_retry_max_attempts).
+    pub fn effective_retry_backoff(&self) -> Duration {
+        let default_sink_backoff_ms = SinkPoolOptions::default().retry_initial_backoff_ms;
+        if self.sink.retry_initial_backoff_ms != default_sink_backoff_ms {
+            Duration::from_millis(self.sink.retry_initial_backoff_ms)
+        } else {
+            self.retry_backoff
+        }
+    }
 }
 
 /// Counters published via the watch channel for tests/metrics.
@@ -1014,13 +1039,18 @@ async fn fetch_worker(
 
         if let Some(delay_fn) = test_fetch_delay.as_ref() {
             let delay = delay_fn(admitted_sequence);
-            if !delay.is_zero() {
-                tokio::time::sleep(delay).await;
+            if !delay.is_zero() && !sleep_with_abort(delay, &hard_abort_token).await {
+                return Ok(());
             }
         }
 
         let stage_start = std::time::Instant::now();
-        let source_batch = match fetch_handle.fetch(descriptor).await {
+        let fetch_result = tokio::select! {
+            biased;
+            _ = hard_abort_token.cancelled() => return Ok(()),
+            r = fetch_handle.fetch(descriptor) => r,
+        };
+        let source_batch = match fetch_result {
             Ok(b) => b,
             Err(e) => {
                 warn!(
@@ -1129,16 +1159,19 @@ async fn decode_worker(
         } = fetched;
 
         let stage_start = std::time::Instant::now();
-        let outcome = decode_one(
-            &decoder,
-            &options,
-            &sink_id,
-            source_batch,
-            admitted_sequence,
-            &bp,
-            &mut reservation,
-        )
-        .await;
+        let outcome = tokio::select! {
+            biased;
+            _ = hard_abort_token.cancelled() => return Ok(()),
+            r = decode_one(
+                &decoder,
+                &options,
+                &sink_id,
+                source_batch,
+                admitted_sequence,
+                &bp,
+                &mut reservation,
+            ) => r,
+        };
         metrics::histogram!(
             crate::metrics::STAGE_LATENCY_SECONDS,
             "stage" => "decode",
@@ -1376,29 +1409,41 @@ async fn writer_worker(
         )
         .set(reservation.held() as f64);
         let stage_start = std::time::Instant::now();
-        let result = write_with_retry(&sink, commit, &options).await;
+        let attempt = write_with_retry(&sink, commit, &options, &hard_abort_token).await;
         metrics::histogram!(
             crate::metrics::STAGE_LATENCY_SECONDS,
             "stage" => "sink_dispatch",
             "source" => source_label.clone(),
         )
         .record(stage_start.elapsed().as_secs_f64());
+        metrics::counter!(
+            crate::metrics::SINK_COMMITS_TOTAL,
+            "source" => source_label.clone(),
+            "sink" => sink_label.clone(),
+            "result" => attempt.outcome.as_label(),
+        )
+        .increment(1);
 
-        match result {
-            Ok(commit_result) => {
-                metrics::counter!(
-                    crate::metrics::SINK_COMMITS_TOTAL,
-                    "source" => source_label.clone(),
-                    "sink" => sink_label.clone(),
-                    "result" => crate::metrics::SinkCommitOutcome::Committed.as_label(),
-                )
-                .increment(1);
+        match attempt.inner {
+            Ok(WriteSuccess::Committed { result }) => {
                 let msg = WriteCompletion::Committed(CommittedReport {
                     range,
-                    rows_written: commit_result.rows_written,
+                    rows_written: result.rows_written,
                 });
                 if completion_tx.send(msg).await.is_err() {
                     return Ok(()); // actor exited
+                }
+            }
+            Ok(WriteSuccess::VerifiedAlreadyCommitted) => {
+                // Range is durably written but no fresh row count.
+                // Report zero so progress.records_written doesn't
+                // double-count on replay.
+                let msg = WriteCompletion::Committed(CommittedReport {
+                    range,
+                    rows_written: 0,
+                });
+                if completion_tx.send(msg).await.is_err() {
+                    return Ok(());
                 }
             }
             Err(e) => {
@@ -1406,22 +1451,15 @@ async fn writer_worker(
                     error = %e,
                     source = %source_id,
                     worker = worker_idx,
+                    outcome = ?attempt.outcome,
                     "writer worker fatal",
                 );
-                metrics::counter!(
-                    crate::metrics::SINK_COMMITS_TOTAL,
-                    "source" => source_label.clone(),
-                    "sink" => sink_label.clone(),
-                    "result" => crate::metrics::SinkCommitOutcome::FailedFatal.as_label(),
-                )
-                .increment(1);
-                // Send the original error to the actor first so the
-                // completion arm sees the typed `RuntimeError::Sink`
-                // (etc.) rather than a generic `Pipeline("hard abort
-                // …")` from the abort arm racing the completion send.
-                // The supervisor cancels `hard_abort_token` after the
-                // actor exits with `Err(...)`, which is what tears
-                // peer workers down.
+                // Send the typed error to the actor first so the
+                // completion arm sees the original `RuntimeError`
+                // variant (not a `Pipeline("hard abort …")` from a
+                // racing abort branch). Supervisor cancels
+                // `hard_abort_token` after the actor exits with
+                // `Err(...)`, which is what tears peer workers down.
                 let _ = completion_tx.send(WriteCompletion::Fatal(e)).await;
                 return Ok(());
             }
@@ -1447,45 +1485,143 @@ fn build_commit(
     SinkCommit { identity, batch }
 }
 
+/// Outcome of a write_with_retry call. Carries the metric label
+/// the writer worker should emit alongside the inner result, so
+/// `verified_already_committed` and `failed_retryable` distinguish
+/// themselves from `committed` / `failed_fatal` in
+/// `runtime_sink_commits_total`.
+struct WriteAttempt {
+    inner: RuntimeResult<WriteSuccess>,
+    outcome: crate::metrics::SinkCommitOutcome,
+}
+
+enum WriteSuccess {
+    /// Sink wrote the commit on this attempt. Carries the
+    /// authoritative row count.
+    Committed { result: SinkCommitResult },
+    /// MaybeCommitted resolved to Committed via `check_committed`;
+    /// the range is durably written but we don't have a fresh
+    /// `SinkCommitResult`. Returns a zero-row result so
+    /// `progress.records_written` doesn't double-count on replay.
+    VerifiedAlreadyCommitted,
+}
+
 async fn write_with_retry(
     sink: &Arc<dyn Sink>,
     commit: SinkCommit,
     options: &RuntimeOptions,
-) -> RuntimeResult<SinkCommitResult> {
+    hard_abort_token: &CancellationToken,
+) -> WriteAttempt {
+    use crate::metrics::SinkCommitOutcome;
     let mut attempt = 0u32;
+    let max_attempts = options.effective_retry_max_attempts();
+    let backoff = options.effective_retry_backoff();
     loop {
-        match sink.write(commit.clone()).await {
-            Ok(result) => return Ok(result),
-            Err(SinkCommitFailure::Fatal(e)) => return Err(RuntimeError::Sink(e)),
+        // sink.write awaits are wrapped in select! against the
+        // abort token so a fatal from a peer worker unwinds this
+        // worker promptly — without this, a parked sink call (or a
+        // long retry sleep) would keep the worker alive past the
+        // supervisor's `hard_abort_token.cancel()`.
+        let write_result = tokio::select! {
+            biased;
+            _ = hard_abort_token.cancelled() => {
+                return WriteAttempt {
+                    inner: Err(RuntimeError::Pipeline(
+                        "hard abort during Sink::write".into(),
+                    )),
+                    outcome: SinkCommitOutcome::FailedFatal,
+                };
+            }
+            r = sink.write(commit.clone()) => r,
+        };
+        match write_result {
+            Ok(result) => {
+                return WriteAttempt {
+                    inner: Ok(WriteSuccess::Committed { result }),
+                    outcome: SinkCommitOutcome::Committed,
+                };
+            }
+            Err(SinkCommitFailure::Fatal(e)) => {
+                return WriteAttempt {
+                    inner: Err(RuntimeError::Sink(e)),
+                    outcome: SinkCommitOutcome::FailedFatal,
+                };
+            }
             Err(SinkCommitFailure::NotCommitted(e)) => {
-                if attempt >= options.max_retry_attempts {
-                    return Err(RuntimeError::Sink(e));
+                if attempt >= max_attempts {
+                    return WriteAttempt {
+                        inner: Err(RuntimeError::Sink(e)),
+                        outcome: SinkCommitOutcome::FailedRetryable,
+                    };
                 }
-                tokio::time::sleep(options.retry_backoff).await;
+                if !sleep_with_abort(backoff, hard_abort_token).await {
+                    return WriteAttempt {
+                        inner: Err(RuntimeError::Pipeline(
+                            "hard abort during retry sleep".into(),
+                        )),
+                        outcome: SinkCommitOutcome::FailedFatal,
+                    };
+                }
                 attempt = attempt.saturating_add(1);
             }
             Err(SinkCommitFailure::MaybeCommitted(e)) => {
-                match sink.check_committed(&commit.identity).await? {
-                    CommitStatus::Committed => {
-                        // The sink confirmed an earlier attempt
-                        // committed; we don't get a fresh
-                        // SinkCommitResult, but the range is durably
-                        // written. Return a zero-row result so the
-                        // runtime's progress.records_written doesn't
-                        // double-count an already-acked range on
-                        // replay.
-                        return Ok(SinkCommitResult::default());
+                let check = tokio::select! {
+                    biased;
+                    _ = hard_abort_token.cancelled() => {
+                        return WriteAttempt {
+                            inner: Err(RuntimeError::Pipeline(
+                                "hard abort during check_committed".into(),
+                            )),
+                            outcome: SinkCommitOutcome::FailedFatal,
+                        };
                     }
-                    CommitStatus::NotCommitted | CommitStatus::Unknown => {
-                        if attempt >= options.max_retry_attempts {
-                            return Err(RuntimeError::Sink(e));
+                    s = sink.check_committed(&commit.identity) => s,
+                };
+                match check {
+                    Ok(CommitStatus::Committed) => {
+                        return WriteAttempt {
+                            inner: Ok(WriteSuccess::VerifiedAlreadyCommitted),
+                            outcome: SinkCommitOutcome::VerifiedAlreadyCommitted,
+                        };
+                    }
+                    Ok(CommitStatus::NotCommitted) | Ok(CommitStatus::Unknown) => {
+                        if attempt >= max_attempts {
+                            return WriteAttempt {
+                                inner: Err(RuntimeError::Sink(e)),
+                                outcome: SinkCommitOutcome::FailedRetryable,
+                            };
                         }
-                        tokio::time::sleep(options.retry_backoff).await;
+                        if !sleep_with_abort(backoff, hard_abort_token).await {
+                            return WriteAttempt {
+                                inner: Err(RuntimeError::Pipeline(
+                                    "hard abort during retry sleep".into(),
+                                )),
+                                outcome: SinkCommitOutcome::FailedFatal,
+                            };
+                        }
                         attempt = attempt.saturating_add(1);
+                    }
+                    Err(check_err) => {
+                        // `check_committed` returned a runtime error of
+                        // its own (e.g. transport failure). Surface it.
+                        return WriteAttempt {
+                            inner: Err(check_err),
+                            outcome: SinkCommitOutcome::FailedFatal,
+                        };
                     }
                 }
             }
         }
+    }
+}
+
+/// Sleep `duration` or return early if `token` cancels. Returns
+/// `true` when the sleep ran to completion, `false` on abort.
+async fn sleep_with_abort(duration: Duration, token: &CancellationToken) -> bool {
+    tokio::select! {
+        biased;
+        _ = token.cancelled() => false,
+        _ = tokio::time::sleep(duration) => true,
     }
 }
 

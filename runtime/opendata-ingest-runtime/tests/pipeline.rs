@@ -808,3 +808,175 @@ async fn pipeline_decode_byte_reconciliation_grows_reservation() {
 
     fx.producer.close().await.expect("close producer");
 }
+
+mod hard_abort_sink {
+    use std::sync::Arc;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use async_trait::async_trait;
+    use opendata_ingest_runtime::error::{RuntimeError, RuntimeResult};
+    use opendata_ingest_runtime::identity::CommitIdentity;
+    use opendata_ingest_runtime::sink::{
+        CommitStatus, Sink, SinkBudget, SinkCommit, SinkCommitFailure, SinkCommitResult, SinkId,
+    };
+    use tokio::sync::Notify;
+
+    /// Custom sink for `pipeline_hard_abort_during_parked_sink_unwinds_pipeline`:
+    /// the write call for sequence 0 parks on a notify forever (until
+    /// the writer worker's `select!` against `hard_abort_token` drops
+    /// the future); every other sequence returns `Fatal` so a peer
+    /// worker triggers the abort path.
+    pub struct GatePeerSink {
+        pub id: SinkId,
+        pub parked_gate: Arc<Notify>,
+        pub parked_entry_count: Arc<AtomicUsize>,
+        pub write_calls: Arc<Mutex<Vec<u64>>>,
+    }
+
+    impl GatePeerSink {
+        pub fn new() -> Self {
+            Self {
+                id: SinkId::from("gate-peer"),
+                parked_gate: Arc::new(Notify::new()),
+                parked_entry_count: Arc::new(AtomicUsize::new(0)),
+                write_calls: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Sink for GatePeerSink {
+        fn id(&self) -> &SinkId {
+            &self.id
+        }
+        fn write_budget(&self) -> SinkBudget {
+            SinkBudget::default()
+        }
+        async fn write(&self, commit: SinkCommit) -> Result<SinkCommitResult, SinkCommitFailure> {
+            let seq = commit.identity.range.high;
+            self.write_calls.lock().unwrap().push(seq);
+            if seq == 0 {
+                // Park forever. The writer worker awaits this future
+                // wrapped in `select!` against the abort token; when
+                // the supervisor cancels, the select! drops this
+                // future and the sink call unwinds.
+                self.parked_entry_count.fetch_add(1, Ordering::SeqCst);
+                self.parked_gate.notified().await;
+                Err(SinkCommitFailure::NotCommitted(
+                    "should never reach here".into(),
+                ))
+            } else {
+                Err(SinkCommitFailure::Fatal(
+                    format!("test peer fatal on seq={seq}").into(),
+                ))
+            }
+        }
+        async fn check_committed(&self, _identity: &CommitIdentity) -> RuntimeResult<CommitStatus> {
+            Ok::<CommitStatus, RuntimeError>(CommitStatus::Unknown)
+        }
+    }
+}
+
+/// HIGH finding: hard abort must propagate through parked workers.
+///
+/// Two batches admitted; sink writes them under `W=4` writers. The
+/// custom `GatePeerSink::write(seq=0)` parks forever on a `Notify`;
+/// `write(seq=1)` returns `Fatal`. Peer worker B emits Fatal → actor
+/// returns `Err(RuntimeError::Sink)` → supervisor cancels
+/// `hard_abort_token` → worker A's parked `sink.write` future is
+/// dropped by the `select!` arm and unwinds within bounded time. The
+/// runtime must exit with the typed `Sink` error (not a generic
+/// `Pipeline("hard abort …")`) and the exit must happen quickly
+/// (under 2 seconds) — proving the parked worker doesn't block
+/// supervisor join.
+#[tokio::test]
+async fn pipeline_hard_abort_during_parked_sink_unwinds_pipeline() {
+    use hard_abort_sink::GatePeerSink;
+    use opendata_ingest_runtime::error::RuntimeError;
+
+    let fx = in_memory_buffer_source(
+        "ingest/test/pipeline/hard-abort/manifest",
+        "ingest/test/pipeline/hard-abort/data",
+    )
+    .await;
+    for i in 0..2u64 {
+        fx.producer
+            .produce(
+                vec![Bytes::from(format!("payload-{i}").into_bytes())],
+                logs_envelope(),
+            )
+            .await
+            .expect("produce");
+        fx.producer.flush().await.expect("flush");
+    }
+
+    let sink = GatePeerSink::new();
+    let parked_entry_count = Arc::clone(&sink.parked_entry_count);
+    let write_calls = Arc::clone(&sink.write_calls);
+
+    let mut opts = options_with_fetch_concurrency(2);
+    opts.source_defaults = SourceBackpressureOptions {
+        max_inflight_batches: 4,
+        fetch_concurrency: 2,
+        decode_concurrency: 2,
+        ..SourceBackpressureOptions::default()
+    };
+    opts.sink = SinkPoolOptions {
+        max_concurrent_commits: 4,
+        retry_max_attempts: 0,
+        retry_initial_backoff_ms: 0,
+    };
+
+    let runtime = Runtime::builder()
+        .add_source(fx.source)
+        .add_decoder(FakeDecoder::permissive())
+        .set_sink(sink)
+        .with_options(opts)
+        .build()
+        .expect("build");
+
+    let shutdown = CancellationToken::new();
+    let shutdown_run = shutdown.clone();
+    let start = std::time::Instant::now();
+    let handle = tokio::spawn(async move { runtime.run(shutdown_run).await });
+
+    // Wait until seq=0's write parks before declaring victory on the
+    // setup. Otherwise a fast Fatal could race the park.
+    let parked_wait_start = std::time::Instant::now();
+    while parked_entry_count.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+        if parked_wait_start.elapsed() > Duration::from_secs(2) {
+            panic!(
+                "seq=0 sink.write never entered the parked state; write_calls so far: {:?}",
+                write_calls.lock().unwrap()
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    // Now the parked worker is in `Sink::write(seq=0).await`. A peer
+    // worker should pick up seq=1 and return Fatal soon after; the
+    // supervisor cancels the abort token; the parked worker exits.
+    let join = timeout(Duration::from_secs(2), handle)
+        .await
+        .expect(
+            "runtime must exit within 2s despite the parked sink \
+             — proving hard_abort wakes the parked Sink::write",
+        )
+        .expect("runtime task join");
+    let elapsed = start.elapsed();
+
+    let err = join.expect_err("Fatal from peer must surface as runtime error");
+    assert!(
+        matches!(err, RuntimeError::Sink(_)),
+        "expected typed RuntimeError::Sink (the original Fatal), got {err:?} \
+         after {elapsed:?}",
+    );
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "runtime should exit promptly after Fatal; took {elapsed:?}",
+    );
+
+    let _ = shutdown;
+    fx.producer.close().await.expect("close producer");
+}

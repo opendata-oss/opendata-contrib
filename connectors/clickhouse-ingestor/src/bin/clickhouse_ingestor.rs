@@ -141,13 +141,29 @@ async fn main() -> Result<()> {
         max_descriptors_per_poll: 1,
         max_retry_attempts: cfg.runtime.retry_max_attempts,
         retry_backoff: std::time::Duration::from_millis(cfg.runtime.retry_initial_backoff_ms),
-        // Phase 6 row 6.1 wiring: keep the binary on the
-        // serial-equivalent profile until later rows turn on parallel
-        // fetch/decode/sink-writer workers and the config surface
-        // grows the matching knobs.
-        source_defaults: SourceBackpressureOptions::serial(),
+        // Phase 6 per-source backpressure knobs threaded from
+        // `IngestorConfig.runtime.*`. Defaults reproduce the
+        // library's pipelined profile (64/8/4 in-flight/fetch/decode);
+        // operators override via `INGESTOR__RUNTIME__*` env or YAML.
+        source_defaults: SourceBackpressureOptions {
+            max_inflight_batches: cfg.runtime.max_inflight_batches,
+            max_inflight_bytes: cfg.runtime.max_inflight_bytes,
+            estimated_max_batch_bytes: cfg.runtime.estimated_max_batch_bytes,
+            fetch_concurrency: cfg.runtime.fetch_concurrency,
+            decode_concurrency: cfg.runtime.decode_concurrency,
+            oversize_fault_multiplier: cfg.runtime.oversize_fault_multiplier,
+        },
         source_overrides: Default::default(),
-        sink: SinkPoolOptions::default(),
+        sink: SinkPoolOptions {
+            max_concurrent_commits: cfg.runtime.max_concurrent_commits,
+            // The sink-namespaced retry knobs shadow the legacy
+            // top-level fields per `RuntimeOptions::effective_retry_*`;
+            // mirror the operator's `retry_*` settings here so the
+            // resolved attempt count + backoff match what the YAML
+            // describes.
+            retry_max_attempts: cfg.runtime.retry_max_attempts,
+            retry_initial_backoff_ms: cfg.runtime.retry_initial_backoff_ms,
+        },
     };
     // Compile-time sanity check that the policy translation didn't
     // drift; not strictly necessary at runtime.

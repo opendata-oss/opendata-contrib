@@ -121,6 +121,29 @@ pub struct RuntimeSection {
     pub retry_initial_backoff_ms: u64,
     #[serde(default = "default_request_timeout_secs")]
     pub request_timeout_secs: u64,
+    /// Phase 6 per-source backpressure knobs. Defaults reproduce the
+    /// library's pipelined profile (`fetch_concurrency = 8`,
+    /// `decode_concurrency = 4`, `max_inflight_batches = 64`,
+    /// `max_inflight_bytes = 256 MiB`, `estimated_max_batch_bytes =
+    /// 4 MiB`, `oversize_fault_multiplier = 4`); an operator can
+    /// override per-deployment via `INGESTOR__RUNTIME__*` env or YAML.
+    /// See phase06 design §`SourceBackpressureOptions`.
+    #[serde(default = "default_max_inflight_batches")]
+    pub max_inflight_batches: u32,
+    #[serde(default = "default_max_inflight_bytes")]
+    pub max_inflight_bytes: u64,
+    #[serde(default = "default_estimated_max_batch_bytes")]
+    pub estimated_max_batch_bytes: u64,
+    #[serde(default = "default_fetch_concurrency")]
+    pub fetch_concurrency: u32,
+    #[serde(default = "default_decode_concurrency")]
+    pub decode_concurrency: u32,
+    #[serde(default = "default_oversize_fault_multiplier")]
+    pub oversize_fault_multiplier: u32,
+    /// Phase 6 shared-sink writer-pool sizing. Default reproduces
+    /// the library default (`max_concurrent_commits = 4`).
+    #[serde(default = "default_max_concurrent_commits")]
+    pub max_concurrent_commits: u32,
 }
 
 fn default_dry_run() -> bool {
@@ -137,6 +160,27 @@ fn default_retry_backoff_ms() -> u64 {
 }
 fn default_request_timeout_secs() -> u64 {
     30
+}
+fn default_max_inflight_batches() -> u32 {
+    64
+}
+fn default_max_inflight_bytes() -> u64 {
+    256 * 1024 * 1024
+}
+fn default_estimated_max_batch_bytes() -> u64 {
+    4 * 1024 * 1024
+}
+fn default_fetch_concurrency() -> u32 {
+    8
+}
+fn default_decode_concurrency() -> u32 {
+    4
+}
+fn default_oversize_fault_multiplier() -> u32 {
+    4
+}
+fn default_max_concurrent_commits() -> u32 {
+    4
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
