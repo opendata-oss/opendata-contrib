@@ -287,6 +287,17 @@ impl Drop for BlockToken {
     }
 }
 
+/// Closure returning an optional per-sequence sink latency.
+/// Returning `Some(d)` makes the sink sleep `d` before consulting
+/// the write script for that sequence; returning `None` (or not
+/// configuring one at all) leaves the write unsleeping. Used by
+/// `pipeline_runtime_level_out_of_order_completion_no_frontier_hole`
+/// and `pipeline_slow_sink_injection_caps_inflight_bytes_and_recovers`
+/// (§1.3b closeout) plus the eventual §1.1 bench harness's
+/// `sink_outage_backpressure_bounded` and
+/// `out_of_order_completion_no_frontier_hole` invariant checks.
+pub type SinkLatencyFn = Arc<dyn Fn(u64) -> Option<Duration> + Send + Sync>;
+
 #[derive(Clone)]
 pub struct ProgrammableSink {
     pub id: SinkId,
@@ -303,6 +314,7 @@ pub struct ProgrammableSink {
     gate_entered_count: Arc<AtomicUsize>,
     gate_active: Arc<Mutex<bool>>,
     gate_writes: Arc<Mutex<bool>>,
+    per_sequence_latency: Arc<Mutex<Option<SinkLatencyFn>>>,
 }
 
 impl ProgrammableSink {
@@ -322,7 +334,25 @@ impl ProgrammableSink {
             gate_entered_count: Arc::new(AtomicUsize::new(0)),
             gate_active: Arc::new(Mutex::new(false)),
             gate_writes: Arc::new(Mutex::new(false)),
+            per_sequence_latency: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Install a per-sequence latency closure. Each `write` call
+    /// computes `latency(commit.identity.range.high)` and, when the
+    /// returned `Option<Duration>` is `Some`, sleeps that long
+    /// **before** the gate-park / write-script consultation. Tests
+    /// that want different writes to complete in non-source order
+    /// configure asymmetric latencies (e.g., seq=0 → 200 ms, every
+    /// other seq → 0). The closure may be replaced (`set_…` is
+    /// idempotent); `None` removes the latency entirely.
+    pub fn set_per_sequence_latency(&self, latency: SinkLatencyFn) {
+        *self.per_sequence_latency.lock().unwrap() = Some(latency);
+    }
+
+    fn lookup_latency(&self, sequence: u64) -> Option<Duration> {
+        let guard = self.per_sequence_latency.lock().unwrap();
+        guard.as_ref().and_then(|f| f(sequence))
     }
 
     /// Replace the script atomically so one sink instance can be
@@ -417,6 +447,15 @@ impl Sink for ProgrammableSink {
             identity: commit.identity.to_string(),
             record_count,
         });
+
+        // Per-sequence latency runs BEFORE gate-park / script
+        // consultation so a slow-sequence test can stall a single
+        // write while peer writes flow through unaffected. The
+        // closure runs once per call; no clone of `self` is held
+        // across the await.
+        if let Some(latency) = self.lookup_latency(commit.identity.range.high) {
+            tokio::time::sleep(latency).await;
+        }
 
         self.maybe_park(true).await;
 

@@ -886,6 +886,351 @@ mod hard_abort_sink {
     }
 }
 
+/// §1.3b closeout: INV-FRONTIER-NEVER-OVER-HOLE under runtime-level
+/// out-of-order completion.
+///
+/// `ProgrammableSink::set_per_sequence_latency` makes seq=0 the
+/// slowest write (200 ms) while every other sequence completes
+/// immediately. With `max_concurrent_commits = 4`, one writer
+/// parks on seq=0 while peer writers run seqs 1..4 to completion.
+/// The coordinator's `mark_committed` records the peer
+/// completions as pending but `advance_frontier` cannot advance
+/// past the seq=0 hole, so `ack_through` is NOT called until
+/// seq=0's write returns. Once it does, `advance_frontier`
+/// collapses every contiguous pending range in one pass and
+/// `ack_through` fires exactly once with the highest committed
+/// sequence.
+///
+/// Structurally exercised today by
+/// `concurrent_50_batches_advance_frontier_under_writer_pool` in
+/// `tests/ack_correctness_concurrent.rs`, but that test pins the
+/// invariant via the AckCoordinator state-machine surface; this
+/// one observes it through the actor's `ack_through_recorder`
+/// hook so the pipeline-level emission timing is also pinned.
+#[tokio::test]
+async fn pipeline_runtime_level_out_of_order_completion_no_frontier_hole() {
+    use opendata_ingest_runtime::sink::{CommitStatus, SinkId};
+    use support::{ProgrammableSink, ScriptedWrite, SinkLatencyFn};
+
+    let fx = in_memory_buffer_source(
+        "ingest/test/pipeline/out-of-order-completion/manifest",
+        "ingest/test/pipeline/out-of-order-completion/data",
+    )
+    .await;
+    let batch_count = 8u64;
+    for i in 0..batch_count {
+        fx.producer
+            .produce(
+                vec![Bytes::from(format!("payload-{i}").into_bytes())],
+                logs_envelope(),
+            )
+            .await
+            .expect("produce");
+        fx.producer.flush().await.expect("flush");
+    }
+
+    let sink = ProgrammableSink::new(
+        SinkId::from("programmable"),
+        (0..batch_count)
+            .map(|_| ScriptedWrite::Ok { rows_written: 1 })
+            .collect(),
+        CommitStatus::Unknown,
+    );
+    // Asymmetric latency: seq=0 sleeps long enough that every
+    // peer write completes first under `W=4`. Without the
+    // imbalance the test reduces to in-order completion and the
+    // out-of-order path isn't exercised.
+    let latency_fn: SinkLatencyFn = Arc::new(|seq: u64| {
+        if seq == 0 {
+            Some(Duration::from_millis(200))
+        } else {
+            None
+        }
+    });
+    sink.set_per_sequence_latency(latency_fn);
+    let write_calls = Arc::clone(&sink.write_calls);
+
+    let ack_recorder: AckThroughRecorder = Arc::new(Mutex::new(Vec::new()));
+    let ack_runtime = Arc::clone(&ack_recorder);
+
+    let mut opts = options_with_fetch_concurrency(2);
+    opts.source_defaults = SourceBackpressureOptions {
+        max_inflight_batches: batch_count as u32,
+        fetch_concurrency: 2,
+        decode_concurrency: 2,
+        ..SourceBackpressureOptions::default()
+    };
+    opts.sink = SinkPoolOptions {
+        max_concurrent_commits: 4,
+        retry_max_attempts: 0,
+        retry_initial_backoff_ms: 0,
+    };
+
+    let runtime = Runtime::builder()
+        .add_source(fx.source)
+        .add_decoder(FakeDecoder::permissive())
+        .set_sink(sink)
+        .with_options(opts)
+        .with_ack_through_recorder(ack_runtime)
+        .build()
+        .expect("build");
+    let mut progress_rx = runtime.progress();
+
+    let shutdown = CancellationToken::new();
+    let shutdown_run = shutdown.clone();
+    let handle = tokio::spawn(async move { runtime.run(shutdown_run).await });
+
+    timeout(Duration::from_secs(10), async {
+        loop {
+            progress_rx
+                .changed()
+                .await
+                .expect("progress channel closed");
+            if progress_rx.borrow().last_acked_sequence == Some(batch_count - 1) {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("runtime should drain after seq=0 finally completes");
+
+    shutdown.cancel();
+    handle
+        .await
+        .expect("runtime task join")
+        .expect("runtime exited cleanly");
+
+    // Sanity: every sequence reached the sink exactly once. Writes
+    // arrive in completion-order (peer writes first, seq=0 last),
+    // so sort for the range check.
+    let mut writes = write_calls.lock().unwrap().clone();
+    writes.sort_by_key(|w| w.high_sequence);
+    assert_eq!(
+        writes.len(),
+        batch_count as usize,
+        "every admitted unit must produce exactly one Sink::write",
+    );
+    for (i, w) in writes.iter().enumerate() {
+        assert_eq!(w.high_sequence, i as u64);
+    }
+
+    // INV-FRONTIER-NEVER-OVER-HOLE: the recorder must NOT contain
+    // any value before seq=0 commits. With W=4 writers and seq=0
+    // the slow one, peer completions for seq=1..7 land first; the
+    // actor marks them committed but `advance_frontier` cannot
+    // cross the seq=0 hole, so `ack_through` is skipped. Only
+    // when seq=0 commits does the coordinator collapse the run.
+    let recorded = ack_recorder.lock().unwrap().clone();
+    assert!(
+        !recorded.is_empty(),
+        "ack_through must fire at least once after seq=0 commits",
+    );
+    for window in recorded.windows(2) {
+        let (prev, next) = (window[0], window[1]);
+        assert!(
+            next > prev,
+            "recorder must be strictly monotonic: saw {prev} \
+             followed by {next} in {recorded:?}",
+        );
+    }
+    assert_eq!(
+        recorded.last().copied(),
+        Some(batch_count - 1),
+        "final ack_through reaches the highest committed sequence",
+    );
+
+    fx.producer.close().await.expect("close");
+}
+
+/// §1.3b closeout: INV-BACKPRESSURE-BOUNDED-MEMORY under sink
+/// outage.
+///
+/// One sequence in the middle of a stream injects a long sink
+/// latency (1500 ms). Peer writes flow through the pool, the
+/// pipeline backpressures admission against the per-source byte
+/// budget, and `budget.in_flight()` never exceeds the bound
+/// pinned by the design:
+///
+///   max_inflight_bytes
+///     + decode_concurrency × (oversize_fault_multiplier - 1)
+///       × estimated_max_batch_bytes
+///
+/// Once the slow write returns the pipeline resumes; the durable
+/// ack frontier reaches the highest produced sequence.
+#[tokio::test]
+async fn pipeline_slow_sink_injection_caps_inflight_bytes_and_recovers() {
+    use large_records::LargeDecoder;
+    use opendata_ingest_runtime::sink::{CommitStatus, SinkId};
+    use support::{ProgrammableSink, ScriptedWrite, SinkLatencyFn};
+
+    let fx = in_memory_buffer_source(
+        "ingest/test/pipeline/slow-sink-injection/manifest",
+        "ingest/test/pipeline/slow-sink-injection/data",
+    )
+    .await;
+    let batch_count = 12u64;
+    for i in 0..batch_count {
+        fx.producer
+            .produce(
+                vec![Bytes::from(format!("payload-{i}").into_bytes())],
+                logs_envelope(),
+            )
+            .await
+            .expect("produce");
+        fx.producer.flush().await.expect("flush");
+    }
+
+    let sink = ProgrammableSink::new(
+        SinkId::from("programmable"),
+        (0..batch_count)
+            .map(|_| ScriptedWrite::Ok { rows_written: 1 })
+            .collect(),
+        CommitStatus::Unknown,
+    );
+    // Long stall on a single mid-stream sequence — peer writes
+    // flow normally so backpressure has to come from upstream
+    // stages (admission budget, decode reservation), not from
+    // sink-pool capacity.
+    let latency_fn: SinkLatencyFn = Arc::new(|seq: u64| {
+        if seq == 4 {
+            Some(Duration::from_millis(1500))
+        } else {
+            None
+        }
+    });
+    sink.set_per_sequence_latency(latency_fn);
+    let write_calls = Arc::clone(&sink.write_calls);
+
+    // Tight byte budget so the bound assertion has teeth. Each
+    // batch reports 8 KiB post-decode; admission reserves 8 KiB
+    // pessimistically; max_inflight_bytes = 32 KiB caps 4 in-
+    // flight (matches max_inflight_batches).
+    let pessimistic: u64 = 8 * 1024;
+    let decoded_bytes: usize = 8 * 1024;
+    let max_inflight_bytes: u64 = 32 * 1024;
+    let max_inflight_batches: u32 = 4;
+    let decode_concurrency: u32 = 2;
+    let oversize_fault_multiplier: u32 = 4;
+    // Design bound (§3 / phase06 §Algorithms > Per-Source Decode
+    // Workers): peak in-flight bytes per source ≤
+    //   max_inflight_bytes
+    //   + decode_concurrency × (oversize_fault_multiplier - 1)
+    //     × estimated_max_batch_bytes
+    let bound: u64 = max_inflight_bytes
+        + decode_concurrency as u64 * (oversize_fault_multiplier as u64 - 1) * pessimistic;
+
+    let mut opts = options_with_fetch_concurrency(2);
+    opts.source_defaults = SourceBackpressureOptions {
+        max_inflight_batches,
+        max_inflight_bytes,
+        estimated_max_batch_bytes: pessimistic,
+        fetch_concurrency: 2,
+        decode_concurrency,
+        oversize_fault_multiplier,
+    };
+    opts.sink = SinkPoolOptions {
+        max_concurrent_commits: 4,
+        retry_max_attempts: 0,
+        retry_initial_backoff_ms: 0,
+    };
+
+    let runtime = Runtime::builder()
+        .add_source(fx.source)
+        .add_decoder(LargeDecoder {
+            bytes_per_batch: decoded_bytes,
+        })
+        .set_sink(sink)
+        .with_options(opts)
+        .build()
+        .expect("build");
+    let budget = runtime.source_byte_budget();
+    let mut progress_rx = runtime.progress();
+
+    let shutdown = CancellationToken::new();
+    let shutdown_run = shutdown.clone();
+    let handle = tokio::spawn(async move { runtime.run(shutdown_run).await });
+
+    // Spawn a poller that samples `budget.in_flight()` every 10 ms
+    // throughout the run. Peak is the maximum sample observed
+    // before the actor exits.
+    let peak = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let peak_poller = Arc::clone(&peak);
+    let budget_poller = Arc::clone(&budget);
+    let poller_stop = CancellationToken::new();
+    let poller_stop_inner = poller_stop.clone();
+    let poller = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                biased;
+                _ = poller_stop_inner.cancelled() => return,
+                _ = tokio::time::sleep(Duration::from_millis(10)) => {
+                    let now = budget_poller.in_flight();
+                    let prev = peak_poller.load(std::sync::atomic::Ordering::SeqCst);
+                    if now > prev {
+                        peak_poller.store(now, std::sync::atomic::Ordering::SeqCst);
+                    }
+                }
+            }
+        }
+    });
+
+    // Wait for full drain — frontier must reach the highest
+    // sequence even though seq=4 took 1.5 s.
+    timeout(Duration::from_secs(10), async {
+        loop {
+            progress_rx
+                .changed()
+                .await
+                .expect("progress channel closed");
+            if progress_rx.borrow().last_acked_sequence == Some(batch_count - 1) {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("runtime should recover and drain after slow seq=4 completes");
+
+    shutdown.cancel();
+    handle
+        .await
+        .expect("runtime task join")
+        .expect("runtime exited cleanly");
+    poller_stop.cancel();
+    let _ = poller.await;
+
+    let peak_in_flight = peak.load(std::sync::atomic::Ordering::SeqCst);
+    assert!(
+        peak_in_flight <= bound,
+        "INV-BACKPRESSURE-BOUNDED-MEMORY: peak in_flight ({}) must \
+         not exceed the design bound ({}) — \
+         max_inflight_bytes={} + decode_concurrency={} × \
+         (oversize_fault_multiplier={} - 1) × \
+         estimated_max_batch_bytes={}",
+        peak_in_flight,
+        bound,
+        max_inflight_bytes,
+        decode_concurrency,
+        oversize_fault_multiplier,
+        pessimistic,
+    );
+
+    // Sanity: every sequence reached the sink and the final
+    // reservation drained back to zero (no leaked permits).
+    let writes = write_calls.lock().unwrap().clone();
+    assert_eq!(
+        writes.len(),
+        batch_count as usize,
+        "every admitted unit must produce exactly one Sink::write",
+    );
+    assert_eq!(
+        budget.in_flight(),
+        0,
+        "byte budget must drain to zero after final completion",
+    );
+
+    fx.producer.close().await.expect("close");
+}
+
 /// §1.3c closeout: INV-ACK-CALLED-ON-ADVANCE.
 ///
 /// The per-source actor's completion arm guards `source.ack_through(f)`
