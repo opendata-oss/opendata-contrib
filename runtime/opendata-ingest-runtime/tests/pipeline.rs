@@ -16,8 +16,8 @@ use std::time::Duration;
 use bytes::Bytes;
 use opendata_ingest_runtime::envelope::{ConfiguredEnvelope, PayloadEncoding, SignalType};
 use opendata_ingest_runtime::runtime::{
-    AckFlushPolicy, AdmissionRecorder, Runtime, RuntimeOptions, SinkPoolOptions,
-    SourceBackpressureOptions, TestFetchKillswitch,
+    AckFlushPolicy, AckThroughRecorder, AdmissionRecorder, Runtime, RuntimeOptions,
+    SinkPoolOptions, SourceBackpressureOptions, TestFetchKillswitch,
 };
 use opendata_ingest_runtime::source::SourceId;
 use tokio::time::timeout;
@@ -884,6 +884,165 @@ mod hard_abort_sink {
             Ok::<CommitStatus, RuntimeError>(CommitStatus::Unknown)
         }
     }
+}
+
+/// §1.3c closeout: INV-ACK-CALLED-ON-ADVANCE.
+///
+/// The per-source actor's completion arm guards `source.ack_through(f)`
+/// behind `f > last_ack_sent`, so out-of-order completions that
+/// arrive but don't advance the coordinator's frontier MUST NOT
+/// produce a redundant `ack_through` call (the buffer-side
+/// `Consumer::ack_through` is durable-immediate per RFC 0003;
+/// invoking it for a non-advancing frontier would re-fence the
+/// manifest for no reason).
+///
+/// Setup:
+/// - Produce 20 batches.
+/// - `fetch_concurrency = 4`, `decode_concurrency = 4`,
+///   `max_inflight_batches = 20`, `max_concurrent_commits = 4`.
+/// - `ProgrammableSink` returns Ok for every write but is gated by
+///   `block_until_released(true)`; the test releases the gate
+///   after all 20 admissions land, so 4 writer workers race to
+///   send their completions to the actor's single-consumer mpsc.
+///   That contention forces some completions to arrive out of
+///   source order — those non-advancing arrivals exercise the
+///   `should_ack == false` branch.
+///
+/// Assertions:
+/// - `recorded` is strictly monotonic (no duplicate frontier).
+/// - `recorded.last() == Some(19)` (durable ack frontier reached
+///   the highest committed sequence).
+/// - `recorded.len() <= 20` (each call is one advance; if any
+///   completion didn't advance, the recorder is shorter).
+/// - `runtime.progress().last_acked_sequence == Some(19)`.
+#[tokio::test]
+async fn pipeline_ack_through_called_only_on_frontier_advance() {
+    use opendata_ingest_runtime::sink::{CommitStatus, SinkId};
+    use support::{ProgrammableSink, ScriptedWrite};
+
+    let fx = in_memory_buffer_source(
+        "ingest/test/pipeline/ack-on-advance/manifest",
+        "ingest/test/pipeline/ack-on-advance/data",
+    )
+    .await;
+    let batch_count = 20u64;
+    for i in 0..batch_count {
+        fx.producer
+            .produce(
+                vec![Bytes::from(format!("payload-{i}").into_bytes())],
+                logs_envelope(),
+            )
+            .await
+            .expect("produce");
+        fx.producer.flush().await.expect("flush");
+    }
+
+    let sink = ProgrammableSink::new(
+        SinkId::from("programmable"),
+        (0..batch_count)
+            .map(|_| ScriptedWrite::Ok { rows_written: 1 })
+            .collect(),
+        CommitStatus::Unknown,
+    );
+    let gate = sink.block_until_released(true);
+
+    let admission_recorder: AdmissionRecorder = Arc::new(Mutex::new(Vec::new()));
+    let admission_runtime = Arc::clone(&admission_recorder);
+    let ack_recorder: AckThroughRecorder = Arc::new(Mutex::new(Vec::new()));
+    let ack_runtime = Arc::clone(&ack_recorder);
+
+    let mut opts = options_with_fetch_concurrency(4);
+    opts.source_defaults = SourceBackpressureOptions {
+        max_inflight_batches: batch_count as u32,
+        fetch_concurrency: 4,
+        decode_concurrency: 4,
+        ..SourceBackpressureOptions::default()
+    };
+    opts.sink = SinkPoolOptions {
+        max_concurrent_commits: 4,
+        retry_max_attempts: 0,
+        retry_initial_backoff_ms: 0,
+    };
+
+    let runtime = Runtime::builder()
+        .add_source(fx.source)
+        .add_decoder(FakeDecoder::permissive())
+        .set_sink(sink)
+        .with_options(opts)
+        .with_admission_recorder(admission_runtime)
+        .with_ack_through_recorder(ack_runtime)
+        .build()
+        .expect("build");
+    let mut progress_rx = runtime.progress();
+
+    let shutdown = CancellationToken::new();
+    let shutdown_run = shutdown.clone();
+    let handle = tokio::spawn(async move { runtime.run(shutdown_run).await });
+
+    // Wait until every batch admits (sink gated, so they queue
+    // ahead of the write stage). Releasing the gate after this
+    // point fans 4 writers loose to race on completion.
+    timeout(Duration::from_secs(10), async {
+        loop {
+            if admission_recorder.lock().unwrap().len() >= batch_count as usize {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("all 20 batches admit while sink gated");
+
+    drop(gate);
+
+    // Wait for full drain — final progress's last_acked_sequence
+    // should equal the highest committed sequence.
+    timeout(Duration::from_secs(10), async {
+        loop {
+            progress_rx
+                .changed()
+                .await
+                .expect("progress channel closed");
+            if progress_rx.borrow().last_acked_sequence == Some(batch_count - 1) {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("runtime should drain to last_acked_sequence = 19");
+
+    shutdown.cancel();
+    handle
+        .await
+        .expect("runtime task join")
+        .expect("runtime exited cleanly");
+
+    let recorded = ack_recorder.lock().unwrap().clone();
+    assert!(
+        !recorded.is_empty(),
+        "ack_through must fire at least once over a 20-batch run",
+    );
+    for window in recorded.windows(2) {
+        let (prev, next) = (window[0], window[1]);
+        assert!(
+            next > prev,
+            "INV-ACK-CALLED-ON-ADVANCE: recorder must be strictly \
+             monotonic — saw {prev} followed by {next} in {recorded:?}",
+        );
+    }
+    assert_eq!(
+        recorded.last().copied(),
+        Some(batch_count - 1),
+        "final ack_through must reach the highest committed sequence",
+    );
+    assert!(
+        recorded.len() <= batch_count as usize,
+        "recorder length cannot exceed batch count: \
+         len={} batch_count={batch_count}",
+        recorded.len(),
+    );
+
+    fx.producer.close().await.expect("close");
 }
 
 /// §1.3a closeout: INV-DESCRIPTOR-LOSS-FATAL.

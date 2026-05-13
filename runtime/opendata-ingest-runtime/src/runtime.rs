@@ -104,6 +104,19 @@ use crate::source_budget::{ByteReservation, SourceByteBudget};
 /// crate as a published library and do not see test-only items.
 pub type AdmissionRecorder = Arc<std::sync::Mutex<Vec<(SourceId, u64)>>>;
 
+/// Test instrumentation: record each frontier value the per-source
+/// actor passes to [`BufferSource::ack_through`] from its completion
+/// arm, in call order. Pins INV-ACK-CALLED-ON-ADVANCE (§1.3c
+/// closeout): the actor must call `ack_through(f)` only when the
+/// coordinator's frontier strictly exceeds `last_ack_sent` (so out-
+/// of-order completions that don't advance the frontier produce no
+/// extra calls). A test asserts the recorded sequence is strictly
+/// monotonic and the final value matches the highest committed
+/// sequence.
+///
+/// Plain `pub` for the same reason as [`AdmissionRecorder`].
+pub type AckThroughRecorder = Arc<std::sync::Mutex<Vec<u64>>>;
+
 /// Test instrumentation: inject artificial latency at the fetch
 /// stage so a test can stress the actor's admission ordering under
 /// uneven fetch completion times (row 6.2 §Test Plan
@@ -429,6 +442,7 @@ pub struct Runtime {
     /// observe `in_flight()` mid-run.
     source_byte_budget: Arc<SourceByteBudget>,
     admission_recorder: Option<AdmissionRecorder>,
+    ack_through_recorder: Option<AckThroughRecorder>,
     test_fetch_delay: Option<TestFetchDelayFn>,
     test_fetch_killswitch: Option<TestFetchKillswitch>,
 }
@@ -439,6 +453,7 @@ pub struct RuntimeBuilder {
     sink: Option<Arc<dyn Sink>>,
     options: RuntimeOptions,
     admission_recorder: Option<AdmissionRecorder>,
+    ack_through_recorder: Option<AckThroughRecorder>,
     test_fetch_delay: Option<TestFetchDelayFn>,
     test_fetch_killswitch: Option<TestFetchKillswitch>,
 }
@@ -451,6 +466,7 @@ impl Runtime {
             sink: None,
             options: RuntimeOptions::default(),
             admission_recorder: None,
+            ack_through_recorder: None,
             test_fetch_delay: None,
             test_fetch_killswitch: None,
         }
@@ -490,6 +506,7 @@ impl Runtime {
             progress_rx: _progress_rx,
             source_byte_budget,
             admission_recorder,
+            ack_through_recorder,
             test_fetch_delay,
             test_fetch_killswitch,
         } = self;
@@ -609,6 +626,7 @@ impl Runtime {
             hard_abort_token.clone(),
             progress_tx.clone(),
             admission_recorder,
+            ack_through_recorder,
         )
         .await;
 
@@ -731,6 +749,19 @@ impl RuntimeBuilder {
         self
     }
 
+    /// Attach a test-only [`AckThroughRecorder`]. Each frontier
+    /// value the per-source actor passes to
+    /// [`BufferSource::ack_through`] lands in the recorder's `Vec`
+    /// in call order. Pin INV-ACK-CALLED-ON-ADVANCE in integration
+    /// tests where you can't wrap `BufferSource` with an observer:
+    /// the actor must only call `ack_through(f)` when `f >
+    /// last_ack_sent`, so the recorded sequence is strictly
+    /// monotonic.
+    pub fn with_ack_through_recorder(mut self, recorder: AckThroughRecorder) -> Self {
+        self.ack_through_recorder = Some(recorder);
+        self
+    }
+
     /// Attach a test-only [`TestFetchDelayFn`]. Each fetch worker
     /// sleeps for `delay(descriptor.sequence)` before invoking the
     /// underlying `BufferSourceFetchHandle::fetch`. Used to stress
@@ -795,6 +826,7 @@ impl RuntimeBuilder {
             progress_rx,
             source_byte_budget,
             admission_recorder: self.admission_recorder,
+            ack_through_recorder: self.ack_through_recorder,
             test_fetch_delay: self.test_fetch_delay,
             test_fetch_killswitch: self.test_fetch_killswitch,
         })
@@ -861,6 +893,7 @@ async fn per_source_actor(
     hard_abort_token: CancellationToken,
     progress_tx: watch::Sender<RuntimeProgress>,
     admission_recorder: Option<AdmissionRecorder>,
+    ack_through_recorder: Option<AckThroughRecorder>,
 ) -> RuntimeResult<()> {
     let source_id = source.id().clone();
     let bp = options.backpressure_for(&source_id);
@@ -942,6 +975,16 @@ async fn per_source_actor(
                                 None => true,
                             };
                             if should_ack {
+                                // INV-ACK-CALLED-ON-ADVANCE: the
+                                // recorder hook fires immediately
+                                // before the call so a test sees
+                                // exactly the same sequence of
+                                // values the source observes —
+                                // strictly monotonic by the
+                                // `f > prev` guard above.
+                                if let Some(recorder) = ack_through_recorder.as_ref() {
+                                    recorder.lock().unwrap().push(f);
+                                }
                                 source.ack_through(f).await?;
                                 last_ack_sent = Some(f);
                                 groups_since_flush = groups_since_flush.saturating_add(1);
