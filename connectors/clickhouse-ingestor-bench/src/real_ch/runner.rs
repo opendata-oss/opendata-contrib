@@ -1012,8 +1012,22 @@ fn git_info(repo: &str) -> Value {
         .and_then(|o| String::from_utf8(o.stdout).ok())
         .map(|s| s.trim().to_string())
         .unwrap_or_default();
+    // Dirty check ignores `bench-results/` (the bench's own output
+    // tree) so a previous run's artifacts sitting in the worktree
+    // don't poison the source-code cleanliness signal. Trusts that
+    // `bench-results/` is generated and tracked by convention; the
+    // source-code path is what determines whether the binary built
+    // matches a commit.
     let dirty = std::process::Command::new("git")
-        .args(["-C", repo, "status", "--porcelain"])
+        .args([
+            "-C",
+            repo,
+            "status",
+            "--porcelain",
+            "--",
+            ".",
+            ":!bench-results",
+        ])
         .output()
         .ok()
         .filter(|o| o.status.success())

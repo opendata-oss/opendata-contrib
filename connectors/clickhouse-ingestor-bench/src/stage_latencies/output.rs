@@ -528,8 +528,19 @@ fn git_info(repo: &str) -> Value {
         .and_then(|o| String::from_utf8(o.stdout).ok())
         .map(|s| s.trim().to_string())
         .unwrap_or_default();
+    // Dirty check excludes `bench-results/` — see real_ch::runner
+    // for the rationale (bench-output tracking doesn't poison the
+    // source-code cleanliness signal).
     let dirty = std::process::Command::new("git")
-        .args(["-C", repo, "status", "--porcelain"])
+        .args([
+            "-C",
+            repo,
+            "status",
+            "--porcelain",
+            "--",
+            ".",
+            ":!bench-results",
+        ])
         .output()
         .ok()
         .filter(|o| o.status.success())

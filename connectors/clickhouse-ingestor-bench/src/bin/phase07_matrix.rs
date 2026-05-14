@@ -122,11 +122,28 @@ async fn main() -> Result<()> {
     } else {
         let wanted: std::collections::HashSet<&str> =
             args.only_points.split(',').map(str::trim).collect();
+        let known: std::collections::HashSet<&str> =
+            all_points.iter().map(|p| p.id.as_str()).collect();
+        let unknown: Vec<&str> = wanted
+            .iter()
+            .filter(|id| !known.contains(*id))
+            .copied()
+            .collect();
+        if !unknown.is_empty() {
+            anyhow::bail!(
+                "--only-points: unknown point id(s) {:?}; known ids = {:?}",
+                unknown,
+                known,
+            );
+        }
         all_points
             .into_iter()
             .filter(|p| wanted.contains(p.id.as_str()))
             .collect()
     };
+    if cfg.points.is_empty() {
+        anyhow::bail!("--only-points produced an empty point set — pass at least one valid id");
+    }
     eprintln!(
         "running {} matrix points: {}",
         cfg.points.len(),

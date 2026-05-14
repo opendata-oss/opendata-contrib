@@ -121,6 +121,11 @@ pub async fn run_matrix(
     cfg: MatrixConfig,
     fixture: &RealClickHouseFixture,
 ) -> Result<MatrixRunArtifacts> {
+    if cfg.points.is_empty() {
+        bail!(
+            "matrix has zero points to run — check `--only-points` filter against the registered point IDs"
+        );
+    }
     let run_id = run_id_slug(&cfg.change_slug);
     let run_dir = cfg.output_dir.join(&run_id);
     std::fs::create_dir_all(&run_dir).with_context(|| format!("mkdir -p {}", run_dir.display()))?;
