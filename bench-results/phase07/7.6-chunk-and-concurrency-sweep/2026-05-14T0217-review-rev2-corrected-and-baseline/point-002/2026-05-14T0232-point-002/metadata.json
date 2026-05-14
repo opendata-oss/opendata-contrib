@@ -1,0 +1,106 @@
+{
+  "baseline_run": null,
+  "binary": {
+    "build_command": "cargo build --release -p clickhouse-ingestor-bench --features real-ch --bin phase07-real-ch-smoke",
+    "build_flags": "release",
+    "build_rev": "see git.opendata-contrib.rev",
+    "name": "phase07-real-ch-smoke"
+  },
+  "config": {
+    "effective_yaml": {
+      "buffer.batch_compression": "none",
+      "buffer.object_store": "InMemory",
+      "runtime.ack_flush_policy": "EveryCommitGroup",
+      "runtime.dry_run": false,
+      "runtime.sink.max_concurrent_commits": 4,
+      "runtime.source.decode_concurrency": 4,
+      "runtime.source.fetch_concurrency": 8,
+      "sink.http_client_mode": "pooled",
+      "sink.kind": "clickhouse",
+      "sink.serialization_format": "json_each_row"
+    },
+    "effective_yaml_hash": "n/a",
+    "runtime_yaml_path": null
+  },
+  "ended_at": "2026-05-14T02:32:14Z",
+  "experiment": {
+    "dimensions": [],
+    "fixed_controls": {
+      "http_client_mode": "pooled",
+      "records_per_source_range": 1000,
+      "serialization_format": "json_each_row",
+      "sink.kind": "clickhouse",
+      "sink.max_concurrent_commits": 4,
+      "source.decode_concurrency": 4,
+      "source.fetch_concurrency": 8,
+      "timed_payloads": 5000,
+      "warmup_payloads": 200
+    },
+    "kind": "ab",
+    "matrix_file": null
+  },
+  "git": {
+    "opendata": null,
+    "opendata-contrib": {
+      "branch": "odb-ht/4-runtime-extraction",
+      "dirty": true,
+      "rev": "87b9478"
+    },
+    "opendata-go": null
+  },
+  "host": {
+    "container": null,
+    "cpu_count_logical": 10,
+    "cpu_model": "unknown",
+    "low_perturbation": true,
+    "machine": "",
+    "memory_gb": -1,
+    "os": "macos aarch64"
+  },
+  "iterations": 1,
+  "notes": "Phase 7.6 matrix point point-002; format=json_each_row, http_mode=pooled",
+  "owner": "Benchmark/Perf Implementor",
+  "phase": "phase07-clickhouse-throughput",
+  "schema_version": 2,
+  "services": {
+    "clickhouse": {
+      "container_image": "testcontainers-modules/clickhouse@default",
+      "engine": "ReplacingMergeTree",
+      "engine_version_column": "_adapter_version",
+      "order_by": null,
+      "settings_overrides": {},
+      "table_ddl_hash": null,
+      "table_ddl_path": null,
+      "version": "testcontainers-default"
+    },
+    "iceberg": null,
+    "object_store": {
+      "bucket": null,
+      "container_image": null,
+      "endpoint": null,
+      "kind": "in-memory",
+      "region": null
+    }
+  },
+  "started_at": "2026-05-14T02:31:42Z",
+  "unit_id": "7.2",
+  "unit_title": "Stand up real-ClickHouse bench harness end-to-end (testcontainers-rs path; docker-compose path also lands; generalize correctness checks)",
+  "varied_param": null,
+  "workload": {
+    "approx_bytes_per_record": 64,
+    "attribute_cardinality": null,
+    "batches_total": 5200,
+    "canonical_path": null,
+    "compression": "none",
+    "encoding": "otlp_protobuf",
+    "fingerprint": "phase07-real-ch-1000records-per-payload-200warmup-5000timed",
+    "fingerprint_hash": "sha256:d12f988f5ede4920c9cf916846b83cdeea3e93d36061421d07ef04e649588b72",
+    "generator": "phase07-real-ch-otlp-logs-synth",
+    "generator_rev": "see git.opendata-contrib.rev",
+    "records_per_batch": 1000,
+    "records_total": 5200000,
+    "schema": "otel_logs_v1",
+    "schema_hash": "sha256:f9d3e3e0170d6ebbf9eaf340b8160bd0c5e6abec9217be28d6cb8d535d8a7816",
+    "seed": 0
+  }
+}

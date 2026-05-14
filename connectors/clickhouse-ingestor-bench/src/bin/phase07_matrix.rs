@@ -59,6 +59,11 @@ struct Args {
 
     #[arg(long, default_value = "")]
     notes: String,
+
+    /// Run only this comma-separated subset of points by id
+    /// (`point-001,point-004`). Empty = all points.
+    #[arg(long, default_value = "")]
+    only_points: String,
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -111,7 +116,26 @@ async fn main() -> Result<()> {
     };
     // Re-emit default points so the source_id update on workload
     // is consistent.
-    cfg.points = clickhouse_ingestor_bench::real_ch::matrix::default_format_x_http_points();
+    let all_points = clickhouse_ingestor_bench::real_ch::matrix::default_format_x_http_points();
+    cfg.points = if args.only_points.trim().is_empty() {
+        all_points
+    } else {
+        let wanted: std::collections::HashSet<&str> =
+            args.only_points.split(',').map(str::trim).collect();
+        all_points
+            .into_iter()
+            .filter(|p| wanted.contains(p.id.as_str()))
+            .collect()
+    };
+    eprintln!(
+        "running {} matrix points: {}",
+        cfg.points.len(),
+        cfg.points
+            .iter()
+            .map(|p| p.id.as_str())
+            .collect::<Vec<_>>()
+            .join(", "),
+    );
 
     let run = run_matrix(cfg, &fixture).await?;
     println!("wrote {}", run.run_dir.display());

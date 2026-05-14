@@ -1,0 +1,24 @@
+{
+  "ended_at": "2026-05-14T02:47:32Z",
+  "experiment": {
+    "dimensions": [
+      "serialization_format",
+      "http_client_mode"
+    ],
+    "fixed_controls": {
+      "records_per_source_range": 1000,
+      "timed_payloads": 8000,
+      "warmup_payloads": 200
+    },
+    "kind": "matrix",
+    "matrix_file": "matrix.json"
+  },
+  "notes": "Phase 7.6 rev-2 follow-up: re-runs only point-004 (RowBinary, Pooled) with bumped timed_payloads=8000 so the timed window clears MIN_TIMED_WINDOW_SECONDS=20.0. Points 1-3 remain at the 5000-payload baseline in the sibling run.",
+  "owner": "Benchmark/Perf Implementor",
+  "phase": "phase07-clickhouse-throughput",
+  "schema_version": 2,
+  "started_at": "2026-05-14T02:47:01Z",
+  "unit_id": "7.6",
+  "unit_title": "Sweep workload × sink × format × http_mode (matrix experiment per benchmarks.md)",
+  "varied_param": null
+}

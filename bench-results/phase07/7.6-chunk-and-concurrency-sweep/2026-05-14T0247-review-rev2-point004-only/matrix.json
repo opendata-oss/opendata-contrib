@@ -1,0 +1,42 @@
+{
+  "dimensions": [
+    "serialization_format",
+    "http_client_mode"
+  ],
+  "fixed_controls": {
+    "records_per_source_range": 1000,
+    "timed_payloads": 8000,
+    "warmup_payloads": 200
+  },
+  "points": [
+    {
+      "coordinates": {
+        "http_client_mode": "pooled",
+        "serialization_format": "row_binary"
+      },
+      "correctness_passed": true,
+      "id": "point-004",
+      "scalars": {
+        "end_to_end_seconds_per_record": 3.5182552134999996e-6,
+        "iteration_elapsed_seconds_median": 28.146041708,
+        "iterations": 1,
+        "serialization_bytes_per_record": 201.262,
+        "serialize_fraction_of_insert": 0.009901516301095176,
+        "serialize_seconds_per_record": 1.2539468524999988e-7,
+        "total_throughput_records_per_sec": 284231.7965345069,
+        "worker_utilization": {
+          "decode": 0.0402358424942614,
+          "fetch": 0.0006310334525636575,
+          "sink_dispatch": 0.9987136036702565,
+          "source": 0.011971770613280475
+        }
+      },
+      "subdir": "point-004"
+    }
+  ],
+  "schema_version": 2,
+  "skip_summary": {
+    "notes": "Row 7.6 lightweight: only format × http_mode dimensions; the workload-axis correctness check from the design's full 6-axis sweep doesn't apply here.",
+    "rule_1_workload_axis_correctness_check_inert_pairs": 0
+  }
+}
