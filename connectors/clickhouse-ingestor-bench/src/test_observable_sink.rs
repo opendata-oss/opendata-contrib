@@ -37,10 +37,24 @@ pub enum ScriptedWrite {
     Ok,
     /// First attempt resolves `SinkCommitFailure::MaybeCommitted`,
     /// the runtime's `check_committed → retry` path replays, and
-    /// the second attempt resolves `Ok`. Used by
-    /// `maybe_committed_replay_idempotent` to exercise the retry
-    /// path end-to-end.
+    /// the second attempt resolves `Ok`. Used to exercise the
+    /// retry path end-to-end **without** the inner sink's side
+    /// effect happening on the first attempt — so the test proves
+    /// identity stability across retries but not the dedupe path.
     MaybeCommittedThenOk,
+    /// First attempt **does commit at the inner sink** (the side
+    /// effect lands — for `RealClickHouseSink`, the row hits
+    /// ClickHouse with its idempotency token) but the wrapper
+    /// reports `MaybeCommitted` to the runtime. The runtime's
+    /// `check_committed → retry` path then drives a second inner
+    /// write whose token matches the first; the inner sink's
+    /// idempotency mechanism must suppress the duplicate (for
+    /// ClickHouse, the `insert_deduplication_token` URL parameter
+    /// at INSERT time). Used by
+    /// `maybe_committed_replay_idempotent` to pin the load-bearing
+    /// invariant: "CH may have committed, then the runtime replays;
+    /// the duplicate insert must not produce a second visible row."
+    CommitButReportMaybeCommittedThenRetry,
 }
 
 /// Captured-writes log entry. One entry per resolved

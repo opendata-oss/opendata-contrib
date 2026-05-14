@@ -8,15 +8,28 @@
 //!  1. Block hook — if a `CancellationToken` is registered for the
 //!     sequence, park on it before any other side effect.
 //!  2. Forced-outcome hook — if a scripted attempt is queued for
-//!     the sequence, return its result instead of delegating. The
-//!     `MaybeCommittedThenOk` script pushes a `MaybeCommitted` for
-//!     the first call and an `Ok` (delegate to inner) for the
-//!     second; per the trait's docs, the runtime's
-//!     `check_committed → retry` path drives the second call.
+//!     the sequence, return its result instead of (or in addition
+//!     to) delegating. Two scripted shapes are supported:
+//!     * `MaybeCommittedThenOk` → `[MaybeCommitted, DelegateOk]`:
+//!       first call returns `MaybeCommitted` **without** touching
+//!       the inner sink; second call delegates normally. Pins
+//!       identity stability across the runtime's `check_committed →
+//!       retry` path.
+//!     * `CommitButReportMaybeCommittedThenRetry` →
+//!       `[CommitThenReportMaybeCommitted, DelegateOk]`: first call
+//!       **delegates** (row lands in CH with its dedupe token) AND
+//!       returns `MaybeCommitted`; second call delegates again with
+//!       the same chunk + token, which CH suppresses at INSERT via
+//!       `insert_deduplication_token`. Pins the load-bearing
+//!       dedupe-suppression-under-ambiguous-failure invariant.
 //!  3. Delegate to inner — production `ClickHouseSink::write`.
-//!  4. Commit observer — fires synchronously after inner Ok.
+//!  4. Commit observer — fires synchronously after every inner Ok
+//!     (so the "inner committed" signal is observable even when
+//!     the wrapper reports `MaybeCommitted` upstream).
 //!  5. Captured-writes log — appends a `CapturedWrite` for every
-//!     resolved call (Ok or Failure).
+//!     resolved call (Ok or Failure). The reported `outcome`
+//!     reflects what the runtime sees, not the inner-side effect;
+//!     pair with the commit observer's log to distinguish.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -46,6 +59,12 @@ use crate::test_observable_sink::{
 enum Attempt {
     DelegateOk,
     MaybeCommitted,
+    /// Inner-write happens (real row + dedupe token land in CH);
+    /// wrapper reports `MaybeCommitted` to the runtime anyway.
+    /// The runtime's `check_committed → retry` path then drives a
+    /// second `Sink::write` whose chunks carry the same dedupe
+    /// token; CH suppresses the second insert at the table layer.
+    CommitThenReportMaybeCommitted,
 }
 
 /// Wraps the production `ClickHouseSink<OtlpLogsClickHouseAdapter>`
@@ -124,6 +143,56 @@ impl Sink for RealClickHouseSink {
                     format!("scripted MaybeCommitted on seq={seq}").into(),
                 ));
             }
+            Some(Attempt::CommitThenReportMaybeCommitted) => {
+                // The inner write must run — that's the load-
+                // bearing part: the row + its dedupe token actually
+                // hit ClickHouse. Only then do we lie to the
+                // runtime about the result so the retry path runs.
+                let inner = self.inner.write(commit.clone()).await;
+                match inner {
+                    Ok(_commit_result) => {
+                        // The commit happened. Fire the observer
+                        // so a test can see that the inner side
+                        // effect landed even though the wrapper is
+                        // about to report MaybeCommitted upstream.
+                        let observer = self.commit_observer.lock().unwrap().clone();
+                        if let Some(cb) = observer {
+                            cb.record_commit(&commit.identity);
+                        }
+                        self.captured.lock().unwrap().push(CapturedWrite {
+                            identity: commit.identity.clone(),
+                            outcome: WriteOutcome::Failure(SinkCommitFailureKind::MaybeCommitted),
+                        });
+                        return Err(SinkCommitFailure::MaybeCommitted(
+                            format!(
+                                "scripted CommitThenReportMaybeCommitted on seq={seq} \
+                                 (inner committed; reporting MaybeCommitted to drive retry path)"
+                            )
+                            .into(),
+                        ));
+                    }
+                    Err(e) => {
+                        // Inner failed — scripted assumption was
+                        // that the row would commit. Surface the
+                        // real error so the test fails loudly
+                        // instead of silently masking it.
+                        let kind = match &e {
+                            SinkCommitFailure::NotCommitted(_) => {
+                                SinkCommitFailureKind::NotCommitted
+                            }
+                            SinkCommitFailure::MaybeCommitted(_) => {
+                                SinkCommitFailureKind::MaybeCommitted
+                            }
+                            SinkCommitFailure::Fatal(_) => SinkCommitFailureKind::Fatal,
+                        };
+                        self.captured.lock().unwrap().push(CapturedWrite {
+                            identity: commit.identity.clone(),
+                            outcome: WriteOutcome::Failure(kind),
+                        });
+                        return Err(e);
+                    }
+                }
+            }
             Some(Attempt::DelegateOk) | None => {
                 // Fall through to delegate.
             }
@@ -175,6 +244,9 @@ impl TestObservableSink for RealClickHouseSink {
             ScriptedWrite::Ok => vec![Attempt::DelegateOk],
             ScriptedWrite::MaybeCommittedThenOk => {
                 vec![Attempt::MaybeCommitted, Attempt::DelegateOk]
+            }
+            ScriptedWrite::CommitButReportMaybeCommittedThenRetry => {
+                vec![Attempt::CommitThenReportMaybeCommitted, Attempt::DelegateOk]
             }
         };
         self.scripts.lock().unwrap().insert(seq, queue.into());

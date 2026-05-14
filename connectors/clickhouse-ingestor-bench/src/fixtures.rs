@@ -200,12 +200,29 @@ impl Decoder for FakeDecoder {
 /// BenchSink's internal per-attempt outcome. The
 /// [`crate::test_observable_sink::TestObservableSink`] trait
 /// exposes a higher-level `ScriptedWrite` enum (e.g.
-/// `MaybeCommittedThenOk`) that this internal type is the
-/// per-attempt expansion of.
+/// `MaybeCommittedThenOk`,
+/// `CommitButReportMaybeCommittedThenRetry`) that this internal
+/// type is the per-attempt expansion of.
 #[derive(Clone, Debug)]
 pub(crate) enum BenchAttempt {
-    Ok { rows_written: u64 },
-    MaybeCommitted { message: String },
+    Ok {
+        rows_written: u64,
+    },
+    MaybeCommitted {
+        message: String,
+    },
+    /// Inner-write side effect happens (the commit observer fires
+    /// and a `Committed` entry lands in the captured-writes log)
+    /// but the call returns `MaybeCommitted` to the runtime. The
+    /// in-memory BenchSink can't simulate CH-style dedupe
+    /// suppression on the retry pass — that's a `RealClickHouseSink`
+    /// concern — so the bench's correctness scenarios don't use
+    /// this variant directly. It exists so the trait stays
+    /// implementable on both sinks symmetrically.
+    CommittedButReportMaybeCommitted {
+        rows_written: u64,
+        message: String,
+    },
 }
 
 /// Per-sequence sink latency closure. Factored out for clippy's
@@ -329,6 +346,17 @@ impl crate::test_observable_sink::TestObservableSink for BenchSink {
                 },
                 BenchAttempt::Ok { rows_written: 1 },
             ],
+            crate::test_observable_sink::ScriptedWrite::CommitButReportMaybeCommittedThenRetry => {
+                vec![
+                    BenchAttempt::CommittedButReportMaybeCommitted {
+                        rows_written: 1,
+                        message: format!(
+                            "scripted CommitButReportMaybeCommittedThenRetry on seq={seq}"
+                        ),
+                    },
+                    BenchAttempt::Ok { rows_written: 1 },
+                ]
+            }
         };
         self.per_sequence_script
             .lock()
@@ -395,6 +423,31 @@ impl Sink for BenchSink {
                             crate::test_observable_sink::SinkCommitFailureKind::MaybeCommitted,
                         ),
                     });
+                Err(SinkCommitFailure::MaybeCommitted(message.into()))
+            }
+            BenchAttempt::CommittedButReportMaybeCommitted {
+                rows_written,
+                message,
+            } => {
+                // The "side effect happened" half: fire the commit
+                // observer + record a `Committed` capture so a test
+                // can see that the inner commit landed.
+                let observer = self.commit_observer.lock().unwrap().clone();
+                if let Some(cb) = observer {
+                    cb.record_commit(&commit.identity);
+                }
+                self.write_calls
+                    .lock()
+                    .unwrap()
+                    .push(crate::test_observable_sink::CapturedWrite {
+                        identity: commit.identity.clone(),
+                        outcome: crate::test_observable_sink::WriteOutcome::Committed {
+                            rows: rows_written,
+                        },
+                    });
+                // The "lie to the runtime" half: report
+                // MaybeCommitted upstream so the runtime's
+                // `check_committed → retry` path runs.
                 Err(SinkCommitFailure::MaybeCommitted(message.into()))
             }
         }

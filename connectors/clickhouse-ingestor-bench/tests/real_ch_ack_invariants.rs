@@ -28,7 +28,7 @@ use clickhouse_ingestor_bench::real_ch::{
     workload::{WorkloadEnv, build_env},
 };
 use clickhouse_ingestor_bench::test_observable_sink::{
-    CommitObserver, ScriptedWrite, TestObservableSink,
+    CommitObserver, ScriptedWrite, SinkCommitFailureKind, TestObservableSink, WriteOutcome,
 };
 use opendata_ingest_clickhouse::adapter::logs::{LogsAdapterConfig, OtlpLogsClickHouseAdapter};
 use opendata_ingest_clickhouse::sink::ClickHouseSink;
@@ -319,12 +319,33 @@ async fn out_of_order_completion_no_frontier_hole_against_real_clickhouse() {
 }
 
 /// `maybe_committed_replay_idempotent` against the production sink.
-/// Script seq=2 to return `MaybeCommitted` on the first call; the
-/// runtime's `check_committed → retry` path delegates the second
-/// call to the inner sink. Assert: (a) the runtime drains; (b) the
-/// captured-writes log records two attempts for seq=2 with
-/// byte-identical `CommitIdentity`; (c) post-FINAL CH row count
-/// equals the total record count (no duplicates after dedupe).
+///
+/// The interesting case for INV-MAYBE-COMMITTED-RESOLVES is **not**
+/// "the first call fails before touching CH and the retry succeeds"
+/// — that's just normal retry. The load-bearing case is "CH has
+/// already committed the row, then the runtime replays the same
+/// `SinkCommit`; the duplicate insert must not produce a second
+/// visible row." Use
+/// `ScriptedWrite::CommitButReportMaybeCommittedThenRetry` so the
+/// scripted attempt actually delegates to the inner sink (the row
+/// + its `insert_deduplication_token` land in CH), returns
+/// `MaybeCommitted` upstream, and then the runtime's
+/// `check_committed → retry` path drives a second inner write
+/// whose token matches; CH's table-layer dedupe must suppress it.
+///
+/// Asserts:
+///   1. The runtime drains (`last_acked_sequence == n - 1`).
+///   2. The captured-writes log records two attempts for seq=2 with
+///      byte-identical `CommitIdentity` — the first reporting
+///      `Failure(MaybeCommitted)` and the second `Committed`.
+///   3. The commit observer fired for seq=2 **at least twice** —
+///      once on the inner-side commit of attempt 1, once on the
+///      inner-side commit of attempt 2 (CH returns 200 OK on the
+///      dedupe-suppressed write).
+///   4. Pre-FINAL and post-FINAL row counts both equal
+///      `expected_records` — CH's `insert_deduplication_token`
+///      suppressed the duplicate insert at INSERT time, so there
+///      are no duplicates to merge away.
 #[tokio::test]
 async fn maybe_committed_replay_idempotent_against_real_clickhouse() {
     let fixture = fresh_fixture("logs_maybe_committed").await;
@@ -342,7 +363,18 @@ async fn maybe_committed_replay_idempotent_against_real_clickhouse() {
     } = env;
 
     let sink = build_real_sink(&fixture);
-    sink.set_per_sequence_forced_outcome(2, ScriptedWrite::MaybeCommittedThenOk);
+    sink.set_per_sequence_forced_outcome(2, ScriptedWrite::CommitButReportMaybeCommittedThenRetry);
+
+    // Observer log: one push per inner-side Ok. With the new
+    // variant, this fires for seq=2 on BOTH attempts (the scripted
+    // first attempt that lies upstream, and the retry that CH
+    // dedupe-suppresses).
+    let commits_seen: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
+    let observer_log = Arc::clone(&commits_seen);
+    let observer: Arc<dyn CommitObserver> = Arc::new(move |id: &CommitIdentity| {
+        observer_log.lock().unwrap().push(id.range.high);
+    });
+    sink.set_commit_observer(observer);
 
     let runtime = Runtime::builder()
         .add_source(source)
@@ -373,6 +405,7 @@ async fn maybe_committed_replay_idempotent_against_real_clickhouse() {
     shutdown.cancel();
     runtime_task.await.expect("join").expect("clean exit");
 
+    // ── 2. captured-writes log shape ─────────────────────────────
     let writes = sink.drain_captured_writes();
     let for_seq_2: Vec<_> = writes
         .iter()
@@ -380,9 +413,27 @@ async fn maybe_committed_replay_idempotent_against_real_clickhouse() {
         .collect();
     assert!(
         for_seq_2.len() >= 2,
-        "expected ≥ 2 captured writes for seq=2 (one MaybeCommitted + one Ok on retry); got {} ({writes:?})",
+        "expected ≥ 2 captured writes for seq=2 (MaybeCommitted attempt + retry Ok); got {} ({writes:?})",
         for_seq_2.len(),
     );
+    // First attempt: outer reported MaybeCommitted (despite inner commit).
+    assert!(
+        matches!(
+            for_seq_2[0].outcome,
+            WriteOutcome::Failure(SinkCommitFailureKind::MaybeCommitted),
+        ),
+        "first captured attempt for seq=2 should report MaybeCommitted, got {:?}",
+        for_seq_2[0].outcome,
+    );
+    // Second attempt: outer Ok (inner write suppressed by dedupe).
+    assert!(
+        matches!(for_seq_2[1].outcome, WriteOutcome::Committed { .. }),
+        "second captured attempt for seq=2 should resolve Ok (dedupe suppresses inner duplicate), got {:?}",
+        for_seq_2[1].outcome,
+    );
+    // Identity byte-identical across retries — the runtime must
+    // replay with the same `CommitIdentity` so the inner sink's
+    // dedupe token recomputes the same value.
     let first = for_seq_2[0].identity.to_string();
     for w in &for_seq_2 {
         assert_eq!(
@@ -392,7 +443,24 @@ async fn maybe_committed_replay_idempotent_against_real_clickhouse() {
         );
     }
 
+    // ── 3. commit observer fired on both inner commits ───────────
+    let seq_2_commits = commits_seen
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|s| **s == 2)
+        .count();
+    assert!(
+        seq_2_commits >= 2,
+        "commit observer should fire ≥ 2 times for seq=2 (inner commit on scripted attempt + retry), got {seq_2_commits}",
+    );
+
+    // ── 4. CH dedupe actually suppressed the duplicate ──────────
     let visible = fixture.count_visible().await.expect("count_visible");
+    let pre_dupes = fixture
+        .count_pre_dedupe_duplicates()
+        .await
+        .expect("count_pre_dedupe_duplicates");
     let post_dupes = fixture
         .count_post_dedupe_duplicates()
         .await
@@ -400,26 +468,76 @@ async fn maybe_committed_replay_idempotent_against_real_clickhouse() {
     let expected_records = n * 10;
     assert_eq!(
         visible, expected_records,
-        "post-FINAL row count should equal record count",
+        "post-FINAL row count should equal record count — CH dedupe must suppress the retry duplicate",
+    );
+    assert_eq!(
+        pre_dupes, 0,
+        "pre-FINAL duplicates must be 0 — CH's insert_deduplication_token suppresses at INSERT, not at merge",
     );
     assert_eq!(post_dupes, 0, "no post-FINAL duplicates");
 }
 
 /// `sink_outage_backpressure_bounded` against the production sink.
-/// Block seq=2 indefinitely; peer commits land at the sink, the
-/// runtime's in-flight queue fills, and admission engages
-/// backpressure on subsequent descriptors. Assert: (a) peak
-/// in-flight bytes stays under the configured bound; (b) the
-/// budget drains to zero after release + shutdown.
+///
+/// Mirrors the hardening that landed for the in-memory test:
+/// block seq=2 indefinitely AND assert the byte budget actually
+/// reached `max_inflight_bytes` (i.e., admission stalled) before
+/// releasing. Without the engagement assertion the test reduces to
+/// "memory did not exceed a large bound", which holds trivially
+/// when peer commits drain before the budget fills.
+///
+/// Real-CH-specific tuning. The in-memory test's design assumes
+/// `actual == estimated_max_batch_bytes` via `LargeDecoder` so
+/// multi-batch accumulation stays within the bound
+/// `max + decode_concurrency × (oversize - 1) × estimated`. We
+/// can't swap the production OTLP-logs decoder, so we go the other
+/// way: keep **only one batch in-flight** via the batch semaphore.
+/// Then peak in_flight = single-batch actual post-decode size,
+/// which exceeds `max_inflight_bytes` (proving the byte budget
+/// would also park admission) and stays under
+/// `oversize_fault_multiplier × estimated_max_batch_bytes`
+/// (INV-BACKPRESSURE-BOUNDED-MEMORY upper bound for this shape).
+///
+///   * `records_per_source_range = 100` so each post-decode batch
+///     is ~40 KiB.
+///   * `max_inflight_batches = 1` — binding constraint that pins
+///     "one batch in flight". The byte budget is also engaged
+///     (the single batch's 40 KiB > 32 KiB max) but the batch
+///     semaphore is what gates admission of seq=3+ while seq=2
+///     holds the slot.
+///   * `max_inflight_bytes = 32 KiB`, `estimated_max_batch_bytes = 8 KiB`,
+///     `oversize_fault_multiplier = 8` (admits ≤ 64 KiB actual).
+///   * `max_concurrent_commits = 1` so seq=2's block stalls the
+///     entire writer pool.
+///   * Produce 10 batches; only 3 ever enter the pipeline
+///     (seq=0, 1 commit; seq=2 enters writer and blocks;
+///     seq=3+ never acquire the batch slot).
+///
+/// Asserts:
+///   1. `peak >= max_inflight_bytes` — byte budget would also park
+///      admission (32 KiB max ≤ 40 KiB actual single-batch
+///      reservation; admission's `reserve(estimated=8) ⊕ current=40`
+///      fails the `current + bytes ≤ capacity` check).
+///   2. `peak <= max_inflight_batches × oversize_fault_multiplier
+///      × estimated_max_batch_bytes` — the per-batch over-subscription
+///      cap times the batch slot count.
+///   3. `budget.in_flight() == 0` after shutdown.
+///
+/// Asserts:
+///   1. `peak >= max_inflight_bytes` — backpressure **did** engage.
+///   2. `peak <= bound` (INV-BACKPRESSURE-BOUNDED-MEMORY).
+///   3. `budget.in_flight() == 0` after shutdown.
 #[tokio::test]
 async fn sink_outage_backpressure_bounded_against_real_clickhouse() {
     let fixture = fresh_fixture("logs_sink_outage").await;
-    let cfg = workload_cfg(
+    let mut cfg = workload_cfg(
         "phase07/ack-invariants/sink-outage/manifest",
         "phase07/ack-invariants/sink-outage/data",
     );
+    // Bigger per-batch payload so the budget saturates cleanly.
+    cfg.records_per_source_range = 100;
     let env = build_env(&cfg).await.expect("build_env");
-    let n: u64 = 30;
+    let n: u64 = 10;
     LogWorkload::produce(&cfg, &env.producer, 0, n)
         .await
         .expect("produce");
@@ -430,11 +548,31 @@ async fn sink_outage_backpressure_bounded_against_real_clickhouse() {
     let sink = build_real_sink(&fixture);
     let release_seq_2 = sink.set_per_sequence_block(2);
 
-    let opts = pipelined_options();
-    let max_bytes = opts.source_defaults.max_inflight_bytes;
-    let est_max_bytes = opts.source_defaults.estimated_max_batch_bytes;
-    let decode_conc = opts.source_defaults.decode_concurrency;
-    let oversize = opts.source_defaults.oversize_fault_multiplier;
+    let mut opts = pipelined_options();
+    opts.source_defaults = SourceBackpressureOptions {
+        // Pin one-batch-in-flight so peak in_flight is exactly
+        // one post-decode batch's footprint — predictable and
+        // tightly bounded by the oversize-fault cap.
+        max_inflight_batches: 1,
+        max_inflight_bytes: 32 * 1024,
+        estimated_max_batch_bytes: 8 * 1024,
+        fetch_concurrency: 1,
+        decode_concurrency: 1,
+        oversize_fault_multiplier: 8,
+    };
+    opts.sink = SinkPoolOptions {
+        max_concurrent_commits: 1,
+        retry_max_attempts: 3,
+        retry_initial_backoff_ms: 10,
+    };
+    let bp = opts.source_defaults;
+    let max_inflight_bytes = bp.max_inflight_bytes;
+    // With max_inflight_batches = 1, peak is bounded by one
+    // batch's oversize-fault-capped size (admission rejects any
+    // batch whose actual_bytes > oversize × estimated).
+    let bound: u64 = (bp.max_inflight_batches as u64)
+        * (bp.oversize_fault_multiplier as u64)
+        * bp.estimated_max_batch_bytes;
 
     let runtime = Runtime::builder()
         .add_source(source)
@@ -452,33 +590,51 @@ async fn sink_outage_backpressure_bounded_against_real_clickhouse() {
     };
     producer.close().await.expect("producer close");
 
-    let peak: Arc<Mutex<u64>> = Arc::new(Mutex::new(0));
-    let peak_clone = Arc::clone(&peak);
+    let peak: Arc<std::sync::atomic::AtomicU64> = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let peak_poller = Arc::clone(&peak);
     let budget_for_poller = Arc::clone(&budget);
     let stop_poller = CancellationToken::new();
     let stop_poller_inner = stop_poller.clone();
+    // 1 ms sampling — coarser intervals miss the peak window.
     let poller = tokio::spawn(async move {
         loop {
-            if stop_poller_inner.is_cancelled() {
-                return;
-            }
-            let inf = budget_for_poller.in_flight();
-            {
-                let mut p = peak_clone.lock().unwrap();
-                if inf > *p {
-                    *p = inf;
+            tokio::select! {
+                biased;
+                _ = stop_poller_inner.cancelled() => return,
+                _ = tokio::time::sleep(Duration::from_millis(1)) => {
+                    let inf = budget_for_poller.in_flight();
+                    let prev = peak_poller.load(std::sync::atomic::Ordering::SeqCst);
+                    if inf > prev {
+                        peak_poller.store(inf, std::sync::atomic::Ordering::SeqCst);
+                    }
                 }
             }
-            tokio::time::sleep(Duration::from_millis(2)).await;
         }
     });
 
-    // Hold the block long enough for the runtime to push peer
-    // commits through and engage admission backpressure.
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // Strict: wait for the peak to reach `max_inflight_bytes`
+    // BEFORE releasing seq=2. Without this gate the upper-bound
+    // assertion trivially holds when backpressure never engaged
+    // (e.g. all writes drain before the budget fills). Same
+    // hardening pattern as the in-memory
+    // `sink_outage_backpressure_bounded` scenario.
+    timeout(Duration::from_secs(30), async {
+        loop {
+            if peak.load(std::sync::atomic::Ordering::SeqCst) >= max_inflight_bytes {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect(
+        "backpressure must engage while seq=2 is held: peak in-flight \
+         must reach max_inflight_bytes",
+    );
+
     release_seq_2.cancel();
     stop_poller.cancel();
-    poller.await.expect("poller");
+    let _ = poller.await;
 
     timeout(Duration::from_secs(60), async {
         loop {
@@ -494,17 +650,18 @@ async fn sink_outage_backpressure_bounded_against_real_clickhouse() {
     shutdown.cancel();
     runtime_task.await.expect("join").expect("clean exit");
 
-    let final_peak = *peak.lock().unwrap();
-    // INV-BACKPRESSURE-BOUNDED-MEMORY (Phase 6 design): peak ≤
-    // max_inflight_bytes + decode_concurrency × (oversize - 1) ×
-    // estimated_max_batch_bytes — accounts for the post-decode
-    // reconciliation window where reservation > actual is possible.
-    let bound =
-        max_bytes + (decode_conc as u64) * (oversize.saturating_sub(1) as u64) * est_max_bytes;
+    let final_peak = peak.load(std::sync::atomic::Ordering::SeqCst);
+    // 1. INV-BACKPRESSURE-BOUNDED-MEMORY (upper bound).
     assert!(
         final_peak <= bound,
         "peak inflight {final_peak} exceeded bound {bound}",
     );
+    // 2. Backpressure DID engage (lower bound).
+    assert!(
+        final_peak >= max_inflight_bytes,
+        "peak inflight {final_peak} below max_inflight_bytes {max_inflight_bytes} — backpressure never engaged",
+    );
+    // 3. Budget drains to zero.
     assert_eq!(
         budget.in_flight(),
         0,
