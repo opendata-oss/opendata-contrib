@@ -13,8 +13,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Result, anyhow, bail};
-use clickhouse_ingestor::writer::ClickHouseWriter;
+use clickhouse_ingestor::writer::{ClickHouseWriter, HttpClientMode, WriterConfig};
 use opendata_ingest_clickhouse::adapter::logs::OtlpLogsClickHouseAdapter;
+use opendata_ingest_clickhouse::serializer::SerializationFormat;
 use opendata_ingest_clickhouse::sink::ClickHouseSink;
 use opendata_ingest_otel::logs::OtlpLogsDecoder;
 use opendata_ingest_runtime::runtime::{
@@ -27,7 +28,7 @@ use super::fixture::RealClickHouseFixture;
 use super::workload::{LogWorkload, LogWorkloadConfig, WorkloadEnv, build_env};
 use crate::metrics_recorder::init_metrics_recorder;
 use crate::stage_latencies::iteration::{
-    Stage, StageSamples, StageWorkerCounts, collect_stage_samples_destructive,
+    ClickHouseSamples, Stage, StageSamples, StageWorkerCounts, collect_bench_samples,
 };
 
 #[derive(Debug, Clone)]
@@ -38,6 +39,10 @@ pub struct RealChConfig {
     pub iterations: usize,
     /// Runtime options (defaults are pipelined per Phase 6).
     pub runtime_options: RuntimeOptions,
+    /// ClickHouse serialization format for the sink writer.
+    pub serialization_format: SerializationFormat,
+    /// HTTP client mode for the sink writer.
+    pub http_client_mode: HttpClientMode,
     /// Warmup-drain deadline.
     pub warmup_deadline: Duration,
     /// Timed-window drain deadline.
@@ -68,6 +73,8 @@ impl Default for RealChConfig {
                 sink: SinkPoolOptions::default(),
                 ..Default::default()
             },
+            serialization_format: SerializationFormat::JsonEachRow,
+            http_client_mode: HttpClientMode::PerCall,
             warmup_deadline: Duration::from_secs(120),
             timed_deadline: Duration::from_secs(600),
             min_timed_window_seconds: 0.0,
@@ -86,6 +93,7 @@ pub struct RealChIterationReport {
     pub elapsed_seconds: f64,
     pub records_processed: u64,
     pub stage_samples: StageSamples,
+    pub clickhouse_samples: ClickHouseSamples,
     pub worker_counts: StageWorkerCounts,
     pub records_visible: u64,
     pub records_raw: u64,
@@ -111,6 +119,71 @@ impl RealChIterationReport {
             0.0
         } else {
             self.stage_samples.sum(stage) / records
+        }
+    }
+
+    /// `Σ clickhouse_serialization_duration_seconds`.
+    pub fn serialize_seconds_total(&self) -> f64 {
+        self.clickhouse_samples
+            .serialize_duration_seconds
+            .iter()
+            .sum()
+    }
+
+    /// `Σ clickhouse_insert_duration_seconds` (one sample per HTTP
+    /// INSERT attempt). Includes serialize time since the attempt
+    /// timer wraps the whole `execute_once` body.
+    pub fn insert_seconds_total(&self) -> f64 {
+        self.clickhouse_samples.insert_duration_seconds.iter().sum()
+    }
+
+    /// `Σ clickhouse_serialized_bytes`.
+    pub fn serialized_bytes_total(&self) -> u64 {
+        self.clickhouse_samples
+            .serialized_bytes
+            .iter()
+            .map(|v| *v as u64)
+            .sum()
+    }
+
+    /// `serialize_fraction_of_insert ∈ [0, 1]`. Per §Bottleneck
+    /// Attribution Methodology.
+    pub fn serialize_fraction_of_insert(&self) -> f64 {
+        let ins = self.insert_seconds_total();
+        if ins <= 0.0 {
+            0.0
+        } else {
+            (self.serialize_seconds_total() / ins).clamp(0.0, 1.0)
+        }
+    }
+
+    /// `serialize_seconds_per_record`.
+    pub fn serialize_seconds_per_record(&self) -> f64 {
+        let records = self.records_processed as f64;
+        if records <= 0.0 {
+            0.0
+        } else {
+            self.serialize_seconds_total() / records
+        }
+    }
+
+    /// `serialization_bytes_per_record`.
+    pub fn serialization_bytes_per_record(&self) -> f64 {
+        let records = self.records_processed as f64;
+        if records <= 0.0 {
+            0.0
+        } else {
+            self.serialized_bytes_total() as f64 / records
+        }
+    }
+
+    /// `end_to_end_seconds_per_record`.
+    pub fn end_to_end_seconds_per_record(&self) -> f64 {
+        let records = self.records_processed as f64;
+        if records <= 0.0 {
+            0.0
+        } else {
+            self.elapsed_seconds / records
         }
     }
 }
@@ -169,7 +242,22 @@ pub async fn run_real_ch(
         let adapter = Arc::new(OtlpLogsClickHouseAdapter::new(
             fixture.adapter_config.clone(),
         ));
-        let sink_writer = Arc::new(fixture.writer.clone());
+        // Build a fresh `ClickHouseWriter` per iteration so the
+        // matrix sweep can flip `serialization_format` and
+        // `http_client_mode` without rebuilding the fixture (which
+        // owns the testcontainers handle). The fixture's writer
+        // stays in use for `TRUNCATE TABLE` + SELECT-style queries.
+        let writer_config = WriterConfig {
+            endpoint: fixture.endpoint.clone(),
+            user: fixture.writer.config().user.clone(),
+            password: fixture.writer.config().password.clone(),
+            request_timeout: fixture.writer.config().request_timeout,
+            max_attempts: fixture.writer.config().max_attempts,
+            initial_backoff: fixture.writer.config().initial_backoff,
+            serialization_format: cfg.serialization_format,
+            http_client_mode: cfg.http_client_mode.clone(),
+        };
+        let sink_writer = Arc::new(ClickHouseWriter::new(writer_config));
         let sink = ClickHouseSink::new("phase07-real-ch", adapter, sink_writer);
         let runtime = Runtime::builder()
             .add_source(source)
@@ -257,7 +345,7 @@ pub async fn run_real_ch(
             .map_err(|e| anyhow!("runtime.run: {e}"))?;
 
         let final_snapshot = snapshotter.snapshot();
-        let stage_samples = collect_stage_samples_destructive(final_snapshot);
+        let (stage_samples, clickhouse_samples) = collect_bench_samples(final_snapshot);
 
         // ── Correctness queries against the live CH ──
         let records_raw = fixture
@@ -283,6 +371,7 @@ pub async fn run_real_ch(
             elapsed_seconds,
             records_processed: progress_final.records_written,
             stage_samples,
+            clickhouse_samples,
             worker_counts,
             records_visible,
             records_raw,
@@ -409,6 +498,43 @@ fn build_results(reports: &[RealChIterationReport]) -> Value {
         agg(&throughputs),
     );
     scalars.insert("iteration_elapsed_seconds".to_string(), agg(&elapsed));
+
+    // §Bottleneck Attribution Methodology — HTTP-side decomposition
+    // per matrix point. One sample per iteration since we run a
+    // single iteration per matrix point in the lightweight 7.6
+    // sweep.
+    let serialize_fractions: Vec<f64> = reports
+        .iter()
+        .map(|r| r.serialize_fraction_of_insert())
+        .collect();
+    let serialize_seconds_per_record: Vec<f64> = reports
+        .iter()
+        .map(|r| r.serialize_seconds_per_record())
+        .collect();
+    let serialization_bytes_per_record: Vec<f64> = reports
+        .iter()
+        .map(|r| r.serialization_bytes_per_record())
+        .collect();
+    let end_to_end_seconds_per_record: Vec<f64> = reports
+        .iter()
+        .map(|r| r.end_to_end_seconds_per_record())
+        .collect();
+    scalars.insert(
+        "serialize_fraction_of_insert".to_string(),
+        agg(&serialize_fractions),
+    );
+    scalars.insert(
+        "serialize_seconds_per_record".to_string(),
+        agg(&serialize_seconds_per_record),
+    );
+    scalars.insert(
+        "serialization_bytes_per_record".to_string(),
+        agg(&serialization_bytes_per_record),
+    );
+    scalars.insert(
+        "end_to_end_seconds_per_record".to_string(),
+        agg(&end_to_end_seconds_per_record),
+    );
 
     let mut stages: Vec<Value> = Vec::with_capacity(4);
     for stage in Stage::ALL {

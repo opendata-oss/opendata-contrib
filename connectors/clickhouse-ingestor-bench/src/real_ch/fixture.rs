@@ -72,6 +72,7 @@ impl RealClickHouseFixture {
             request_timeout: Duration::from_secs(30),
             max_attempts: 4,
             initial_backoff: Duration::from_millis(100),
+            ..Default::default()
         });
 
         let database = database.into();

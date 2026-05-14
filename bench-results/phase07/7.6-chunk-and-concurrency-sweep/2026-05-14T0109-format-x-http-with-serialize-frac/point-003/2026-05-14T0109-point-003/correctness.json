@@ -1,0 +1,24 @@
+{
+  "iterations": [
+    {
+      "iteration": 1,
+      "passed": true,
+      "post_dedupe_duplicates": 0,
+      "pre_dedupe_duplicates": 0,
+      "records_missing_from_sink": 0,
+      "records_processed": 110000,
+      "records_raw_in_clickhouse": 110000,
+      "records_visible_in_clickhouse": 110000
+    }
+  ],
+  "schema_version": 2,
+  "summary": {
+    "ack_invariant_checks_reported": 0,
+    "iterations": 1,
+    "notes": "Row 7.2 first cut: counts-based correctness only. Full ack_invariant_checks land alongside the TestObservableSink trait refactor.",
+    "passed": true,
+    "required_sinks": [
+      "clickhouse"
+    ]
+  }
+}

@@ -1,0 +1,24 @@
+{
+  "ended_at": "2026-05-14T01:05:23Z",
+  "experiment": {
+    "dimensions": [
+      "serialization_format",
+      "http_client_mode"
+    ],
+    "fixed_controls": {
+      "records_per_source_range": 1000,
+      "timed_payloads": 100,
+      "warmup_payloads": 10
+    },
+    "kind": "matrix",
+    "matrix_file": "matrix.json"
+  },
+  "notes": "Phase 7.6 lightweight matrix: 4 points (format × http_mode), 1000 records/payload × 10 warmup + 100 timed; testcontainers default CH",
+  "owner": "Benchmark/Perf Implementor",
+  "phase": "phase07-clickhouse-throughput",
+  "schema_version": 2,
+  "started_at": "2026-05-14T01:04:44Z",
+  "unit_id": "7.6",
+  "unit_title": "Sweep workload × sink × format × http_mode (matrix experiment per benchmarks.md)",
+  "varied_param": null
+}

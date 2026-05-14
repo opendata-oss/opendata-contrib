@@ -262,6 +262,7 @@ impl IngestorConfig {
             request_timeout: Duration::from_secs(self.runtime.request_timeout_secs),
             max_attempts: self.runtime.retry_max_attempts,
             initial_backoff: Duration::from_millis(self.runtime.retry_initial_backoff_ms),
+            ..Default::default()
         }
     }
 

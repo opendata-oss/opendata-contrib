@@ -69,6 +69,63 @@ impl RowValue {
             }
         }
     }
+
+    /// Append this value's RowBinary encoding to `out` per the
+    /// ClickHouse RowBinary spec. Used by the row 7.4 serializer.
+    ///
+    /// * `String` / `LowCardinality(String)` — LEB128 length, then bytes.
+    /// * `UInt8`  — 1 byte LE.
+    /// * `UInt32` — 4 bytes LE.
+    /// * `UInt64` — 8 bytes LE.
+    /// * `Int32`  — 4 bytes LE (two's complement).
+    /// * `Int64`  — 8 bytes LE (two's complement).
+    /// * `DateTime64(9)` — 8 bytes LE, i64 nanoseconds since Unix epoch.
+    /// * `Map(K, V)` — LEB128 count, then alternating K, V (each
+    ///   encoded per its own type rule). Order follows the
+    ///   `BTreeMap` iteration order (lexicographic on key).
+    pub fn write_row_binary(&self, out: &mut Vec<u8>) {
+        match self {
+            RowValue::String(s) | RowValue::LowCardinalityString(s) => {
+                write_varuint(out, s.len() as u64);
+                out.extend_from_slice(s.as_bytes());
+            }
+            RowValue::UInt8(v) => out.push(*v),
+            RowValue::Int32(v) => out.extend_from_slice(&v.to_le_bytes()),
+            RowValue::UInt32(v) => out.extend_from_slice(&v.to_le_bytes()),
+            RowValue::UInt64(v) => out.extend_from_slice(&v.to_le_bytes()),
+            RowValue::Int64(v) => out.extend_from_slice(&v.to_le_bytes()),
+            RowValue::DateTime64Nanos(ns) => {
+                // Wire encoding is i64 ns. `DateTime64Nanos` is stored
+                // as u64 (matches OTLP's time_unix_nano shape); cast to
+                // i64 for the wire. Real-world timestamps fit i64.
+                let signed = *ns as i64;
+                out.extend_from_slice(&signed.to_le_bytes());
+            }
+            RowValue::StringMap(m) => {
+                write_varuint(out, m.len() as u64);
+                for (k, v) in m {
+                    write_varuint(out, k.len() as u64);
+                    out.extend_from_slice(k.as_bytes());
+                    write_varuint(out, v.len() as u64);
+                    out.extend_from_slice(v.as_bytes());
+                }
+            }
+        }
+    }
+}
+
+/// LEB128 unsigned varint encoding. ClickHouse RowBinary header
+/// and `String` / `Map` length prefixes use this.
+pub fn write_varuint(out: &mut Vec<u8>, mut value: u64) {
+    loop {
+        let byte = (value & 0x7F) as u8;
+        value >>= 7;
+        if value == 0 {
+            out.push(byte);
+            return;
+        }
+        out.push(byte | 0x80);
+    }
 }
 
 fn format_datetime64_ns(unix_nanos: u64) -> String {

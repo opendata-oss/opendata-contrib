@@ -345,6 +345,69 @@ pub async fn run_iteration(
     })
 }
 
+/// ClickHouse-side histogram samples captured by the writer (row
+/// 7.3 metric families). Populated by [`collect_bench_samples`] when
+/// the snapshot contains writer-emitted histograms; the in-memory
+/// dry-run bench leaves these empty.
+#[derive(Debug, Default, Clone)]
+pub struct ClickHouseSamples {
+    pub serialize_duration_seconds: Vec<f64>,
+    pub insert_duration_seconds: Vec<f64>,
+    pub serialized_bytes: Vec<f64>,
+    pub chunk_rows: Vec<f64>,
+}
+
+/// Walk the snapshot and collect both the runtime stage histograms
+/// and the writer-side `clickhouse_*` histograms in a single pass.
+/// Consumes the snapshot because `Snapshot` is `!Clone`.
+pub fn collect_bench_samples(snapshot: Snapshot) -> (StageSamples, ClickHouseSamples) {
+    let mut stages = StageSamples::default();
+    let mut ch = ClickHouseSamples::default();
+    for (key, _unit, _desc, value) in snapshot.into_vec() {
+        let name = key.key().name();
+        let DebugValue::Histogram(hist) = value else {
+            continue;
+        };
+        match name {
+            n if n == opendata_ingest_runtime::metrics::STAGE_LATENCY_SECONDS => {
+                let stage_label = key.key().labels().find_map(|l| {
+                    if l.key() == "stage" {
+                        Some(l.value().to_string())
+                    } else {
+                        None
+                    }
+                });
+                if let Some(stage) = stage_label.as_deref().and_then(Stage::parse) {
+                    let bucket: &mut Vec<f64> = match stage {
+                        Stage::Source => &mut stages.source,
+                        Stage::Fetch => &mut stages.fetch,
+                        Stage::Decode => &mut stages.decode,
+                        Stage::SinkDispatch => &mut stages.sink_dispatch,
+                    };
+                    bucket.extend(hist.iter().map(|v| v.into_inner()));
+                }
+            }
+            "clickhouse_serialization_duration_seconds" => {
+                ch.serialize_duration_seconds
+                    .extend(hist.iter().map(|v| v.into_inner()));
+            }
+            "clickhouse_insert_duration_seconds" => {
+                ch.insert_duration_seconds
+                    .extend(hist.iter().map(|v| v.into_inner()));
+            }
+            "clickhouse_serialized_bytes" => {
+                ch.serialized_bytes
+                    .extend(hist.iter().map(|v| v.into_inner()));
+            }
+            "clickhouse_chunk_rows" => {
+                ch.chunk_rows.extend(hist.iter().map(|v| v.into_inner()));
+            }
+            _ => {}
+        }
+    }
+    (stages, ch)
+}
+
 /// Walk the snapshot and collect the histogram sample vectors for
 /// every `runtime_stage_latency_seconds{stage=...}` series. Returns
 /// the four-stage tuple; missing stages produce empty vecs.

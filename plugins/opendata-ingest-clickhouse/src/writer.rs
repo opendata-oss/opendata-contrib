@@ -1,22 +1,28 @@
 //! ClickHouse writer.
 //!
 //! Sync inserts only. Each chunk goes out as one HTTP `INSERT INTO ...
-//! FORMAT JSONEachRow` request with `async_insert=0`,
+//! FORMAT <X>` request with `async_insert=0`,
 //! `insert_deduplication_token=<chunk token>`, and an optional
-//! `insert_quorum`. JSONEachRow keeps `Map(LowCardinality(String), String)`
-//! columns straightforward; switching to `RowBinaryWithNamesAndTypes` is a
-//! future optimization (see RFC 0003 open questions).
+//! `insert_quorum`. Phase 7.3 made the serializer pluggable via
+//! [`ChunkSerializer`]: row 7.3 ships JSONEachRow (default; bit-identical
+//! with the pre-7.3 path), row 7.4 lands RowBinaryWithNamesAndTypes
+//! alongside.
 //!
 //! Errors are classified into retryable vs non-retryable so the runtime
 //! can apply backoff for retryable failures and halt for the rest.
 
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
-use serde_json::Value as JsonValue;
 use thiserror::Error;
 use tracing::{debug, warn};
 
 use crate::adapter::InsertChunk;
+use crate::metrics::{
+    CHUNK_ROWS, HTTP_CONCURRENT_INFLIGHT, INSERT_DURATION_SECONDS, InsertResult,
+    SERIALIZATION_DURATION_SECONDS, SERIALIZED_BYTES,
+};
+use crate::serializer::{ChunkSerializer, SerializationFormat, build_serializer};
 
 /// Metric name shared with `clickhouse-ingestor::metrics`. Emitted
 /// per-attempt by the writer; the registry-side `describe_counter!`
@@ -68,6 +74,38 @@ impl WriterError {
     }
 }
 
+/// How the writer manages its HTTP client. Phase 7.5 lands the
+/// pooled variant alongside the legacy per-call mode so row 7.6's
+/// matrix sweep can compare them.
+#[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum HttpClientMode {
+    /// Build a fresh `reqwest::Client` per HTTP attempt. Matches
+    /// the pre-7.5 writer; surfaces silent-insert-drop history in
+    /// the comment on `http_client`.
+    #[default]
+    PerCall,
+    /// Hold one shared `reqwest::Client` for the writer's lifetime
+    /// with a configured idle pool. `reqwest::Client` is `Arc`-shared
+    /// internally so the connection pool is reused across cloned
+    /// handles.
+    Pooled {
+        /// `reqwest::ClientBuilder::pool_max_idle_per_host`.
+        pool_max_idle_per_host: usize,
+        /// `reqwest::ClientBuilder::pool_idle_timeout`.
+        pool_idle_timeout_ms: u64,
+    },
+}
+
+impl HttpClientMode {
+    pub fn as_label(&self) -> &'static str {
+        match self {
+            Self::PerCall => "per_call",
+            Self::Pooled { .. } => "pooled",
+        }
+    }
+}
+
 /// Configuration for the writer.
 #[derive(Debug, Clone)]
 pub struct WriterConfig {
@@ -82,6 +120,13 @@ pub struct WriterConfig {
     pub max_attempts: u32,
     /// Initial backoff between retry attempts; doubles each attempt.
     pub initial_backoff: Duration,
+    /// Wire format the writer hands ClickHouse for each chunk
+    /// (`INSERT ... FORMAT <X>`). Default: JSONEachRow (matches the
+    /// pre-7.3 writer behavior).
+    pub serialization_format: SerializationFormat,
+    /// HTTP client management mode. Default: PerCall (matches the
+    /// pre-7.5 writer).
+    pub http_client_mode: HttpClientMode,
 }
 
 impl Default for WriterConfig {
@@ -93,6 +138,8 @@ impl Default for WriterConfig {
             request_timeout: Duration::from_secs(30),
             max_attempts: 6,
             initial_backoff: Duration::from_millis(100),
+            serialization_format: SerializationFormat::default(),
+            http_client_mode: HttpClientMode::default(),
         }
     }
 }
@@ -107,24 +154,62 @@ impl Default for WriterConfig {
 #[derive(Clone)]
 pub struct ClickHouseWriter {
     config: WriterConfig,
+    serializer: Arc<dyn ChunkSerializer>,
+    /// Some when `http_client_mode == Pooled`; None when PerCall
+    /// (each call constructs a fresh client).
+    pooled_client: Option<reqwest::Client>,
 }
 
 impl ClickHouseWriter {
     pub fn new(config: WriterConfig) -> Self {
-        Self { config }
+        let serializer = build_serializer(config.serialization_format);
+        let pooled_client = match &config.http_client_mode {
+            HttpClientMode::PerCall => None,
+            HttpClientMode::Pooled {
+                pool_max_idle_per_host,
+                pool_idle_timeout_ms,
+            } => match reqwest::Client::builder()
+                .timeout(config.request_timeout)
+                .http1_only()
+                .pool_max_idle_per_host(*pool_max_idle_per_host)
+                .pool_idle_timeout(Duration::from_millis(*pool_idle_timeout_ms))
+                .build()
+            {
+                Ok(c) => Some(c),
+                Err(e) => {
+                    // Fall back to PerCall semantics if the pooled
+                    // builder fails — the per-call path then handles
+                    // its own builder errors classically.
+                    tracing::warn!("pooled reqwest builder failed, falling back to per-call: {e}");
+                    None
+                }
+            },
+        };
+        Self {
+            config,
+            serializer,
+            pooled_client,
+        }
     }
 
     pub fn config(&self) -> &WriterConfig {
         &self.config
     }
 
-    /// Build a fresh reqwest client per call. The runtime's testcontainers
-    /// flow surfaced silent insert drops when a pooled HTTP/1.1
-    /// connection got reused across tokio tasks; per-call clients
-    /// (with HTTP/1.1, pool disabled) keep the wire shape predictable.
-    /// We can switch to a shared client once the underlying issue is
-    /// understood.
+    /// `http_mode` label for the per-attempt
+    /// `clickhouse_insert_duration_seconds{http_mode}` metric.
+    fn http_mode_label(&self) -> &'static str {
+        self.config.http_client_mode.as_label()
+    }
+
+    /// Return the HTTP client for this attempt. In pooled mode the
+    /// `reqwest::Client` is `Arc`-shared internally and cheap to
+    /// clone; in per-call mode a fresh builder runs each call (the
+    /// historical no-silent-drop shape).
     fn http_client(&self) -> Result<reqwest::Client, WriterError> {
+        if let Some(c) = &self.pooled_client {
+            return Ok(c.clone());
+        }
         reqwest::Client::builder()
             .timeout(self.config.request_timeout)
             .http1_only()
@@ -145,19 +230,49 @@ impl ClickHouseWriter {
     }
 
     /// Execute a single chunk with classified retry. Same-token replays
-    /// are dedup-safe at the table level.
+    /// are dedup-safe at the table level. Emits the four Phase 7.3
+    /// metric families: `clickhouse_serialization_duration_seconds`,
+    /// `clickhouse_serialized_bytes`, and `clickhouse_chunk_rows`
+    /// (one sample per chunk), plus `clickhouse_insert_duration_seconds`
+    /// (one sample per HTTP INSERT attempt; labelled with the result).
     pub async fn execute_chunk(&self, chunk: &InsertChunk) -> Result<(), WriterError> {
-        let body = render_jsoneachrow(chunk)?;
-        // SQL is the bare INSERT (no SETTINGS clause). Settings ride
-        // as URL query params so the body shape exactly matches the
-        // simple-insert path that ClickHouse always accepts.
-        let sql = render_insert_sql_clean(chunk);
+        let format = self.serializer.format();
+        let format_label = format.as_label();
+        let serialize_start = Instant::now();
+        let body = self.serializer.serialize(chunk)?;
+        let serialize_secs = serialize_start.elapsed().as_secs_f64();
+        metrics::histogram!(SERIALIZATION_DURATION_SECONDS, "format" => format_label)
+            .record(serialize_secs);
+        metrics::histogram!(SERIALIZED_BYTES, "format" => format_label).record(body.len() as f64);
+        metrics::histogram!(CHUNK_ROWS, "format" => format_label).record(chunk.rows_count() as f64);
+
+        let sql = render_insert_sql_clean(chunk, format);
+        let http_mode = self.http_mode_label();
 
         let mut attempt: u32 = 0;
         let mut backoff = self.config.initial_backoff;
         loop {
             attempt += 1;
-            match self.execute_once(&sql, &body, chunk).await {
+            let attempt_start = Instant::now();
+            let result = self.execute_once(&sql, &body, chunk).await;
+            let attempt_secs = attempt_start.elapsed().as_secs_f64();
+            let attempt_label = match &result {
+                Ok(()) => InsertResult::Ok,
+                Err(e) => match e.class() {
+                    WriterErrorClass::Retryable => InsertResult::Retryable,
+                    WriterErrorClass::NonRetryable => InsertResult::NonRetryable,
+                    WriterErrorClass::RetryBudgetExhausted => InsertResult::RetryBudgetExhausted,
+                },
+            };
+            metrics::histogram!(
+                INSERT_DURATION_SECONDS,
+                "format" => format_label,
+                "http_mode" => http_mode,
+                "result" => attempt_label.as_label(),
+            )
+            .record(attempt_secs);
+
+            match result {
                 Ok(()) => {
                     debug!(
                         attempt,
@@ -201,24 +316,23 @@ impl ClickHouseWriter {
     async fn execute_once(
         &self,
         sql_clean: &str,
-        body: &str,
+        body: &[u8],
         chunk: &InsertChunk,
     ) -> Result<(), WriterError> {
         // SQL+data combined in body (no SETTINGS clause); per-request
         // settings ride as URL query params. This matches the curl
         // shape ClickHouse 23.3 accepts most consistently.
-        let mut combined = String::with_capacity(sql_clean.len() + 2 + body.len());
-        combined.push_str(sql_clean);
-        combined.push('\n');
-        combined.push_str(body);
+        let mut combined = Vec::with_capacity(sql_clean.len() + 2 + body.len());
+        combined.extend_from_slice(sql_clean.as_bytes());
+        combined.push(b'\n');
+        combined.extend_from_slice(body);
         if let Ok(path) = std::env::var("INGESTOR_DUMP_INSERT_BODY") {
-            let _ = std::fs::write(&path, combined.as_bytes());
+            let _ = std::fs::write(&path, &combined);
             tracing::debug!(path = %path, "dumped insert body");
         }
 
         let url = build_insert_url(&self.config.endpoint, chunk, self.config.request_timeout);
-        let body_bytes = combined.into_bytes();
-        let body_len = body_bytes.len();
+        let body_len = combined.len();
         tracing::debug!(
             url = %url,
             body_len,
@@ -228,14 +342,18 @@ impl ClickHouseWriter {
         let mut req = http
             .post(&url)
             .header(reqwest::header::CONTENT_LENGTH, body_len.to_string())
-            .body(body_bytes);
+            .body(combined);
         if !self.config.user.is_empty() {
             req = req.header("X-ClickHouse-User", &self.config.user);
         }
         if !self.config.password.is_empty() {
             req = req.header("X-ClickHouse-Key", &self.config.password);
         }
-        let resp = req.send().await.map_err(|e| classify_reqwest(&e))?;
+        let http_mode = self.http_mode_label();
+        metrics::gauge!(HTTP_CONCURRENT_INFLIGHT, "http_mode" => http_mode).increment(1.0);
+        let send_result = req.send().await;
+        metrics::gauge!(HTTP_CONCURRENT_INFLIGHT, "http_mode" => http_mode).decrement(1.0);
+        let resp = send_result.map_err(|e| classify_reqwest(&e))?;
         let status = resp.status();
         let resp_body = resp.text().await.unwrap_or_default();
         if status.is_success() {
@@ -311,13 +429,14 @@ fn classify_status(status: u16, body: &str) -> WriterError {
     }
 }
 
-fn render_insert_sql_clean(chunk: &InsertChunk) -> String {
-    // No SETTINGS clause, no column list. JSONEachRow keys rows by
-    // field name. This is the universally-accepted INSERT shape;
-    // settings ride as URL query params.
+fn render_insert_sql_clean(chunk: &InsertChunk, format: SerializationFormat) -> String {
+    // No SETTINGS clause, no column list. `FORMAT <X>` matches the
+    // serializer chosen above. Settings ride as URL query params.
     format!(
-        "INSERT INTO {}.{} FORMAT JSONEachRow",
-        chunk.database, chunk.table
+        "INSERT INTO {}.{} FORMAT {}",
+        chunk.database,
+        chunk.table,
+        format.format_keyword(),
     )
 }
 
@@ -341,29 +460,6 @@ fn build_insert_url(endpoint: &str, chunk: &InsertChunk, timeout: Duration) -> S
         let _ = write!(&mut url, "&max_execution_time={}", timeout.as_secs());
     }
     url
-}
-
-/// Serialize the chunk's rows into ndjson for the `JSONEachRow` body.
-fn render_jsoneachrow(chunk: &InsertChunk) -> Result<String, WriterError> {
-    let mut out = String::with_capacity(chunk.rows.len() * 256);
-    for row in &chunk.rows {
-        if row.len() != chunk.columns.len() {
-            return Err(WriterError::Serialization(format!(
-                "row has {} values but {} columns are expected",
-                row.len(),
-                chunk.columns.len()
-            )));
-        }
-        let mut obj = serde_json::Map::with_capacity(row.len());
-        for (col, value) in chunk.columns.iter().zip(row.iter()) {
-            obj.insert((*col).to_string(), value.to_json());
-        }
-        let line = serde_json::to_string(&JsonValue::Object(obj))
-            .map_err(|e| WriterError::Serialization(e.to_string()))?;
-        out.push_str(&line);
-        out.push('\n');
-    }
-    Ok(out)
 }
 
 #[cfg(test)]
@@ -391,36 +487,8 @@ mod tests {
     #[test]
     fn insert_sql_is_well_formed() {
         let c = chunk(vec![]);
-        let sql = render_insert_sql_clean(&c);
+        let sql = render_insert_sql_clean(&c, SerializationFormat::JsonEachRow);
         assert_eq!(sql, "INSERT INTO responsive.logs FORMAT JSONEachRow");
-    }
-
-    #[test]
-    fn jsoneachrow_emits_one_object_per_row() {
-        let c = chunk(vec![
-            vec![RowValue::String("x".into()), RowValue::UInt64(1)],
-            vec![RowValue::String("y".into()), RowValue::UInt64(2)],
-        ]);
-        let body = render_jsoneachrow(&c).expect("render");
-        let lines: Vec<&str> = body.lines().collect();
-        assert_eq!(lines.len(), 2);
-        let row0: JsonValue = serde_json::from_str(lines[0]).unwrap();
-        assert_eq!(row0["a"], "x");
-        assert_eq!(row0["b"], 1);
-        let row1: JsonValue = serde_json::from_str(lines[1]).unwrap();
-        assert_eq!(row1["a"], "y");
-        assert_eq!(row1["b"], 2);
-    }
-
-    #[test]
-    fn jsoneachrow_rejects_row_column_mismatch() {
-        let mut c = chunk(vec![vec![RowValue::String("x".into())]]);
-        c.columns = vec!["a", "b"];
-        let err = render_jsoneachrow(&c).unwrap_err();
-        match err {
-            WriterError::Serialization(msg) => assert!(msg.contains("row has 1 values")),
-            other => panic!("unexpected error: {other:?}"),
-        }
     }
 
     #[test]
@@ -478,6 +546,7 @@ mod tests {
             request_timeout: Duration::from_millis(100),
             max_attempts: 1,
             initial_backoff: Duration::from_millis(1),
+            ..Default::default()
         });
         // Minimum viable chunk: one row, one column. The body
         // never reaches the network because the connect fails.

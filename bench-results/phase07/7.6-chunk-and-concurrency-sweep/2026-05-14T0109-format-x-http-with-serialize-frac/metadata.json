@@ -1,0 +1,24 @@
+{
+  "ended_at": "2026-05-14T01:09:56Z",
+  "experiment": {
+    "dimensions": [
+      "serialization_format",
+      "http_client_mode"
+    ],
+    "fixed_controls": {
+      "records_per_source_range": 1000,
+      "timed_payloads": 100,
+      "warmup_payloads": 10
+    },
+    "kind": "matrix",
+    "matrix_file": "matrix.json"
+  },
+  "notes": "Phase 7.6 matrix re-run with serialize_fraction_of_insert + clickhouse_* metrics surfaced",
+  "owner": "Benchmark/Perf Implementor",
+  "phase": "phase07-clickhouse-throughput",
+  "schema_version": 2,
+  "started_at": "2026-05-14T01:09:17Z",
+  "unit_id": "7.6",
+  "unit_title": "Sweep workload × sink × format × http_mode (matrix experiment per benchmarks.md)",
+  "varied_param": null
+}

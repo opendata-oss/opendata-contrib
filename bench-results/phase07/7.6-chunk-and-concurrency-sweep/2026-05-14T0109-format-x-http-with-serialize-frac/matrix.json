@@ -1,0 +1,114 @@
+{
+  "dimensions": [
+    "serialization_format",
+    "http_client_mode"
+  ],
+  "fixed_controls": {
+    "records_per_source_range": 1000,
+    "timed_payloads": 100,
+    "warmup_payloads": 10
+  },
+  "points": [
+    {
+      "coordinates": {
+        "http_client_mode": "per_call",
+        "serialization_format": "json_each_row"
+      },
+      "correctness_passed": true,
+      "id": "point-001",
+      "scalars": {
+        "end_to_end_seconds_per_record": 0.00013708438826363635,
+        "iteration_elapsed_seconds_median": 15.079282709,
+        "iterations": 1,
+        "serialization_bytes_per_record": 500.7,
+        "serialize_fraction_of_insert": 0.004174022035482875,
+        "serialize_seconds_per_record": 2.2375681727272732e-6,
+        "total_throughput_records_per_sec": 7294.776689500424,
+        "worker_utilization": {
+          "decode": 0.0009594454211913538,
+          "fetch": 2.3618331645671394e-6,
+          "sink_dispatch": 0.9839481990011679,
+          "source": 0.0002501967151095475
+        }
+      },
+      "subdir": "point-001"
+    },
+    {
+      "coordinates": {
+        "http_client_mode": "pooled",
+        "serialization_format": "json_each_row"
+      },
+      "correctness_passed": true,
+      "id": "point-002",
+      "scalars": {
+        "end_to_end_seconds_per_record": 5.481626890909091e-6,
+        "iteration_elapsed_seconds_median": 0.602978958,
+        "iterations": 1,
+        "serialization_bytes_per_record": 500.7,
+        "serialize_fraction_of_insert": 0.13158623557150745,
+        "serialize_seconds_per_record": 2.3057003272727275e-6,
+        "total_throughput_records_per_sec": 182427.59310350593,
+        "worker_utilization": {
+          "decode": 0.02383379976917868,
+          "fetch": 0.00006068060006830285,
+          "sink_dispatch": 0.9552084659975815,
+          "source": 0.004637483552120902
+        }
+      },
+      "subdir": "point-002"
+    },
+    {
+      "coordinates": {
+        "http_client_mode": "per_call",
+        "serialization_format": "row_binary"
+      },
+      "correctness_passed": true,
+      "id": "point-003",
+      "scalars": {
+        "end_to_end_seconds_per_record": 0.00013958962424545456,
+        "iteration_elapsed_seconds_median": 15.354858667,
+        "iterations": 1,
+        "serialization_bytes_per_record": 182.96545454545455,
+        "serialize_fraction_of_insert": 0.0002009533880286887,
+        "serialize_seconds_per_record": 1.1019545454545456e-7,
+        "total_throughput_records_per_sec": 7163.856235056546,
+        "worker_utilization": {
+          "decode": 0.000831700051882998,
+          "fetch": 2.4069580060303398e-6,
+          "sink_dispatch": 0.9850053853641244,
+          "source": 0.00026139615395002455
+        }
+      },
+      "subdir": "point-003"
+    },
+    {
+      "coordinates": {
+        "http_client_mode": "pooled",
+        "serialization_format": "row_binary"
+      },
+      "correctness_passed": true,
+      "id": "point-004",
+      "scalars": {
+        "end_to_end_seconds_per_record": 3.7212651454545453e-6,
+        "iteration_elapsed_seconds_median": 0.409339166,
+        "iterations": 1,
+        "serialization_bytes_per_record": 182.96545454545455,
+        "serialize_fraction_of_insert": 0.008495434937891353,
+        "serialize_seconds_per_record": 1.0680795454545455e-7,
+        "total_throughput_records_per_sec": 268725.8125698141,
+        "worker_utilization": {
+          "decode": 0.047029154180667866,
+          "fetch": 0.000085032481353128,
+          "sink_dispatch": 0.926250594232168,
+          "source": 0.006285650662609698
+        }
+      },
+      "subdir": "point-004"
+    }
+  ],
+  "schema_version": 2,
+  "skip_summary": {
+    "notes": "Row 7.6 lightweight: only format × http_mode dimensions; the workload-axis correctness check from the design's full 6-axis sweep doesn't apply here.",
+    "rule_1_workload_axis_correctness_check_inert_pairs": 0
+  }
+}

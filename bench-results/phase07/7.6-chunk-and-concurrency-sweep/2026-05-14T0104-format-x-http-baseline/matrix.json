@@ -1,0 +1,98 @@
+{
+  "dimensions": [
+    "serialization_format",
+    "http_client_mode"
+  ],
+  "fixed_controls": {
+    "records_per_source_range": 1000,
+    "timed_payloads": 100,
+    "warmup_payloads": 10
+  },
+  "points": [
+    {
+      "coordinates": {
+        "http_client_mode": "per_call",
+        "serialization_format": "json_each_row"
+      },
+      "correctness_passed": true,
+      "id": "point-001",
+      "scalars": {
+        "iteration_elapsed_seconds_median": 15.241137042,
+        "iterations": 1,
+        "total_throughput_records_per_sec": 7217.30929240207,
+        "worker_utilization": {
+          "decode": 0.0011015349579060628,
+          "fetch": 3.08617066235812e-6,
+          "sink_dispatch": 0.9768774824490549,
+          "source": 0.0002409403570009579
+        }
+      },
+      "subdir": "point-001"
+    },
+    {
+      "coordinates": {
+        "http_client_mode": "pooled",
+        "serialization_format": "json_each_row"
+      },
+      "correctness_passed": true,
+      "id": "point-002",
+      "scalars": {
+        "iteration_elapsed_seconds_median": 0.663554167,
+        "iterations": 1,
+        "total_throughput_records_per_sec": 165773.95707922665,
+        "worker_utilization": {
+          "decode": 0.04496463436420557,
+          "fetch": 0.00008518483164012744,
+          "sink_dispatch": 0.9522796734995103,
+          "source": 0.004993113094262281
+        }
+      },
+      "subdir": "point-002"
+    },
+    {
+      "coordinates": {
+        "http_client_mode": "per_call",
+        "serialization_format": "row_binary"
+      },
+      "correctness_passed": true,
+      "id": "point-003",
+      "scalars": {
+        "iteration_elapsed_seconds_median": 15.5947935,
+        "iterations": 1,
+        "total_throughput_records_per_sec": 7053.636202364591,
+        "worker_utilization": {
+          "decode": 0.0011230016928406267,
+          "fetch": 3.5371580906153068e-6,
+          "sink_dispatch": 0.9859598106893819,
+          "source": 0.0007979366318637038
+        }
+      },
+      "subdir": "point-003"
+    },
+    {
+      "coordinates": {
+        "http_client_mode": "pooled",
+        "serialization_format": "row_binary"
+      },
+      "correctness_passed": true,
+      "id": "point-004",
+      "scalars": {
+        "iteration_elapsed_seconds_median": 0.378668542,
+        "iterations": 1,
+        "total_throughput_records_per_sec": 290491.5190974591,
+        "worker_utilization": {
+          "decode": 0.04297513707911864,
+          "fetch": 0.0000968195028991872,
+          "sink_dispatch": 0.9386021931549838,
+          "source": 0.007519893215740115
+        }
+      },
+      "subdir": "point-004"
+    }
+  ],
+  "schema_version": 2,
+  "skip_summary": {
+    "notes": "Row 7.6 lightweight: only format × http_mode dimensions; the workload-axis correctness check from the design's full 6-axis sweep doesn't apply here.",
+    "rule_1_workload_axis_correctness_check_inert_pairs": 0
+  }
+}

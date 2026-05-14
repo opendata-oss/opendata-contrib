@@ -131,6 +131,7 @@ async fn clickhouse_round_trip_with_dedup() -> Result<(), Box<dyn std::error::Er
         request_timeout: Duration::from_secs(15),
         max_attempts: 4,
         initial_backoff: Duration::from_millis(100),
+        ..Default::default()
     });
 
     let database = "responsive_test";

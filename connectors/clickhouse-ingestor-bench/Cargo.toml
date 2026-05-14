@@ -20,6 +20,11 @@ name = "phase07-real-ch-smoke"
 path = "src/bin/phase07_real_ch_smoke.rs"
 required-features = ["real-ch"]
 
+[[bin]]
+name = "phase07-matrix"
+path = "src/bin/phase07_matrix.rs"
+required-features = ["real-ch"]
+
 [features]
 # Phase 7.2: testcontainers-driven real-ClickHouse harness.
 # Defaults to off so `cargo test -p clickhouse-ingestor-bench`

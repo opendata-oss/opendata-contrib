@@ -16,9 +16,11 @@
 //! getting a real benchmark number measurable end-to-end.
 
 pub mod fixture;
+pub mod matrix;
 pub mod runner;
 pub mod workload;
 
 pub use fixture::{FixtureError, RealClickHouseFixture};
+pub use matrix::{MatrixConfig, MatrixPoint, MatrixPointResult, MatrixRunArtifacts, run_matrix};
 pub use runner::{RealChConfig, RealChIterationReport, run_real_ch};
 pub use workload::{LogWorkload, LogWorkloadConfig, WorkloadHandle};

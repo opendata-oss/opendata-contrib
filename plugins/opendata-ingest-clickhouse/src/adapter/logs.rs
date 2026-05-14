@@ -106,7 +106,7 @@ fn chunking_fingerprint(config: &LogsAdapterConfig) -> String {
     hex::encode(&digest[..8])
 }
 
-const COLUMNS: &[&str] = &[
+pub const COLUMNS: &[&str] = &[
     "Timestamp",
     "ObservedTimestamp",
     "SeverityText",

@@ -7,6 +7,8 @@
 //! lands in Phase 4.4b.
 
 pub mod adapter;
+pub mod metrics;
+pub mod serializer;
 pub mod sink;
 pub mod writer;
 
@@ -15,5 +17,9 @@ pub use adapter::{
     Adapter, AdapterError, AdapterResult, ClickHouseAdapterBatch, ClickHouseSettings, InsertChunk,
     RowValue,
 };
+pub use serializer::{
+    ChunkSerializer, JsonEachRowSerializer, RowBinarySerializer, SerializationFormat,
+    build_serializer,
+};
 pub use sink::ClickHouseSink;
-pub use writer::{ClickHouseWriter, WriterError, WriterErrorClass};
+pub use writer::{ClickHouseWriter, HttpClientMode, WriterConfig, WriterError, WriterErrorClass};
