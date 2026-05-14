@@ -17,6 +17,11 @@ pub const SINK_QUEUE_DEPTH: &str = "runtime_sink_queue_depth";
 pub const SINK_INFLIGHT_BYTES: &str = "runtime_sink_inflight_bytes";
 pub const DESCRIPTORS_HANDED_OUT_TOTAL: &str = "runtime_descriptors_handed_out_total";
 pub const ACK_LAG_SECONDS: &str = "runtime_ack_lag_seconds";
+/// `head_sequence − last_acked_sequence`, as observed by the consumer
+/// at the last manifest read/write. Surfaced as a gauge labelled
+/// `source` so the Phase 8 cell-bench bottleneck classifier can detect
+/// when ingestor work falls behind manifest growth.
+pub const BUFFER_CONSUMER_SEQUENCE_LAG: &str = "buffer_consumer_sequence_lag";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BackpressureReason {

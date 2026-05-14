@@ -2207,6 +2207,7 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 [[package]]
 name = "opendata-buffer"
 version = "0.2.0"
+source = "git+https://github.com/opendata-oss/opendata.git?rev=39b02fc84cc63c3a3cf05d885864dcdca6e1cc7f#39b02fc84cc63c3a3cf05d885864dcdca6e1cc7f"
 dependencies = [
  "bytes",
  "futures",
@@ -2225,6 +2226,7 @@ dependencies = [
 [[package]]
 name = "opendata-common"
 version = "0.1.14"
+source = "git+https://github.com/opendata-oss/opendata.git?rev=39b02fc84cc63c3a3cf05d885864dcdca6e1cc7f#39b02fc84cc63c3a3cf05d885864dcdca6e1cc7f"
 dependencies = [
  "async-trait",
  "bytes",

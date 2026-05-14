@@ -1166,6 +1166,11 @@ async fn per_source_actor(
                             "source" => source_id.0.clone(),
                         )
                         .set(coordinator.pending_count() as f64);
+                        metrics::gauge!(
+                            crate::metrics::BUFFER_CONSUMER_SEQUENCE_LAG,
+                            "source" => source_id.0.clone(),
+                        )
+                        .set(source.pending_count() as f64);
                         // Per-stage breakdown (§1.4 closeout). Each
                         // stage atomic tracks the bytes attached to
                         // reservations currently owned by that

@@ -257,6 +257,14 @@ impl BufferSource {
         self.last_acked
     }
 
+    /// Number of buffer entries the consumer knows about that have not
+    /// yet been acked, equal to `head_sequence − last_acked_sequence`
+    /// as observed at the most recent manifest read or write. Surfaced
+    /// to the runtime's `buffer_consumer_sequence_lag` gauge.
+    pub fn pending_count(&self) -> usize {
+        self.consumer.len()
+    }
+
     /// Fetch up to `max` new descriptors from the manifest. Delegates
     /// directly to `Consumer::next_descriptors` (RFC 0003) — the
     /// consumer maintains its own read-ahead cursor, so successive
