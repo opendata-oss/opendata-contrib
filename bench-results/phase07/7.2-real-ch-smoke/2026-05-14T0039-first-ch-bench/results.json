@@ -1,0 +1,167 @@
+{
+  "histograms": {},
+  "iterations": [
+    {
+      "histograms": {},
+      "iteration": 1,
+      "raw_log": "raw/run-1.metrics.jsonl",
+      "raw_metrics": "raw/run-1.metrics.jsonl",
+      "scalars": {
+        "iteration_elapsed_seconds": 16.286277334,
+        "iteration_records_processed": 110000.0,
+        "iteration_throughput_records_per_sec": 6754.152452651583,
+        "post_dedupe_duplicates": 0.0,
+        "pre_dedupe_duplicates": 0.0,
+        "records_raw_in_clickhouse": 110000.0,
+        "records_visible_in_clickhouse": 110000.0
+      },
+      "stages": [
+        {
+          "median_ms_per_op": 0.010042,
+          "name": "source",
+          "ops_per_sec": 20.815069831353515,
+          "p10": 0.003958,
+          "p90": 0.030959,
+          "per_record_service_time_seconds": 4.546364545454549e-8,
+          "samples": 339,
+          "worker_count": 1,
+          "worker_utilization": 0.00030706839245330046
+        },
+        {
+          "median_ms_per_op": 0.001792,
+          "name": "fetch",
+          "ops_per_sec": 6.140138593319621,
+          "p10": 0.001583,
+          "p90": 0.005541,
+          "per_record_service_time_seconds": 2.78599090909091e-9,
+          "samples": 100,
+          "worker_count": 8,
+          "worker_utilization": 2.352125916462673e-6
+        },
+        {
+          "median_ms_per_op": 0.5770000000000001,
+          "name": "decode",
+          "ops_per_sec": 6.140138593319621,
+          "p10": 0.5337500000000001,
+          "p90": 0.750416,
+          "per_record_service_time_seconds": 5.570465909090907e-7,
+          "samples": 100,
+          "worker_count": 4,
+          "worker_utilization": 0.0009405943995574595
+        },
+        {
+          "median_ms_per_op": 648.806375,
+          "name": "sink_dispatch",
+          "ops_per_sec": 6.140138593319621,
+          "p10": 346.94375,
+          "p90": 904.648125,
+          "per_record_service_time_seconds": 0.0005829868560636365,
+          "samples": 100,
+          "worker_count": 4,
+          "worker_utilization": 0.9843955259364616
+        }
+      ]
+    }
+  ],
+  "scalars": {
+    "iteration_elapsed_seconds": {
+      "median": 16.286277334,
+      "n": 1,
+      "p10": 16.286277334,
+      "p90": 16.286277334
+    },
+    "per_record_service_time_decode": {
+      "median": 5.570465909090907e-7,
+      "n": 1,
+      "p10": 5.570465909090907e-7,
+      "p90": 5.570465909090907e-7
+    },
+    "per_record_service_time_fetch": {
+      "median": 2.78599090909091e-9,
+      "n": 1,
+      "p10": 2.78599090909091e-9,
+      "p90": 2.78599090909091e-9
+    },
+    "per_record_service_time_sink_dispatch": {
+      "median": 0.0005829868560636365,
+      "n": 1,
+      "p10": 0.0005829868560636365,
+      "p90": 0.0005829868560636365
+    },
+    "per_record_service_time_source": {
+      "median": 4.546364545454549e-8,
+      "n": 1,
+      "p10": 4.546364545454549e-8,
+      "p90": 4.546364545454549e-8
+    },
+    "total_throughput_records_per_sec": {
+      "median": 6754.152452651583,
+      "n": 1,
+      "p10": 6754.152452651583,
+      "p90": 6754.152452651583
+    },
+    "worker_utilization_decode": {
+      "median": 0.0009405943995574595,
+      "n": 1,
+      "p10": 0.0009405943995574595,
+      "p90": 0.0009405943995574595
+    },
+    "worker_utilization_fetch": {
+      "median": 2.352125916462673e-6,
+      "n": 1,
+      "p10": 2.352125916462673e-6,
+      "p90": 2.352125916462673e-6
+    },
+    "worker_utilization_sink_dispatch": {
+      "median": 0.9843955259364616,
+      "n": 1,
+      "p10": 0.9843955259364616,
+      "p90": 0.9843955259364616
+    },
+    "worker_utilization_source": {
+      "median": 0.00030706839245330046,
+      "n": 1,
+      "p10": 0.00030706839245330046,
+      "p90": 0.00030706839245330046
+    }
+  },
+  "schema_version": 2,
+  "stages": [
+    {
+      "median_ms_per_op": 0.010042,
+      "name": "source",
+      "ops_per_sec": 20.815069831353515,
+      "p10": 0.003958,
+      "p90": 0.030959,
+      "samples": 339,
+      "worker_count": 1
+    },
+    {
+      "median_ms_per_op": 0.001792,
+      "name": "fetch",
+      "ops_per_sec": 6.140138593319621,
+      "p10": 0.001583,
+      "p90": 0.005541,
+      "samples": 100,
+      "worker_count": 8
+    },
+    {
+      "median_ms_per_op": 0.5770000000000001,
+      "name": "decode",
+      "ops_per_sec": 6.140138593319621,
+      "p10": 0.5337500000000001,
+      "p90": 0.750416,
+      "samples": 100,
+      "worker_count": 4
+    },
+    {
+      "median_ms_per_op": 648.806375,
+      "name": "sink_dispatch",
+      "ops_per_sec": 6.140138593319621,
+      "p10": 346.94375,
+      "p90": 904.648125,
+      "samples": 100,
+      "worker_count": 4
+    }
+  ]
+}

@@ -15,6 +15,27 @@ path = "src/main.rs"
 name = "phase07-stage-latencies"
 path = "src/bin/phase07_stage_latencies.rs"
 
+[[bin]]
+name = "phase07-real-ch-smoke"
+path = "src/bin/phase07_real_ch_smoke.rs"
+required-features = ["real-ch"]
+
+[features]
+# Phase 7.2: testcontainers-driven real-ClickHouse harness.
+# Defaults to off so `cargo test -p clickhouse-ingestor-bench`
+# stays Docker-free. The `phase07-real-ch-smoke` binary and the
+# real-CH integration tests require this feature.
+default = []
+real-ch = [
+  "dep:testcontainers",
+  "dep:testcontainers-modules",
+  "dep:clickhouse-ingestor",
+  "dep:opendata-ingest-clickhouse",
+  "dep:opendata-ingest-otel",
+  "dep:opentelemetry-proto",
+  "dep:prost",
+]
+
 [dependencies]
 anyhow = { workspace = true }
 async-channel = { workspace = true }
@@ -37,6 +58,15 @@ tokio = { workspace = true }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+
+# Optional deps for the `real-ch` feature.
+clickhouse-ingestor = { path = "../clickhouse-ingestor", optional = true }
+opendata-ingest-clickhouse = { path = "../../plugins/opendata-ingest-clickhouse", optional = true }
+opendata-ingest-otel = { path = "../../plugins/opendata-ingest-otel", optional = true }
+opentelemetry-proto = { workspace = true, optional = true }
+prost = { workspace = true, optional = true }
+testcontainers = { version = "0.23", optional = true }
+testcontainers-modules = { version = "0.11", optional = true, features = ["clickhouse"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }

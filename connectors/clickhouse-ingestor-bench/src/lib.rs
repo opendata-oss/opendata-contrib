@@ -17,5 +17,7 @@ pub mod correctness;
 pub mod fixtures;
 pub mod metrics_recorder;
 pub mod output;
+#[cfg(feature = "real-ch")]
+pub mod real_ch;
 pub mod stage_latencies;
 pub mod witness;
