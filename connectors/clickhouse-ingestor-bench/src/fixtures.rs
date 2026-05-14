@@ -197,31 +197,20 @@ impl Decoder for FakeDecoder {
     }
 }
 
-/// Scripted sink response. The bench's smoke run uses `Ok` for
-/// every-batch scenarios and `MaybeCommitted` for the
-/// `maybe_committed_replay_idempotent` scenario.
+/// BenchSink's internal per-attempt outcome. The
+/// [`crate::test_observable_sink::TestObservableSink`] trait
+/// exposes a higher-level `ScriptedWrite` enum (e.g.
+/// `MaybeCommittedThenOk`) that this internal type is the
+/// per-attempt expansion of.
 #[derive(Clone, Debug)]
-pub enum ScriptedWrite {
+pub(crate) enum BenchAttempt {
     Ok { rows_written: u64 },
     MaybeCommitted { message: String },
-}
-
-#[derive(Debug, Clone)]
-pub struct CapturedWrite {
-    pub identity: CommitIdentity,
-    pub identity_string: String,
 }
 
 /// Per-sequence sink latency closure. Factored out for clippy's
 /// `type_complexity` lint.
 pub type LatencyFn = Arc<dyn Fn(u64) -> Option<Duration> + Send + Sync>;
-
-/// Callback fired AFTER the sink resolves a write to `Ok(...)`.
-/// Receives the committed sequence. Used by the bench harness's
-/// `no_ack_before_sink_commit` scenario to push a SinkCommitOk
-/// event onto the same shared ordered log the runtime's
-/// `AckThroughObserver` pushes Ack events to.
-pub type CommitObserver = Arc<dyn Fn(u64) + Send + Sync>;
 
 /// Sink used by the bench's correctness scenarios. Records every
 /// `write` call (so a scenario can assert byte-identical identity
@@ -236,20 +225,19 @@ pub type CommitObserver = Arc<dyn Fn(u64) + Send + Sync>;
 #[derive(Clone)]
 pub struct BenchSink {
     id: SinkId,
-    /// Default response when no per-sequence script entry exists.
-    default_response: Arc<Mutex<ScriptedWrite>>,
-    /// Per-sequence response. Each `Vec<ScriptedWrite>` is popped
-    /// front-to-back on each call against that sequence; falls
-    /// back to `default_response` when empty / not present.
-    per_sequence_script: Arc<Mutex<std::collections::HashMap<u64, VecDeque<ScriptedWrite>>>>,
+    /// Per-sequence attempt queue. BenchSink pops the front entry
+    /// per `Sink::write` call; falls back to `Ok { rows_written: 1 }`
+    /// when empty / absent. The `TestObservableSink::set_per_sequence_forced_outcome`
+    /// trait method translates the high-level
+    /// `ScriptedWrite::MaybeCommittedThenOk` into
+    /// `[MaybeCommitted, Ok]` here.
+    per_sequence_script: Arc<Mutex<std::collections::HashMap<u64, VecDeque<BenchAttempt>>>>,
     /// Per-sequence latency. The sink sleeps `latency_fn(seq)`
     /// (if `Some(d)`) before consulting the script.
     latency_fn: Arc<Mutex<Option<LatencyFn>>>,
-    /// Optional callback fired AFTER a write resolves to `Ok`. The
-    /// scenarios that care about temporal ordering (`no_ack_before_sink_commit`)
-    /// install one that pushes a SinkCommitOk event onto a shared
-    /// ordered log.
-    commit_observer: Arc<Mutex<Option<CommitObserver>>>,
+    /// `TestObservableSink::set_commit_observer` slot. Fires after
+    /// each `Ok` write resolves.
+    commit_observer: Arc<Mutex<Option<Arc<dyn crate::test_observable_sink::CommitObserver>>>>,
     /// Per-sequence block. `write` for a sequence with a
     /// registered `CancellationToken` parks on
     /// `token.cancelled().await` BEFORE consulting the script.
@@ -259,8 +247,9 @@ pub struct BenchSink {
     /// resolves any current / future waiter (lost-wakeup safe,
     /// unlike `Notify::notify_waiters`).
     per_sequence_block: Arc<Mutex<std::collections::HashMap<u64, CancellationToken>>>,
-    /// Every successful `write` call's identity, in call order.
-    pub write_calls: Arc<Mutex<Vec<CapturedWrite>>>,
+    /// Captured-writes log accumulated by every `write` call.
+    /// Drained via `TestObservableSink::drain_captured_writes`.
+    write_calls: Arc<Mutex<Vec<crate::test_observable_sink::CapturedWrite>>>,
     check_committed_response: Arc<Mutex<CommitStatus>>,
 }
 
@@ -268,7 +257,6 @@ impl BenchSink {
     pub fn new(id: impl Into<SinkId>) -> Self {
         Self {
             id: id.into(),
-            default_response: Arc::new(Mutex::new(ScriptedWrite::Ok { rows_written: 1 })),
             per_sequence_script: Arc::new(Mutex::new(std::collections::HashMap::new())),
             latency_fn: Arc::new(Mutex::new(None)),
             commit_observer: Arc::new(Mutex::new(None)),
@@ -278,44 +266,8 @@ impl BenchSink {
         }
     }
 
-    pub fn set_default_response(&self, r: ScriptedWrite) {
-        *self.default_response.lock().unwrap() = r;
-    }
-
-    pub fn set_per_sequence_script(&self, sequence: u64, script: Vec<ScriptedWrite>) {
-        self.per_sequence_script
-            .lock()
-            .unwrap()
-            .insert(sequence, script.into());
-    }
-
     pub fn set_latency_fn(&self, f: LatencyFn) {
         *self.latency_fn.lock().unwrap() = Some(f);
-    }
-
-    /// Install a callback fired after each successful `write`
-    /// (i.e. one that resolves to `Ok(SinkCommitResult)`). The
-    /// callback fires synchronously with the sink's response
-    /// before the writer worker emits `WriteCompletion::Committed`
-    /// upstream, so events pushed here are temporally ordered
-    /// before the matching ack — that's the property the
-    /// `no_ack_before_sink_commit` scenario relies on.
-    pub fn set_commit_observer(&self, f: CommitObserver) {
-        *self.commit_observer.lock().unwrap() = Some(f);
-    }
-
-    /// Insert a per-sequence block. Returns the
-    /// `CancellationToken` controlling the gate — test releases
-    /// the block by calling `token.cancel()`. `CancellationToken`
-    /// is lost-wakeup-safe: cancelling before the writer reaches
-    /// the await still resolves the future immediately.
-    pub fn set_per_sequence_block(&self, seq: u64) -> CancellationToken {
-        let token = CancellationToken::new();
-        self.per_sequence_block
-            .lock()
-            .unwrap()
-            .insert(seq, token.clone());
-        token
     }
 
     /// Remove the block for `seq` so subsequent writes against
@@ -340,14 +292,56 @@ impl BenchSink {
         guard.as_ref().and_then(|f| f(sequence))
     }
 
-    fn next_response(&self, sequence: u64) -> ScriptedWrite {
+    fn next_attempt(&self, sequence: u64) -> BenchAttempt {
         let mut script_map = self.per_sequence_script.lock().unwrap();
         if let Some(queue) = script_map.get_mut(&sequence)
             && let Some(next) = queue.pop_front()
         {
             return next;
         }
-        self.default_response.lock().unwrap().clone()
+        BenchAttempt::Ok { rows_written: 1 }
+    }
+}
+
+#[async_trait]
+impl crate::test_observable_sink::TestObservableSink for BenchSink {
+    fn set_per_sequence_block(&self, seq: u64) -> CancellationToken {
+        let token = CancellationToken::new();
+        self.per_sequence_block
+            .lock()
+            .unwrap()
+            .insert(seq, token.clone());
+        token
+    }
+
+    fn set_per_sequence_forced_outcome(
+        &self,
+        seq: u64,
+        outcome: crate::test_observable_sink::ScriptedWrite,
+    ) {
+        let script: Vec<BenchAttempt> = match outcome {
+            crate::test_observable_sink::ScriptedWrite::Ok => {
+                vec![BenchAttempt::Ok { rows_written: 1 }]
+            }
+            crate::test_observable_sink::ScriptedWrite::MaybeCommittedThenOk => vec![
+                BenchAttempt::MaybeCommitted {
+                    message: format!("scripted MaybeCommitted on seq={seq}"),
+                },
+                BenchAttempt::Ok { rows_written: 1 },
+            ],
+        };
+        self.per_sequence_script
+            .lock()
+            .unwrap()
+            .insert(seq, script.into());
+    }
+
+    fn set_commit_observer(&self, observer: Arc<dyn crate::test_observable_sink::CommitObserver>) {
+        *self.commit_observer.lock().unwrap() = Some(observer);
+    }
+
+    fn drain_captured_writes(&self) -> Vec<crate::test_observable_sink::CapturedWrite> {
+        std::mem::take(&mut *self.write_calls.lock().unwrap())
     }
 }
 
@@ -361,16 +355,12 @@ impl Sink for BenchSink {
     }
     async fn write(&self, commit: SinkCommit) -> Result<SinkCommitResult, SinkCommitFailure> {
         let seq = commit.identity.range.high;
-        self.write_calls.lock().unwrap().push(CapturedWrite {
-            identity: commit.identity.clone(),
-            identity_string: commit.identity.to_string(),
-        });
         if let Some(d) = self.lookup_latency(seq) {
             tokio::time::sleep(d).await;
         }
         self.await_per_sequence_block(seq).await;
-        match self.next_response(seq) {
-            ScriptedWrite::Ok { rows_written } => {
+        match self.next_attempt(seq) {
+            BenchAttempt::Ok { rows_written } => {
                 // Fire the post-Ok observer SYNCHRONOUSLY with the
                 // sink's response so the event lands in the shared
                 // log before the writer worker emits the
@@ -379,14 +369,32 @@ impl Sink for BenchSink {
                 // ordering required by INV-NO-ACK-BEFORE-COMMIT.
                 let observer = self.commit_observer.lock().unwrap().clone();
                 if let Some(cb) = observer {
-                    cb(seq);
+                    cb.record_commit(&commit.identity);
                 }
+                self.write_calls
+                    .lock()
+                    .unwrap()
+                    .push(crate::test_observable_sink::CapturedWrite {
+                        identity: commit.identity.clone(),
+                        outcome: crate::test_observable_sink::WriteOutcome::Committed {
+                            rows: rows_written,
+                        },
+                    });
                 Ok(SinkCommitResult {
                     bytes_written: 0,
                     rows_written,
                 })
             }
-            ScriptedWrite::MaybeCommitted { message } => {
+            BenchAttempt::MaybeCommitted { message } => {
+                self.write_calls
+                    .lock()
+                    .unwrap()
+                    .push(crate::test_observable_sink::CapturedWrite {
+                        identity: commit.identity.clone(),
+                        outcome: crate::test_observable_sink::WriteOutcome::Failure(
+                            crate::test_observable_sink::SinkCommitFailureKind::MaybeCommitted,
+                        ),
+                    });
                 Err(SinkCommitFailure::MaybeCommitted(message.into()))
             }
         }

@@ -10,9 +10,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
-use clickhouse_ingestor_bench::fixtures::{
-    BenchSink, FakeDecoder, LatencyFn, ScriptedWrite, logs_envelope,
-};
+use clickhouse_ingestor_bench::fixtures::{BenchSink, FakeDecoder, LatencyFn, logs_envelope};
 use clickhouse_ingestor_bench::metrics_recorder::init_metrics_recorder;
 use common::ObjectStoreConfig;
 use common::clock::SystemClock;
@@ -314,15 +312,8 @@ async fn backpressure_reason_fires_on_retrying_sleep() {
     // 50 ms backoff is well above the 10 ms gating threshold
     // so the `with_backpressure_timer` arm fires reliably.
     let sink = BenchSink::new("retrying-bench-sink");
-    sink.set_per_sequence_script(
-        0,
-        vec![
-            ScriptedWrite::MaybeCommitted {
-                message: "first attempt transient".into(),
-            },
-            ScriptedWrite::Ok { rows_written: 1 },
-        ],
-    );
+    use clickhouse_ingestor_bench::test_observable_sink::{ScriptedWrite, TestObservableSink};
+    sink.set_per_sequence_forced_outcome(0, ScriptedWrite::MaybeCommittedThenOk);
     let latency: LatencyFn = Arc::new(|seq: u64| {
         if seq == 0 {
             Some(Duration::from_millis(30))

@@ -14,6 +14,7 @@
 //! the matrix runner (row 7.6) when the perf-test environment shape
 //! is settled.
 
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 use clickhouse_ingestor::writer::{ClickHouseWriter, WriterConfig};
@@ -145,6 +146,47 @@ impl RealClickHouseFixture {
             self.database, self.table
         ))
         .await
+    }
+
+    /// Order-independent fingerprint of all post-FINAL rows in
+    /// `<self.database>.<table>`. Wraps each row as
+    /// `toString(tuple(*))` then sums `cityHash64` across rows.
+    /// Sum is associative + commutative, so the result doesn't
+    /// depend on storage iteration order — two tables receiving
+    /// the same logical rows via different wire formats produce
+    /// the same fingerprint.
+    pub async fn hash_rows_in(&self, table: &str) -> Result<u64, FixtureError> {
+        self.count_scalar(&format!(
+            "SELECT sum(cityHash64(toString(tuple(*)))) FROM {}.{} FINAL",
+            self.database, table
+        ))
+        .await
+    }
+
+    /// Per-column equivalent of `hash_rows_in`. Returns a map from
+    /// column name to its order-independent fingerprint
+    /// (`sum(cityHash64(toString(col)))` post-FINAL). Lets the
+    /// `format_swap_produces_identical_column_hashes` scenario
+    /// localize a mismatch to a single column when full-row hashes
+    /// disagree.
+    pub async fn hash_columns_in(
+        &self,
+        table: &str,
+        columns: &[&str],
+    ) -> Result<BTreeMap<String, u64>, FixtureError> {
+        let mut out = BTreeMap::new();
+        for column in columns {
+            let h = self
+                .count_scalar(&format!(
+                    "SELECT sum(cityHash64(toString({col}))) FROM {db}.{table} FINAL",
+                    col = column,
+                    db = self.database,
+                    table = table,
+                ))
+                .await?;
+            out.insert((*column).to_string(), h);
+        }
+        Ok(out)
     }
 
     async fn count_scalar(&self, sql: &str) -> Result<u64, FixtureError> {

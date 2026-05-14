@@ -17,6 +17,7 @@ use std::time::Duration;
 
 use opendata_ingest_runtime::envelope::{ConfiguredEnvelope, PayloadEncoding, SignalType};
 use opendata_ingest_runtime::error::RuntimeResult;
+use opendata_ingest_runtime::identity::CommitIdentity;
 use opendata_ingest_runtime::runtime::{
     AckFlushPolicy, AckThroughObserver, AckThroughRecorder, AdmissionRecorder, Runtime,
     RuntimeOptions, SinkPoolOptions, SourceBackpressureOptions,
@@ -25,14 +26,12 @@ use serde::Serialize;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
-use crate::fixtures::{
-    BenchSink, CommitObserver, FakeDecoder, LargeDecoder, ScriptedWrite, in_memory_fixture,
-    produce_n_batches,
-};
+use crate::fixtures::{BenchSink, FakeDecoder, LargeDecoder, in_memory_fixture, produce_n_batches};
 use crate::output::{
     AckInvariantCheck, CorrectnessReport, ExperimentMeta, PerSourceCorrectness, RunMetadata,
     SummarySection,
 };
+use crate::test_observable_sink::{CommitObserver, ScriptedWrite, TestObservableSink};
 use crate::witness::WitnessWriter;
 
 /// The five named `ack_invariant_checks` from
@@ -274,11 +273,13 @@ async fn run_no_ack_before_sink_commit(
 
     let sink = BenchSink::new(SINK_LABEL);
     let sink_log = Arc::clone(&event_log);
-    let commit_observer: CommitObserver = Arc::new(move |seq: u64| {
+    let commit_observer: Arc<dyn CommitObserver> = Arc::new(move |id: &CommitIdentity| {
         sink_log
             .lock()
             .unwrap()
-            .push(CorrectnessEvent::SinkCommitOk { sequence: seq });
+            .push(CorrectnessEvent::SinkCommitOk {
+                sequence: id.range.high,
+            });
     });
     sink.set_commit_observer(commit_observer);
 
@@ -403,9 +404,10 @@ async fn run_out_of_order_completion_no_frontier_hole(
     let commits_seen: Arc<Mutex<std::collections::HashSet<u64>>> =
         Arc::new(Mutex::new(std::collections::HashSet::new()));
     let commits_seen_observer = Arc::clone(&commits_seen);
-    sink.set_commit_observer(Arc::new(move |seq| {
-        commits_seen_observer.lock().unwrap().insert(seq);
-    }));
+    let observer: Arc<dyn CommitObserver> = Arc::new(move |id: &CommitIdentity| {
+        commits_seen_observer.lock().unwrap().insert(id.range.high);
+    });
+    sink.set_commit_observer(observer);
 
     let ack_recorder: AckThroughRecorder = Arc::new(Mutex::new(Vec::new()));
     let ack_runtime = Arc::clone(&ack_recorder);
@@ -538,27 +540,11 @@ async fn run_maybe_committed_replay_idempotent(
     // Inject MaybeCommitted on seq=3, then Ok. The runtime's
     // `check_committed` returns Unknown → it retries with
     // byte-identical identity. Witness records every retry.
-    sink.set_per_sequence_script(
-        3,
-        vec![
-            ScriptedWrite::MaybeCommitted {
-                message: "transient-during-write".into(),
-            },
-            ScriptedWrite::Ok { rows_written: 1 },
-        ],
-    );
+    sink.set_per_sequence_forced_outcome(3, ScriptedWrite::MaybeCommittedThenOk);
     // Same for seq=12 to exercise more than one replay window.
-    sink.set_per_sequence_script(
-        12,
-        vec![
-            ScriptedWrite::MaybeCommitted {
-                message: "transient-during-write".into(),
-            },
-            ScriptedWrite::Ok { rows_written: 1 },
-        ],
-    );
+    sink.set_per_sequence_forced_outcome(12, ScriptedWrite::MaybeCommittedThenOk);
 
-    let writes = Arc::clone(&sink.write_calls);
+    let drainable = sink.clone();
 
     let runtime = Runtime::builder()
         .add_source(fx.source)
@@ -590,7 +576,7 @@ async fn run_maybe_committed_replay_idempotent(
     shutdown.cancel();
     handle.await.expect("join").expect("clean exit");
 
-    let writes_vec = writes.lock().unwrap().clone();
+    let writes_vec = drainable.drain_captured_writes();
 
     // Group writes by sequence. For sequences with > 1 write
     // (retry path), all identity strings must be byte-identical.
@@ -598,14 +584,15 @@ async fn run_maybe_committed_replay_idempotent(
         std::collections::HashMap::new();
     for (i, w) in writes_vec.iter().enumerate() {
         let seq = w.identity.range.high;
+        let identity_string = w.identity.to_string();
         by_sequence
             .entry(seq)
             .or_default()
-            .push(w.identity_string.clone());
+            .push(identity_string.clone());
         witness
             .write_event(&IdempotentReplayEvent {
                 sequence: seq,
-                identity: w.identity_string.clone(),
+                identity: identity_string,
                 attempt_index: i,
             })
             .map_err(io_err)?;

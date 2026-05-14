@@ -20,4 +20,5 @@ pub mod output;
 #[cfg(feature = "real-ch")]
 pub mod real_ch;
 pub mod stage_latencies;
+pub mod test_observable_sink;
 pub mod witness;

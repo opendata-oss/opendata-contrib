@@ -17,8 +17,11 @@
 
 pub mod fixture;
 pub mod matrix;
+pub mod real_clickhouse_sink;
 pub mod runner;
 pub mod workload;
+
+pub use real_clickhouse_sink::RealClickHouseSink;
 
 pub use fixture::{FixtureError, RealClickHouseFixture};
 pub use matrix::{
