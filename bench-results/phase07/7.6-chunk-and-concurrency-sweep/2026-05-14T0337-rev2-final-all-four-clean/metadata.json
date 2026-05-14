@@ -1,0 +1,24 @@
+{
+  "ended_at": "2026-05-14T04:20:32Z",
+  "experiment": {
+    "dimensions": [
+      "serialization_format",
+      "http_client_mode"
+    ],
+    "fixed_controls": {
+      "records_per_source_range": 1000,
+      "timed_payloads": 8000,
+      "warmup_payloads": 200
+    },
+    "kind": "matrix",
+    "matrix_file": "matrix.json"
+  },
+  "notes": "Phase 7.6 rev-2 final: full 4-point matrix re-run from clean HEAD b456c6b. timed_payloads=8000 chosen so the fastest point (RowBinary+Pooled) clears MIN_TIMED_WINDOW_SECONDS=20.0. PerCall points take ~19min each at ~7k rec/s; pooled points take ~30-45s. Produces one canonical matrix.json index.",
+  "owner": "Benchmark/Perf Implementor",
+  "phase": "phase07-clickhouse-throughput",
+  "schema_version": 2,
+  "started_at": "2026-05-14T03:37:13Z",
+  "unit_id": "7.6",
+  "unit_title": "Sweep workload × sink × format × http_mode (matrix experiment per benchmarks.md)",
+  "varied_param": null
+}
