@@ -17,4 +17,5 @@ pub mod correctness;
 pub mod fixtures;
 pub mod metrics_recorder;
 pub mod output;
+pub mod stage_latencies;
 pub mod witness;

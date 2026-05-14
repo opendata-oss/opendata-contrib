@@ -11,7 +11,12 @@ path = "src/lib.rs"
 name = "clickhouse-ingestor-bench"
 path = "src/main.rs"
 
+[[bin]]
+name = "phase07-stage-latencies"
+path = "src/bin/phase07_stage_latencies.rs"
+
 [dependencies]
+anyhow = { workspace = true }
 async-channel = { workspace = true }
 async-trait = "0.1"
 buffer = { workspace = true }
@@ -25,9 +30,13 @@ metrics-util = { workspace = true, features = ["debugging"] }
 opendata-ingest-runtime = { path = "../../runtime/opendata-ingest-runtime" }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 slatedb = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

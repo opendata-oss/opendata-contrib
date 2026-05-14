@@ -1076,8 +1076,14 @@ async fn per_source_actor(
 
             // 2. Completion arm — drain writer completions promptly
             //    so the byte budget recovers and admission can
-            //    park-then-resume cleanly.
+            //    park-then-resume cleanly. The arm body is timed and
+            //    recorded as `runtime_stage_latency_seconds{stage=source}`
+            //    so the Phase 7 stage-latency bench sees the source
+            //    actor's per-cycle work cost (see phase07-clickhouse-
+            //    throughput-design.md §Bottleneck Attribution
+            //    Methodology > Underlying instrument semantics).
             completion = completion_rx.recv(), if in_flight > 0 => {
+                let stage_start = std::time::Instant::now();
                 match completion {
                     Some(WriteCompletion::Committed(report)) => {
                         let ack_lag_start = std::time::Instant::now();
@@ -1181,6 +1187,12 @@ async fn per_source_actor(
                         )));
                     }
                 }
+                metrics::histogram!(
+                    crate::metrics::STAGE_LATENCY_SECONDS,
+                    "stage" => "source",
+                    "source" => source_id.0.clone(),
+                )
+                .record(stage_start.elapsed().as_secs_f64());
             }
 
             // 3. Admission arm — only when admission is open AND
@@ -1196,6 +1208,13 @@ async fn per_source_actor(
                     &bp,
                 ),
             ), if admission_open => {
+                // Time the admission arm body and record one
+                // `runtime_stage_latency_seconds{stage=source}` sample
+                // per arm execution. The parked time on backpressure
+                // is already accounted for by `with_backpressure_timer`
+                // above; this only measures the synchronous + the
+                // `next_descriptors` + the `descriptor_tx.send` work.
+                let stage_start = std::time::Instant::now();
                 let AdmissionGate { batch_permit, mut reservation } = biased_arm;
                 // Attach the reservation to the source-stage atomic
                 // so it shows up in `runtime_stage_inflight_bytes{
@@ -1212,6 +1231,12 @@ async fn per_source_actor(
                 if descriptors.is_empty() {
                     drop(reservation);
                     drop(batch_permit);
+                    metrics::histogram!(
+                        crate::metrics::STAGE_LATENCY_SECONDS,
+                        "stage" => "source",
+                        "source" => source_id.0.clone(),
+                    )
+                    .record(stage_start.elapsed().as_secs_f64());
                     tokio::time::sleep(options.poll_interval).await;
                     continue;
                 }
@@ -1248,6 +1273,12 @@ async fn per_source_actor(
                         "descriptor lost: source={source_id} seq={seq} cause=worker-stage-closed",
                     )));
                 }
+                metrics::histogram!(
+                    crate::metrics::STAGE_LATENCY_SECONDS,
+                    "stage" => "source",
+                    "source" => source_id.0.clone(),
+                )
+                .record(stage_start.elapsed().as_secs_f64());
             }
         }
     }

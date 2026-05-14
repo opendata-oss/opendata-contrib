@@ -512,6 +512,7 @@ dependencies = [
 name = "clickhouse-ingestor-bench"
 version = "0.1.2"
 dependencies = [
+ "anyhow",
  "async-channel",
  "async-trait",
  "bytes",
@@ -525,7 +526,9 @@ dependencies = [
  "opendata-ingest-runtime",
  "serde",
  "serde_json",
+ "sha2",
  "slatedb",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tokio-util",
