@@ -1,0 +1,126 @@
+{
+  "experiment_kind": "matrix",
+  "histograms": {},
+  "iterations": [],
+  "points": {
+    "point-001": {
+      "coordinates": {
+        "http_client_mode": "per_call",
+        "serialization_format": "json_each_row"
+      },
+      "correctness_passed": true,
+      "iterations": 1,
+      "scalars": {
+        "end_to_end_seconds_per_record": 0.0001520436481355,
+        "iteration_elapsed_seconds_median": 1216.349185084,
+        "per_record_service_time": {
+          "decode": 6.160770034999979e-7,
+          "fetch": 2.8438057375000065e-8,
+          "sink_dispatch": 0.0006080528885426256,
+          "source": 4.2569694250000026e-8
+        },
+        "serialization_bytes_per_record": 552.57,
+        "serialize_fraction_of_insert": 0.004283657729226185,
+        "serialize_seconds_per_record": 2.597525155249999e-6,
+        "total_throughput_records_per_sec": 6577.058708225736,
+        "worker_utilization": {
+          "decode": 0.0010129936552018197,
+          "fetch": 0.00002337984661290841,
+          "sink_dispatch": 0.9997998864127722,
+          "source": 0.0002799833782734697
+        }
+      },
+      "subdir": "point-001"
+    },
+    "point-002": {
+      "coordinates": {
+        "http_client_mode": "pooled",
+        "serialization_format": "json_each_row"
+      },
+      "correctness_passed": true,
+      "iterations": 1,
+      "scalars": {
+        "end_to_end_seconds_per_record": 7.0451486875e-6,
+        "iteration_elapsed_seconds_median": 56.3611895,
+        "per_record_service_time": {
+          "decode": 6.797974542500003e-7,
+          "fetch": 3.1814484500000027e-8,
+          "sink_dispatch": 0.000028157197146249953,
+          "source": 5.290858249999992e-8
+        },
+        "serialization_bytes_per_record": 552.57,
+        "serialize_fraction_of_insert": 0.10381983962816688,
+        "serialize_seconds_per_record": 2.7630634068749976e-6,
+        "total_throughput_records_per_sec": 141941.6458554339,
+        "worker_utilization": {
+          "decode": 0.024122892376144768,
+          "fetch": 0.0005644750364965243,
+          "sink_dispatch": 0.9991697264036612,
+          "source": 0.007509931279927996
+        }
+      },
+      "subdir": "point-002"
+    },
+    "point-003": {
+      "coordinates": {
+        "http_client_mode": "per_call",
+        "serialization_format": "row_binary"
+      },
+      "correctness_passed": true,
+      "iterations": 1,
+      "scalars": {
+        "end_to_end_seconds_per_record": 0.000151504354401,
+        "iteration_elapsed_seconds_median": 1212.034835208,
+        "per_record_service_time": {
+          "decode": 6.493891768750043e-7,
+          "fetch": 9.731752587499993e-8,
+          "sink_dispatch": 0.0006058908536093785,
+          "source": 4.4843445624999936e-8
+        },
+        "serialization_bytes_per_record": 201.262,
+        "serialize_fraction_of_insert": 0.0002145710566967084,
+        "serialize_seconds_per_record": 1.2960443099999958e-7,
+        "total_throughput_records_per_sec": 6600.470355810444,
+        "worker_utilization": {
+          "decode": 0.0010715685028369027,
+          "fetch": 0.0000802926805798441,
+          "sink_dispatch": 0.9997911545263468,
+          "source": 0.0002959878335002096
+        }
+      },
+      "subdir": "point-003"
+    },
+    "point-004": {
+      "coordinates": {
+        "http_client_mode": "pooled",
+        "serialization_format": "row_binary"
+      },
+      "correctness_passed": true,
+      "iterations": 1,
+      "scalars": {
+        "end_to_end_seconds_per_record": 5.11153536975e-6,
+        "iteration_elapsed_seconds_median": 40.892282958,
+        "per_record_service_time": {
+          "decode": 6.273969507500003e-7,
+          "fetch": 3.6194458000000245e-8,
+          "sink_dispatch": 0.000020424204986000013,
+          "source": 4.8880824249999726e-8
+        },
+        "serialization_bytes_per_record": 201.262,
+        "serialize_fraction_of_insert": 0.00713789957073608,
+        "serialize_seconds_per_record": 1.346805433750005e-7,
+        "total_throughput_records_per_sec": 195635.9347365543,
+        "worker_utilization": {
+          "decode": 0.03068534722771006,
+          "fetch": 0.0008851170778891253,
+          "sink_dispatch": 0.9989271084217765,
+          "source": 0.009562845742841927
+        }
+      },
+      "subdir": "point-004"
+    }
+  },
+  "scalars": {},
+  "schema_version": 2,
+  "stages": []
+}

@@ -1,0 +1,94 @@
+{
+  "points": {
+    "point-001": {
+      "coordinates": {
+        "http_client_mode": "per_call",
+        "serialization_format": "json_each_row"
+      },
+      "iterations": [
+        {
+          "iteration": 1,
+          "post_dedupe_duplicates": 0,
+          "pre_dedupe_duplicates": 0,
+          "records_missing_from_sink": 0,
+          "records_processed_cumulative": 8200000,
+          "records_processed_timed": 8000000,
+          "records_raw_in_clickhouse": 8200000,
+          "records_visible_in_clickhouse": 8200000
+        }
+      ],
+      "passed": true,
+      "subdir": "point-001"
+    },
+    "point-002": {
+      "coordinates": {
+        "http_client_mode": "pooled",
+        "serialization_format": "json_each_row"
+      },
+      "iterations": [
+        {
+          "iteration": 1,
+          "post_dedupe_duplicates": 0,
+          "pre_dedupe_duplicates": 0,
+          "records_missing_from_sink": 0,
+          "records_processed_cumulative": 8200000,
+          "records_processed_timed": 8000000,
+          "records_raw_in_clickhouse": 8200000,
+          "records_visible_in_clickhouse": 8200000
+        }
+      ],
+      "passed": true,
+      "subdir": "point-002"
+    },
+    "point-003": {
+      "coordinates": {
+        "http_client_mode": "per_call",
+        "serialization_format": "row_binary"
+      },
+      "iterations": [
+        {
+          "iteration": 1,
+          "post_dedupe_duplicates": 0,
+          "pre_dedupe_duplicates": 0,
+          "records_missing_from_sink": 0,
+          "records_processed_cumulative": 8200000,
+          "records_processed_timed": 8000000,
+          "records_raw_in_clickhouse": 8200000,
+          "records_visible_in_clickhouse": 8200000
+        }
+      ],
+      "passed": true,
+      "subdir": "point-003"
+    },
+    "point-004": {
+      "coordinates": {
+        "http_client_mode": "pooled",
+        "serialization_format": "row_binary"
+      },
+      "iterations": [
+        {
+          "iteration": 1,
+          "post_dedupe_duplicates": 0,
+          "pre_dedupe_duplicates": 0,
+          "records_missing_from_sink": 0,
+          "records_processed_cumulative": 8200000,
+          "records_processed_timed": 8000000,
+          "records_raw_in_clickhouse": 8200000,
+          "records_visible_in_clickhouse": 8200000
+        }
+      ],
+      "passed": true,
+      "subdir": "point-004"
+    }
+  },
+  "schema_version": 2,
+  "summary": {
+    "ack_invariant_checks_reported": 0,
+    "matrix_points": 4,
+    "notes": "Phase 7.6 lightweight: counts-only correctness across every point. Full `ack_invariant_checks` against the production ClickHouseSink land alongside the TestObservableSink trait refactor.",
+    "passed": true,
+    "required_sinks": [
+      "clickhouse"
+    ]
+  }
+}

@@ -9,8 +9,9 @@ use std::time::Duration;
 
 use anyhow::Result;
 use clap::Parser;
+use clickhouse_ingestor_bench::real_ch::matrix::filter_points_by_id;
 use clickhouse_ingestor_bench::real_ch::{
-    LogWorkloadConfig, MatrixConfig, RealClickHouseFixture, run_matrix,
+    LogWorkloadConfig, MatrixConfig, RealClickHouseFixture, backfill_parent_aggregates, run_matrix,
 };
 use opendata_ingest_clickhouse::adapter::logs::LogsAdapterConfig;
 use opendata_ingest_runtime::source::SourceId;
@@ -64,6 +65,14 @@ struct Args {
     /// (`point-001,point-004`). Empty = all points.
     #[arg(long, default_value = "")]
     only_points: String,
+
+    /// Skip the matrix run; instead, read per-point artifacts from
+    /// the named run directory and (re-)emit the parent
+    /// `results.json` / `timeseries.json` / `correctness.json`
+    /// per the design's benchmarks.md contract. Used to backfill
+    /// canonical parent aggregates for completed runs.
+    #[arg(long)]
+    backfill_aggregates: Option<PathBuf>,
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -79,6 +88,16 @@ async fn main() -> Result<()> {
         .ok();
 
     let args = Args::parse();
+
+    if let Some(path) = &args.backfill_aggregates {
+        eprintln!("backfilling parent aggregates for {}", path.display());
+        backfill_parent_aggregates(path)?;
+        println!(
+            "wrote results.json, timeseries.json, correctness.json into {}",
+            path.display()
+        );
+        return Ok(());
+    }
 
     let adapter_cfg = LogsAdapterConfig {
         database: "phase07_matrix".into(),
@@ -117,33 +136,7 @@ async fn main() -> Result<()> {
     // Re-emit default points so the source_id update on workload
     // is consistent.
     let all_points = clickhouse_ingestor_bench::real_ch::matrix::default_format_x_http_points();
-    cfg.points = if args.only_points.trim().is_empty() {
-        all_points
-    } else {
-        let wanted: std::collections::HashSet<&str> =
-            args.only_points.split(',').map(str::trim).collect();
-        let known: std::collections::HashSet<&str> =
-            all_points.iter().map(|p| p.id.as_str()).collect();
-        let unknown: Vec<&str> = wanted
-            .iter()
-            .filter(|id| !known.contains(*id))
-            .copied()
-            .collect();
-        if !unknown.is_empty() {
-            anyhow::bail!(
-                "--only-points: unknown point id(s) {:?}; known ids = {:?}",
-                unknown,
-                known,
-            );
-        }
-        all_points
-            .into_iter()
-            .filter(|p| wanted.contains(p.id.as_str()))
-            .collect()
-    };
-    if cfg.points.is_empty() {
-        anyhow::bail!("--only-points produced an empty point set — pass at least one valid id");
-    }
+    cfg.points = filter_points_by_id(all_points, &args.only_points)?;
     eprintln!(
         "running {} matrix points: {}",
         cfg.points.len(),

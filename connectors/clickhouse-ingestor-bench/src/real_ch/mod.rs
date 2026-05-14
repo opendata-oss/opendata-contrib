@@ -21,6 +21,9 @@ pub mod runner;
 pub mod workload;
 
 pub use fixture::{FixtureError, RealClickHouseFixture};
-pub use matrix::{MatrixConfig, MatrixPoint, MatrixPointResult, MatrixRunArtifacts, run_matrix};
+pub use matrix::{
+    MatrixConfig, MatrixPoint, MatrixPointResult, MatrixRunArtifacts, backfill_parent_aggregates,
+    build_matrix_correctness, build_matrix_results, build_matrix_timeseries, run_matrix,
+};
 pub use runner::{RealChConfig, RealChIterationReport, run_real_ch};
 pub use workload::{LogWorkload, LogWorkloadConfig, WorkloadHandle};
