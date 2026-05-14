@@ -88,15 +88,20 @@ async fn phase07_real_ch_smoke_runs_against_testcontainers() {
         "ReplacingMergeTree"
     );
 
-    let total_records = (25 * (2 + 8)) as u64;
+    let total_records = (25 * (2 + 8)) as u64; // warmup + timed
+    let timed_records = (25 * 8) as u64; // timed only
     let iter0 = &correctness["iterations"][0];
     assert_eq!(
-        iter0["records_processed"], total_records,
-        "records_processed should equal warmup+timed × records_per_source_range",
+        iter0["records_processed_timed"], timed_records,
+        "records_processed_timed should equal timed_payloads × records_per_source_range",
+    );
+    assert_eq!(
+        iter0["records_processed_cumulative"], total_records,
+        "records_processed_cumulative should equal warmup+timed × records_per_source_range",
     );
     assert_eq!(
         iter0["records_visible_in_clickhouse"], total_records,
-        "every produced record should be visible in CH (FINAL view)",
+        "CH sees warmup + timed (TRUNCATE'd at iteration start)",
     );
     assert_eq!(iter0["post_dedupe_duplicates"], 0);
     assert!(

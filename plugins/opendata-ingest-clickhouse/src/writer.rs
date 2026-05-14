@@ -235,12 +235,21 @@ impl ClickHouseWriter {
     /// `clickhouse_serialized_bytes`, and `clickhouse_chunk_rows`
     /// (one sample per chunk), plus `clickhouse_insert_duration_seconds`
     /// (one sample per HTTP INSERT attempt; labelled with the result).
+    ///
+    /// Per the Phase 7 design's §Bottleneck Attribution Methodology,
+    /// `clickhouse_insert_duration_seconds` is defined to **include
+    /// serialization time**. The first attempt's timer therefore wraps
+    /// `serializer.serialize(...)` + the HTTP send; retries reuse the
+    /// already-serialized body so their samples cover only the HTTP
+    /// attempt. This keeps `serialize_fraction_of_insert =
+    /// Σ serialize_duration / Σ insert_duration` in `[0, 1]` exactly
+    /// (the readout's row 7.7 fraction relies on this).
     pub async fn execute_chunk(&self, chunk: &InsertChunk) -> Result<(), WriterError> {
         let format = self.serializer.format();
         let format_label = format.as_label();
-        let serialize_start = Instant::now();
+        let chunk_start = Instant::now();
         let body = self.serializer.serialize(chunk)?;
-        let serialize_secs = serialize_start.elapsed().as_secs_f64();
+        let serialize_secs = chunk_start.elapsed().as_secs_f64();
         metrics::histogram!(SERIALIZATION_DURATION_SECONDS, "format" => format_label)
             .record(serialize_secs);
         metrics::histogram!(SERIALIZED_BYTES, "format" => format_label).record(body.len() as f64);
@@ -253,7 +262,14 @@ impl ClickHouseWriter {
         let mut backoff = self.config.initial_backoff;
         loop {
             attempt += 1;
-            let attempt_start = Instant::now();
+            // First attempt's timer reaches back to before serialize
+            // so `insert_duration` includes serialize per the design.
+            // Subsequent attempts reuse `body` and only time HTTP.
+            let attempt_start = if attempt == 1 {
+                chunk_start
+            } else {
+                Instant::now()
+            };
             let result = self.execute_once(&sql, &body, chunk).await;
             let attempt_secs = attempt_start.elapsed().as_secs_f64();
             let attempt_label = match &result {

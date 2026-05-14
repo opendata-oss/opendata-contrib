@@ -91,7 +91,17 @@ pub struct RealChIterationReport {
     pub iteration: usize,
     pub timed_started_unix_ms: u64,
     pub elapsed_seconds: f64,
+    /// Records the runtime acked during the **timed window only**
+    /// (final cumulative count minus the baseline captured at
+    /// warmup boundary). Drives all timed-report scalars.
     pub records_processed: u64,
+    /// Cumulative records the runtime acked from start through
+    /// shutdown — equals `records_visible` against the live CH
+    /// in the happy path. Kept for the per-iteration correctness
+    /// gate, which compares against `count_visible` (which sees
+    /// warmup + timed because the bench TRUNCATEs once per
+    /// iteration, not at the warmup boundary).
+    pub records_processed_cumulative: u64,
     pub stage_samples: StageSamples,
     pub clickhouse_samples: ClickHouseSamples,
     pub worker_counts: StageWorkerCounts,
@@ -300,6 +310,15 @@ pub async fn run_real_ch(
         }
 
         // ── Snapshot baseline (drains warmup-phase metrics) ──
+        //   Also capture the runtime's records_written counter at
+        //   the warmup boundary so the timed report's
+        //   `records_processed` is timed-only (`final - baseline`),
+        //   not cumulative. The design's §Iteration Protocol
+        //   pseudocode emits `timed_records_count(workload_cfg)`;
+        //   `progress.records_written` is monotonic from runtime
+        //   start, so the subtraction is the equivalent for an
+        //   already-running pipeline.
+        let baseline_records_written = progress.borrow().records_written;
         let _baseline = snapshotter.snapshot();
         let timed_start = Instant::now();
         let timed_started_unix_ms = SystemTime::now()
@@ -365,11 +384,18 @@ pub async fn run_real_ch(
             .await
             .map_err(|e| anyhow!("count_post_dedupe_duplicates: {e}"))?;
 
+        // Timed-only records: total since runtime start minus
+        // what was already written when the timed window began.
+        // Matches the design's `timed_records_count(workload_cfg)`.
+        let records_processed_timed = progress_final
+            .records_written
+            .saturating_sub(baseline_records_written);
         reports.push(RealChIterationReport {
             iteration: iter_idx,
             timed_started_unix_ms,
             elapsed_seconds,
-            records_processed: progress_final.records_written,
+            records_processed: records_processed_timed,
+            records_processed_cumulative: progress_final.records_written,
             stage_samples,
             clickhouse_samples,
             worker_counts,
@@ -381,9 +407,12 @@ pub async fn run_real_ch(
     }
 
     let correctness_passed = reports.iter().all(|r| {
-        r.records_visible == r.records_processed
+        // CH was TRUNCATE'd at iteration start, so `count_visible`
+        // reflects warmup + timed. Compare against the cumulative
+        // count, not the timed-only `records_processed`.
+        r.records_visible == r.records_processed_cumulative
             && r.post_dedupe_dupes == 0
-            && r.records_processed > 0
+            && r.records_processed_cumulative > 0
     });
 
     let run_dir = write_artifacts(&reports, &cfg, correctness_passed)?;
@@ -605,7 +634,8 @@ fn iteration_block(r: &RealChIterationReport) -> Value {
         "scalars": {
             "iteration_elapsed_seconds": r.elapsed_seconds,
             "iteration_throughput_records_per_sec": throughput,
-            "iteration_records_processed": r.records_processed as f64,
+            "iteration_records_processed":           r.records_processed as f64,
+            "iteration_records_processed_cumulative": r.records_processed_cumulative as f64,
             "records_visible_in_clickhouse": r.records_visible as f64,
             "records_raw_in_clickhouse":     r.records_raw as f64,
             "pre_dedupe_duplicates": r.pre_dedupe_dupes as f64,
@@ -677,17 +707,24 @@ fn build_correctness(reports: &[RealChIterationReport], passed: bool) -> Value {
     let per_iter: Vec<Value> = reports
         .iter()
         .map(|r| {
+            // Correctness compares the cumulative count (warmup +
+            // timed) against `count_visible` because the table was
+            // TRUNCATE'd once at iteration start, so CH sees both
+            // phases. Throughput uses timed-only — those are
+            // semantically different.
             json!({
                 "iteration": r.iteration,
-                "records_processed":           r.records_processed,
-                "records_raw_in_clickhouse":   r.records_raw,
+                "records_processed_timed":      r.records_processed,
+                "records_processed_cumulative": r.records_processed_cumulative,
+                "records_raw_in_clickhouse":    r.records_raw,
                 "records_visible_in_clickhouse": r.records_visible,
                 "pre_dedupe_duplicates":  r.pre_dedupe_dupes,
                 "post_dedupe_duplicates": r.post_dedupe_dupes,
-                "records_missing_from_sink": r.records_processed.saturating_sub(r.records_visible),
-                "passed": r.records_visible == r.records_processed
+                "records_missing_from_sink":
+                    r.records_processed_cumulative.saturating_sub(r.records_visible),
+                "passed": r.records_visible == r.records_processed_cumulative
                     && r.post_dedupe_dupes == 0
-                    && r.records_processed > 0,
+                    && r.records_processed_cumulative > 0,
             })
         })
         .collect();
@@ -757,8 +794,8 @@ fn build_metadata(
                 "source.decode_concurrency": bp.decode,
                 "sink.max_concurrent_commits": bp.sink_dispatch,
                 "sink.kind": "clickhouse",
-                "serialization_format": "json_each_row",
-                "http_client_mode": "per_call",
+                "serialization_format": cfg.serialization_format.as_label(),
+                "http_client_mode": cfg.http_client_mode.as_label(),
             },
             "matrix_file": Value::Null,
         },
@@ -795,8 +832,8 @@ fn build_metadata(
                 "runtime.source.decode_concurrency": bp.decode,
                 "runtime.ack_flush_policy": "EveryCommitGroup",
                 "sink.kind": "clickhouse",
-                "sink.serialization_format": "json_each_row",
-                "sink.http_client_mode": "per_call",
+                "sink.serialization_format": cfg.serialization_format.as_label(),
+                "sink.http_client_mode": cfg.http_client_mode.as_label(),
             },
         },
         "services": {
