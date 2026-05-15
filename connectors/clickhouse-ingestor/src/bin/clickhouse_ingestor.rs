@@ -23,7 +23,7 @@ use async_trait::async_trait;
 use clap::Parser;
 use clickhouse_ingestor::metrics_server;
 use clickhouse_ingestor::{ClickHouseWriter, IngestorConfig, OtlpLogsClickHouseAdapter};
-use metrics_exporter_prometheus::{Matcher, PrometheusBuilder};
+use clickhouse_ingestor::metrics_recorder;
 use opendata_ingest_clickhouse::ClickHouseSink;
 use opendata_ingest_otel::logs::OtlpLogsDecoder;
 use opendata_ingest_runtime::envelope::{ConfiguredEnvelope, PayloadEncoding, SignalType};
@@ -103,32 +103,11 @@ async fn main() -> Result<()> {
     );
 
     // Install the metrics-rs recorder before any code that records or
-    // describes metrics runs.
-    //
-    // The PrometheusBuilder's default is to render `metrics::histogram!`
-    // as Prometheus *summaries* (a base series + `_count` + `_sum` +
-    // per-quantile labels). The Phase 8 cell-bench classifier wants
-    // real histograms so PromQL's `histogram_quantile(_bucket)` works
-    // across cells — summaries can't be aggregated. Set explicit
-    // buckets for the `*_seconds` family which covers
-    // `clickhouse_*_duration_seconds`, `runtime_stage_latency_seconds`,
-    // `runtime_ack_lag_seconds`, etc.
-    //
-    // Bucket choice spans 1ms → 30s. CH INSERT p99 on a tuned cell is
-    // ~30–200 ms; a stuck-ingestor p99 can hit seconds. The 30s upper
-    // bound is wider than the runtime's `request_timeout_secs` default
-    // (30), so a runaway INSERT lands in the +Inf bucket where it
-    // belongs rather than masquerading as a 30s sample.
-    let recorder = PrometheusBuilder::new()
-        .set_buckets_for_metric(
-            Matcher::Suffix("_seconds".to_string()),
-            &[
-                0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5,
-                1.0, 2.5, 5.0, 10.0, 30.0,
-            ],
-        )
-        .map_err(|e| anyhow::anyhow!("configure histogram buckets: {e}"))?
-        .build_recorder();
+    // describes metrics runs. The recorder is built in
+    // `metrics_recorder::build_recorder` so the histogram-bucket
+    // configuration has unit-test coverage that fails on regressions
+    // (see `metrics_recorder::tests`).
+    let recorder = metrics_recorder::build_recorder()?;
     let metrics_handle = recorder.handle();
     metrics::set_global_recorder(recorder)
         .map_err(|e| anyhow::anyhow!("install global metrics recorder: {e}"))?;
