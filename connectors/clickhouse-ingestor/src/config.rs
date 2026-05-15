@@ -50,7 +50,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::adapter::logs::LogsAdapterConfig;
 use crate::error::{IngestorError, IngestorResult};
-use crate::writer::WriterConfig;
+use crate::writer::{HttpClientMode, WriterConfig};
+use opendata_ingest_clickhouse::serializer::SerializationFormat;
 use opendata_ingest_runtime::runtime::AckFlushPolicy;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -60,6 +61,8 @@ pub struct IngestorConfig {
     pub runtime: RuntimeSection,
     pub ack: AckSection,
     pub adapter: AdapterSection,
+    #[serde(default)]
+    pub sink: SinkSection,
     #[serde(default)]
     pub metrics_server: MetricsServerSection,
 }
@@ -140,10 +143,6 @@ pub struct RuntimeSection {
     pub decode_concurrency: u32,
     #[serde(default = "default_oversize_fault_multiplier")]
     pub oversize_fault_multiplier: u32,
-    /// Phase 6 shared-sink writer-pool sizing. Default reproduces
-    /// the library default (`max_concurrent_commits = 4`).
-    #[serde(default = "default_max_concurrent_commits")]
-    pub max_concurrent_commits: u32,
 }
 
 fn default_dry_run() -> bool {
@@ -181,6 +180,41 @@ fn default_oversize_fault_multiplier() -> u32 {
 }
 fn default_max_concurrent_commits() -> u32 {
     4
+}
+
+/// Sink-side knobs. Phase 8 row 8.4 promotes these out of
+/// [`RuntimeSection`] so the cell YAML's `sink:` block is
+/// load-bearing: `serialization_format` and `http_client_mode` are
+/// now wired end-to-end (previously [`IngestorConfig::writer_config`]
+/// used `..Default::default()` and silently dropped them).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SinkSection {
+    /// Cap on concurrent in-flight `Sink::write` calls. Moved from
+    /// [`RuntimeSection`] in row 8.4. The runtime applies a `.max(1)`
+    /// floor, so 0 is treated as 1.
+    #[serde(default = "default_max_concurrent_commits")]
+    pub max_concurrent_commits: u32,
+    /// Wire format the writer hands ClickHouse for each chunk. Phase
+    /// 7.3 introduced the trait; row 8.4 wires it through the
+    /// ingestor's YAML. Default: `JsonEachRow` (matches the pre-7.3
+    /// writer behavior and the bench runner default).
+    #[serde(default)]
+    pub serialization_format: SerializationFormat,
+    /// HTTP client management mode. Phase 7.5 introduced the pooled
+    /// variant; row 8.4 wires it through. Default: `PerCall` (matches
+    /// the pre-7.5 writer; cell tuning expects `Pooled`).
+    #[serde(default)]
+    pub http_client_mode: HttpClientMode,
+}
+
+impl Default for SinkSection {
+    fn default() -> Self {
+        Self {
+            max_concurrent_commits: default_max_concurrent_commits(),
+            serialization_format: SerializationFormat::default(),
+            http_client_mode: HttpClientMode::default(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -262,7 +296,8 @@ impl IngestorConfig {
             request_timeout: Duration::from_secs(self.runtime.request_timeout_secs),
             max_attempts: self.runtime.retry_max_attempts,
             initial_backoff: Duration::from_millis(self.runtime.retry_initial_backoff_ms),
-            ..Default::default()
+            serialization_format: self.sink.serialization_format,
+            http_client_mode: self.sink.http_client_mode.clone(),
         }
     }
 
@@ -325,6 +360,17 @@ adapter:
         let writer = cfg.writer_config();
         assert_eq!(writer.endpoint, "http://localhost:8123");
         assert_eq!(writer.max_attempts, 6);
+        // SinkSection is absent in this YAML, so serde(default) on
+        // `IngestorConfig.sink` produces SinkSection::default(), and
+        // `writer_config()` propagates the enum defaults to the
+        // writer (JsonEachRow + PerCall). The bench harness's
+        // production-shaped defaults match these.
+        assert_eq!(
+            writer.serialization_format,
+            SerializationFormat::JsonEachRow
+        );
+        assert_eq!(writer.http_client_mode, HttpClientMode::PerCall);
+        assert_eq!(cfg.sink.max_concurrent_commits, 4);
 
         match cfg.ack_flush_policy() {
             AckFlushPolicy::EveryCommitGroup => {}
@@ -335,6 +381,74 @@ adapter:
         assert_eq!(adapter.database, "responsive");
         assert_eq!(adapter.table, "logs");
         assert_eq!(adapter.adapter_version, 1);
+    }
+
+    /// Row 8.4 wiring sanity: sink.serialization_format,
+    /// sink.http_client_mode, and sink.max_concurrent_commits are
+    /// now load-bearing. Prior behavior used WriterConfig::default()
+    /// for the first two regardless of YAML; this test pins the new
+    /// path.
+    #[test]
+    fn sink_section_wires_serialization_format_and_http_client_mode() {
+        let yaml = r#"
+buffer:
+  manifest_path: m
+  data_prefix: d
+  object_store:
+    type: InMemory
+clickhouse:
+  endpoint: http://x:8123
+  database: db
+  table: t
+runtime:
+  dry_run: true
+  poll_interval_ms: 250
+  retry_max_attempts: 6
+  retry_initial_backoff_ms: 100
+  request_timeout_secs: 30
+ack:
+  policy: every_commit_group
+adapter:
+  adapter_version: 1
+  max_chunk_rows: 1
+  max_chunk_bytes: 1
+sink:
+  max_concurrent_commits: 16
+  serialization_format: row_binary
+  http_client_mode:
+    mode: pooled
+    pool_max_idle_per_host: 32
+    pool_idle_timeout_ms: 30000
+"#;
+        let cfg: IngestorConfig = serde_yaml::from_str(yaml).expect("parse");
+        assert_eq!(cfg.sink.max_concurrent_commits, 16);
+        assert_eq!(
+            cfg.sink.serialization_format,
+            SerializationFormat::RowBinary
+        );
+        match &cfg.sink.http_client_mode {
+            HttpClientMode::Pooled {
+                pool_max_idle_per_host,
+                pool_idle_timeout_ms,
+            } => {
+                assert_eq!(*pool_max_idle_per_host, 32);
+                assert_eq!(*pool_idle_timeout_ms, 30000);
+            }
+            other => panic!("expected Pooled, got {other:?}"),
+        }
+
+        let writer = cfg.writer_config();
+        assert_eq!(writer.serialization_format, SerializationFormat::RowBinary);
+        match &writer.http_client_mode {
+            HttpClientMode::Pooled {
+                pool_max_idle_per_host,
+                pool_idle_timeout_ms,
+            } => {
+                assert_eq!(*pool_max_idle_per_host, 32);
+                assert_eq!(*pool_idle_timeout_ms, 30000);
+            }
+            other => panic!("expected Pooled, got {other:?}"),
+        }
     }
 
     #[test]

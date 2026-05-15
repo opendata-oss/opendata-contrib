@@ -21,9 +21,9 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use clap::Parser;
+use clickhouse_ingestor::metrics_recorder;
 use clickhouse_ingestor::metrics_server;
 use clickhouse_ingestor::{ClickHouseWriter, IngestorConfig, OtlpLogsClickHouseAdapter};
-use clickhouse_ingestor::metrics_recorder;
 use opendata_ingest_clickhouse::ClickHouseSink;
 use opendata_ingest_otel::logs::OtlpLogsDecoder;
 use opendata_ingest_runtime::envelope::{ConfiguredEnvelope, PayloadEncoding, SignalType};
@@ -92,15 +92,13 @@ async fn main() -> Result<()> {
     let cfg = IngestorConfig::load(&cli.config)
         .with_context(|| format!("loading ingestor config from {}", cli.config.display()))?;
 
-    info!(
-        manifest = %cfg.buffer.manifest_path,
-        endpoint = %cfg.clickhouse.endpoint,
-        database = %cfg.clickhouse.database,
-        table = %cfg.clickhouse.table,
-        dry_run = cfg.runtime.dry_run,
-        metrics_bind_addr = %cfg.metrics_server.bind_addr,
-        "configuration loaded",
-    );
+    // Dump the full effective IngestorConfig (post-figment YAML+env
+    // merge) so Phase 8 row 8.4 tuning runs can grep one log line
+    // for exactly what knobs took effect. A partial-field log
+    // previously hid silently-dropped knobs (serialization_format,
+    // http_client_mode were declared in YAML but ..Default::default()'d
+    // by writer_config until row 8.4).
+    info!(config = ?cfg, "configuration loaded");
 
     // Install the metrics-rs recorder before any code that records or
     // describes metrics runs. The recorder is built in
@@ -158,7 +156,7 @@ async fn main() -> Result<()> {
         },
         source_overrides: Default::default(),
         sink: SinkPoolOptions {
-            max_concurrent_commits: cfg.runtime.max_concurrent_commits,
+            max_concurrent_commits: cfg.sink.max_concurrent_commits,
             // The sink-namespaced retry knobs shadow the legacy
             // top-level fields per `RuntimeOptions::effective_retry_*`;
             // mirror the operator's `retry_*` settings here so the

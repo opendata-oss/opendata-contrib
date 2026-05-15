@@ -15,16 +15,15 @@ use opendata_ingest_runtime::source::SourceBudget;
 use support::{in_memory_buffer_source, logs_envelope};
 
 fn unbounded_budget() -> SourceBudget {
-    SourceBudget { bytes_remaining: u64::MAX, batches_remaining: u32::MAX }
+    SourceBudget {
+        bytes_remaining: u64::MAX,
+        batches_remaining: u32::MAX,
+    }
 }
 
 #[tokio::test]
 async fn pending_count_reflects_unacked_batches_through_lifecycle() {
-    let mut fx = in_memory_buffer_source(
-        "ingest/test/lag/manifest",
-        "ingest/test/lag/data",
-    )
-    .await;
+    let mut fx = in_memory_buffer_source("ingest/test/lag/manifest", "ingest/test/lag/data").await;
 
     // Empty queue → no entries yet.
     assert_eq!(
@@ -82,7 +81,10 @@ async fn pending_count_reflects_unacked_batches_through_lifecycle() {
 
     // Ack through the remaining tail.
     let final_seq = descriptors.last().unwrap().sequence;
-    fx.source.ack_through(final_seq).await.expect("ack_through tail");
+    fx.source
+        .ack_through(final_seq)
+        .await
+        .expect("ack_through tail");
     fx.source.flush_acks().await.expect("flush_acks tail");
     let _ = fx
         .source
