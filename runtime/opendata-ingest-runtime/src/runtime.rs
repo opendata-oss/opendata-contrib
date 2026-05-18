@@ -1464,6 +1464,21 @@ async fn fetch_worker(
             "source" => source_label.clone(),
         )
         .record(stage_start.elapsed().as_secs_f64());
+        // §4 fetch-stage byte throughput. `_count` on
+        // STAGE_LATENCY_SECONDS already gives the batches-fetched
+        // rate; this counter gives the byte rate against the
+        // producer's wire bytes so we can answer "is the fetcher
+        // keeping up?" without sampling per-batch sizes.
+        let fetched_bytes: u64 = source_batch
+            .entries
+            .iter()
+            .map(|e| e.raw_bytes.len() as u64 + e.raw_metadata.len() as u64)
+            .sum();
+        metrics::counter!(
+            crate::metrics::BYTES_FETCHED_TOTAL,
+            "source" => source_label.clone(),
+        )
+        .increment(fetched_bytes);
 
         let send_result = with_backpressure_timer(
             &source_id,
@@ -1748,6 +1763,14 @@ async fn decode_one(
     let row_count = match &decoded.records {
         DecodedRecords::Typed(t) => t.record_count() as u64,
     };
+    // §4 decode-stage record throughput. Live + dry-run both pay
+    // the decode work, so the counter increments before branching
+    // on dry_run.
+    metrics::counter!(
+        crate::metrics::RECORDS_DECODED_TOTAL,
+        "source" => decoded.source.0.clone(),
+    )
+    .increment(row_count);
 
     if options.dry_run {
         debug!(low, high, rows = row_count, "dry-run: skipping sink write");

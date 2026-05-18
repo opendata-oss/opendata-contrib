@@ -99,6 +99,34 @@ pub fn describe() {
         CLICKHOUSE_FAILURES_TOTAL,
         "ClickHouse insert failures, labeled by classification."
     );
+    // Row-8.4 instrumentation-gap §1 + §4. These metrics fire from
+    // the runtime crate (bytes_fetched, records_decoded) and the
+    // ClickHouse plugin (rows_committed, commit_bytes, insert_errors);
+    // describe them here so the registry picks them up at startup
+    // before any traffic arrives. Constants live in their owning
+    // crate (runtime / plugin), not duplicated here.
+    describe_counter!(
+        opendata_ingest_runtime::metrics::BYTES_FETCHED_TOTAL,
+        Unit::Bytes,
+        "Total bytes fetched from the buffer source (sum of source-batch entry payload + metadata sizes)."
+    );
+    describe_counter!(
+        opendata_ingest_runtime::metrics::RECORDS_DECODED_TOTAL,
+        "Total decoded records produced by the decoder stage."
+    );
+    describe_counter!(
+        opendata_ingest_clickhouse::metrics::ROWS_COMMITTED_TOTAL,
+        "Rows successfully committed to ClickHouse, labeled by _odb_run_id."
+    );
+    describe_counter!(
+        opendata_ingest_clickhouse::metrics::COMMIT_BYTES_TOTAL,
+        Unit::Bytes,
+        "Bytes successfully committed to ClickHouse (sum of serialized row lengths)."
+    );
+    describe_counter!(
+        opendata_ingest_clickhouse::metrics::INSERT_ERRORS_TOTAL,
+        "ClickHouse insert errors labeled by HTTP status_code (or 'timeout'/'connect'/'network')."
+    );
 }
 
 /// Snapshot the recorder-side counters that the runtime updates as it

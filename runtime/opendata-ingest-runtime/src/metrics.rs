@@ -23,6 +23,27 @@ pub const ACK_LAG_SECONDS: &str = "runtime_ack_lag_seconds";
 /// when ingestor work falls behind manifest growth.
 pub const BUFFER_CONSUMER_SEQUENCE_LAG: &str = "buffer_consumer_sequence_lag";
 
+// =========================================================================
+// Row-8.4 instrumentation-gap §4 — per-stage throughput counters.
+//
+// `STAGE_LATENCY_SECONDS{stage}._count` already gives per-stage batch
+// rates via `rate(...)`; these counters add the byte and record axes
+// the histograms can't reconstruct.
+// =========================================================================
+
+/// Counter. Bytes pulled out of the buffer source (sum of
+/// `SourceEntry.raw_bytes + raw_metadata` per fetched batch).
+/// Labelled by `source`. `rate(...)` answers "is the fetcher keeping
+/// up with the producer's write rate?" — instrumentation-gaps §4.
+pub const BYTES_FETCHED_TOTAL: &str = "ingestor_bytes_fetched_total";
+
+/// Counter. Records produced by the decoder stage (one increment per
+/// `TypedRecords::record_count()`). Labelled by `source`. Combined
+/// with `STAGE_LATENCY_SECONDS{stage="decode"}._count`, lets us tell
+/// "are batches arriving slowly?" from "are batches arriving fine
+/// but each one is small?" — instrumentation-gaps §4.
+pub const RECORDS_DECODED_TOTAL: &str = "ingestor_records_decoded_total";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BackpressureReason {
     SourceBudget,

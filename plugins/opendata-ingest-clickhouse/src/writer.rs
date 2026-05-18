@@ -19,8 +19,8 @@ use tracing::{debug, warn};
 
 use crate::adapter::InsertChunk;
 use crate::metrics::{
-    CHUNK_ROWS, HTTP_CONCURRENT_INFLIGHT, INSERT_DURATION_SECONDS, InsertResult,
-    SERIALIZATION_DURATION_SECONDS, SERIALIZED_BYTES,
+    CHUNK_ROWS, HTTP_CONCURRENT_INFLIGHT, INSERT_DURATION_SECONDS, INSERT_ERRORS_TOTAL,
+    InsertResult, SERIALIZATION_DURATION_SECONDS, SERIALIZED_BYTES,
 };
 use crate::serializer::{ChunkSerializer, SerializationFormat, build_serializer};
 
@@ -417,6 +417,16 @@ impl ClickHouseWriter {
 }
 
 fn classify_reqwest(err: &reqwest::Error) -> WriterError {
+    let label = if err.is_timeout() {
+        "timeout"
+    } else if err.is_connect() {
+        "connect"
+    } else if err.is_status() {
+        "http"
+    } else {
+        "network"
+    };
+    metrics::counter!(INSERT_ERRORS_TOTAL, "status_code" => label).increment(1);
     if err.is_timeout() || err.is_connect() {
         return WriterError::Retryable {
             message: format!("network/timeout: {err}"),
@@ -435,6 +445,13 @@ fn classify_reqwest(err: &reqwest::Error) -> WriterError {
 }
 
 fn classify_status(status: u16, body: &str) -> WriterError {
+    // §4 commit_errors_total{status_code}: emit before classifying so
+    // operators can rate() by literal HTTP code (429 vs 503 vs 4xx).
+    metrics::counter!(
+        INSERT_ERRORS_TOTAL,
+        "status_code" => status.to_string(),
+    )
+    .increment(1);
     if status == 429 || (500..600).contains(&status) {
         return WriterError::Retryable {
             message: format!("status {status}: {body}"),

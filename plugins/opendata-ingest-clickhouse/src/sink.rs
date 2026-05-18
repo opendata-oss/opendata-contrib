@@ -20,6 +20,7 @@
 //!   `Unknown` like `NotCommitted` and retries, with table-level
 //!   dedupe as the long-window backstop.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -33,7 +34,17 @@ use opendata_ingest_runtime::sink::{
 };
 
 use crate::adapter::{Adapter, ClickHouseAdapterBatch};
+use crate::metrics::{COMMIT_BYTES_TOTAL, ROWS_COMMITTED_TOTAL};
 use crate::writer::{ClickHouseWriter, WriterErrorClass};
+
+/// LogAttributes key loadgen stamps on every record to identify the
+/// run. The harness uses the same key in its correctness-gate SQL.
+const ODB_RUN_ID_ATTR: &str = "_odb_run_id";
+
+/// Records missing the `_odb_run_id` attribute land here. Keeps the
+/// counter cardinality bounded even when an upstream producer skips
+/// the stamp (a real bug to investigate via this very label).
+const UNKNOWN_RUN_ID_LABEL: &str = "unknown";
 
 /// `Sink` impl backed by an [`Adapter`] (planning) + a
 /// [`ClickHouseWriter`] (HTTP execution). Generic over the adapter
@@ -72,6 +83,22 @@ where
 
 fn fatal(msg: impl Into<String>) -> SinkCommitFailure {
     SinkCommitFailure::Fatal(msg.into().into())
+}
+
+/// Build a `{run_id -> row_count}` map from a batch of decoded log
+/// records. Records missing the `_odb_run_id` attribute fall into the
+/// `"unknown"` bucket so the metric is still total-count-accurate.
+fn bucket_rows_by_run_id(records: &[DecodedLogRecord]) -> HashMap<String, u64> {
+    let mut counts: HashMap<String, u64> = HashMap::new();
+    for rec in records {
+        let run_id = rec
+            .log_attributes
+            .get(ODB_RUN_ID_ATTR)
+            .map(|s| s.as_str())
+            .unwrap_or(UNKNOWN_RUN_ID_LABEL);
+        *counts.entry(run_id.to_string()).or_insert(0) += 1;
+    }
+    counts
 }
 
 #[async_trait]
@@ -117,6 +144,14 @@ where
         let selected = logs.records().to_vec();
         let input_row_count = selected.len();
         let bytes: usize = selected.iter().map(|r| r.approx_size_bytes()).sum();
+
+        // Row 8.4 instrumentation-gap §1: bucket by _odb_run_id BEFORE
+        // the adapter consumes `selected`. The adapter sorts and emits
+        // RowValue chunks where the run_id is buried inside a StringMap,
+        // so doing it here keeps the lookup a single map probe per
+        // record rather than a column reconstruction.
+        let rows_by_run_id = bucket_rows_by_run_id(&selected);
+
         let group = ClickHouseAdapterBatch {
             identity,
             records: selected,
@@ -150,10 +185,28 @@ where
         let rows_written: u64 = chunks.iter().map(|c| c.rows_count() as u64).sum();
 
         match self.writer.execute_all(&chunks).await {
-            Ok(()) => Ok(SinkCommitResult {
-                bytes_written,
-                rows_written,
-            }),
+            Ok(()) => {
+                // Per-run drain counter — §1. Increment exactly once
+                // per record per successful commit. The harness reads
+                // `rate(...{run_id="..."}[1m])` to track live drain
+                // progress without scanning ClickHouse.
+                for (run_id, count) in &rows_by_run_id {
+                    metrics::counter!(
+                        ROWS_COMMITTED_TOTAL,
+                        "run_id" => run_id.clone(),
+                    )
+                    .increment(*count);
+                }
+                // §4 commit-stage byte throughput. `bytes_written` here
+                // is the sum of serialized RowValue lengths the writer
+                // sent; it's the same number reported in
+                // SinkCommitResult.bytes_written.
+                metrics::counter!(COMMIT_BYTES_TOTAL).increment(bytes_written);
+                Ok(SinkCommitResult {
+                    bytes_written,
+                    rows_written,
+                })
+            }
             Err(e) => match e.class() {
                 WriterErrorClass::Retryable | WriterErrorClass::RetryBudgetExhausted => {
                     // ClickHouse can ambiguously commit on retryable
@@ -310,4 +363,30 @@ mod tests {
     /// for future tests that inspect adapter-error mapping.
     #[allow(dead_code)]
     fn _adapter_error_import_anchor(_: AdapterError) {}
+
+    /// §1 helper: bucket counts records by `_odb_run_id`, falls back
+    /// to `"unknown"` for records missing the stamp. Both buckets
+    /// must sum to the input size so the counter stays
+    /// row-conservation-correct.
+    #[test]
+    fn bucket_rows_by_run_id_groups_and_falls_back() {
+        let mut a = fake_log_record(0);
+        a.log_attributes
+            .insert("_odb_run_id".into(), "run-a".into());
+        let mut b = fake_log_record(1);
+        b.log_attributes
+            .insert("_odb_run_id".into(), "run-a".into());
+        let mut c = fake_log_record(2);
+        c.log_attributes
+            .insert("_odb_run_id".into(), "run-b".into());
+        // d has no _odb_run_id stamp.
+        let d = fake_log_record(3);
+
+        let counts = bucket_rows_by_run_id(&[a, b, c, d]);
+        assert_eq!(counts.get("run-a").copied(), Some(2));
+        assert_eq!(counts.get("run-b").copied(), Some(1));
+        assert_eq!(counts.get("unknown").copied(), Some(1));
+        let total: u64 = counts.values().sum();
+        assert_eq!(total, 4, "row count must be conserved across buckets");
+    }
 }
