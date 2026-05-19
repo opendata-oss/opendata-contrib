@@ -53,6 +53,7 @@ common = { workspace = true }
 futures = { workspace = true }
 metrics = { workspace = true }
 metrics-util = { workspace = true, features = ["debugging"] }
+prometheus-client = { workspace = true }
 opendata-ingest-runtime = { path = "../../runtime/opendata-ingest-runtime" }
 serde = { workspace = true }
 serde_json = { workspace = true }

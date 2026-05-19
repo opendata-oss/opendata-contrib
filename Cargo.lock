@@ -529,6 +529,7 @@ dependencies = [
  "opendata-ingest-otel",
  "opendata-ingest-runtime",
  "opentelemetry-proto",
+ "prometheus-client",
  "prost",
  "serde",
  "serde_json",

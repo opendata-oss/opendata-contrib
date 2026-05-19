@@ -6,7 +6,6 @@
 //! four `runtime_stage_inflight_bytes{stage=...}` label values
 //! land in §1.4.
 
-use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -16,7 +15,11 @@ use common::ObjectStoreConfig;
 use common::clock::SystemClock;
 use metrics_util::debugging::DebugValue;
 use opendata_ingest_runtime::envelope::{ConfiguredEnvelope, PayloadEncoding, SignalType};
-use opendata_ingest_runtime::metrics as runtime_metrics;
+use opendata_ingest_runtime::metrics::{
+    RuntimeMetrics, SinkLabels, SourceLabels, SourceReasonLabels, StageLabels,
+};
+use prometheus_client::encoding::text::encode;
+use prometheus_client::registry::Registry;
 use opendata_ingest_runtime::runtime::{
     AckFlushPolicy, Runtime, RuntimeOptions, SinkPoolOptions, SourceBackpressureOptions,
 };
@@ -111,16 +114,21 @@ async fn drive_pipeline(
     batch_count: u64,
     sink: BenchSink,
     retry_initial_backoff_ms: u64,
-) -> String {
+) -> (String, Arc<RuntimeMetrics>) {
     let (producer, source) = unique_source(test_tag).await;
     let source_label = source.id().0.clone();
     produce_n(&producer, batch_count).await;
 
+    // Stage-1 migration: each test owns its own `RuntimeMetrics` and
+    // inspects the typed Family fields directly after the pipeline
+    // drains. No shared global recorder needed.
+    let metrics = Arc::new(RuntimeMetrics::new());
     let runtime = Runtime::builder()
         .add_source(source)
         .add_decoder(FakeDecoder)
         .set_sink(sink)
         .with_options(options(retry_initial_backoff_ms))
+        .with_runtime_metrics(Arc::clone(&metrics))
         .build()
         .expect("build");
     let mut progress_rx = runtime.progress();
@@ -145,7 +153,7 @@ async fn drive_pipeline(
 
     shutdown.cancel();
     handle.await.expect("join").expect("clean exit");
-    source_label
+    (source_label, metrics)
 }
 
 /// Sanity that the global recorder + snapshotter wiring is
@@ -176,120 +184,133 @@ async fn process_recorder_increments_accumulate_across_macro_reresolves() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn process_recorder_captures_all_named_series_after_10_batches() {
-    let snapshotter = init_metrics_recorder();
+    let sink_id = "metrics-bench-sink-named-series";
+    let sink = BenchSink::new(sink_id);
+    let (source_label, metrics) = drive_pipeline("named-series", 10, sink, 2).await;
 
-    let sink = BenchSink::new("metrics-bench-sink-named-series");
-    let source_label = drive_pipeline("named-series", 10, sink, 2).await;
+    let source = SourceLabels {
+        source: source_label.clone(),
+    };
+    let sink_labels = SinkLabels {
+        sink: sink_id.to_string(),
+    };
 
-    let snapshot_vec = snapshotter.snapshot().into_vec();
-
-    // Filter the snapshot to entries this test produced. Tests
-    // share one process-wide recorder; the unique source label
-    // (`buffer-named-series`) keeps assertions hermetic against
-    // parallel test execution.
-    let our_entries: Vec<_> = snapshot_vec
-        .iter()
-        .filter(|(k, _, _, _)| {
-            k.key()
-                .labels()
-                .any(|l| l.key() == "source" && l.value() == source_label)
-                || k.key()
-                    .labels()
-                    .any(|l| l.key() == "sink" && l.value() == "metrics-bench-sink-named-series")
-        })
-        .collect();
-
-    let names: HashSet<&str> = our_entries
-        .iter()
-        .map(|(k, _, _, _)| k.key().name())
-        .collect();
-
-    // Every constant declared in `opendata_ingest_runtime::metrics`
-    // (modulo BACKPRESSURE_REASON which only fires under retry
-    // paths — covered by the second test) must have been emitted
-    // at least once by a 10-batch happy-path run.
-    let required = [
-        runtime_metrics::STAGE_QUEUE_DEPTH,
-        runtime_metrics::STAGE_INFLIGHT_BYTES,
-        runtime_metrics::STAGE_LATENCY_SECONDS,
-        runtime_metrics::ACK_FRONTIER,
-        runtime_metrics::PENDING_RANGES,
-        runtime_metrics::SINK_QUEUE_DEPTH,
-        runtime_metrics::SINK_INFLIGHT_BYTES,
-        runtime_metrics::SINK_COMMITS_TOTAL,
-        runtime_metrics::DESCRIPTORS_HANDED_OUT_TOTAL,
-        runtime_metrics::ACK_LAG_SECONDS,
-    ];
-    for name in &required {
-        assert!(
-            names.contains(name),
-            "expected series {name} for source={source_label} in snapshot; saw {names:?}",
-        );
-    }
-
-    // §1.4 closeout: per-stage breakdown of
-    // `runtime_stage_inflight_bytes`. All four stage labels must
-    // have been emitted at least once during a 10-batch run.
-    let mut seen_stages: HashSet<String> = HashSet::new();
-    for (key, _unit, _desc, _value) in &our_entries {
-        if key.key().name() == runtime_metrics::STAGE_INFLIGHT_BYTES {
-            for label in key.key().labels() {
-                if label.key() == "stage" {
-                    seen_stages.insert(label.value().to_string());
-                }
-            }
-        }
-    }
-    for stage in ["source", "fetch", "decode", "sink_dispatch"] {
-        assert!(
-            seen_stages.contains(stage),
-            "expected stage={stage} in runtime_stage_inflight_bytes \
-             for source={source_label}; saw {seen_stages:?}",
-        );
-    }
-
-    // `runtime_descriptors_handed_out_total{source}` should equal
-    // the produced batch count exactly. Hermetic on the unique
-    // source label.
-    let descriptors_total: Option<u64> = our_entries
-        .iter()
-        .find(|(k, _, _, _)| k.key().name() == runtime_metrics::DESCRIPTORS_HANDED_OUT_TOTAL)
-        .and_then(|(_, _, _, value)| match value {
-            DebugValue::Counter(c) => Some(*c),
-            _ => None,
-        });
+    // Direct-typed assertions on counters + gauges (those expose
+    // `.get()`). Histogram counts go through `encode` since the
+    // `prometheus-client` Histogram doesn't have a public count
+    // accessor.
+    let descriptors_total = metrics.descriptors_handed_out.get_or_create(&source).get();
     assert_eq!(
-        descriptors_total,
-        Some(10),
+        descriptors_total, 10,
         "descriptors_handed_out_total for source={source_label} \
-         should equal the 10 produced batches; saw {descriptors_total:?}",
+         should equal the 10 produced batches; saw {descriptors_total}",
     );
 
-    // Review fix-up MEDIUM: after the pipeline fully drains, the
-    // sink-inflight gauge must read zero. Previously the writer
-    // worker only set the gauge when an envelope arrived, leaving
-    // the last non-zero value sticky in the snapshot — a
-    // post-drain reader would see stale data. The writer now
-    // re-emits the gauge after every reservation drop; the
-    // process-final value reads the post-drain
-    // `stage_bytes.sink_dispatch` (which is 0).
-    let sink_inflight_final: Option<f64> = snapshot_vec
-        .iter()
-        .find(|(k, _, _, _)| {
-            k.key().name() == runtime_metrics::SINK_INFLIGHT_BYTES
-                && k.key()
-                    .labels()
-                    .any(|l| l.key() == "sink" && l.value() == "metrics-bench-sink-named-series")
-        })
-        .and_then(|(_, _, _, value)| match value {
-            DebugValue::Gauge(g) => Some(g.into_inner()),
-            _ => None,
+    assert!(
+        metrics.bytes_fetched.get_or_create(&source).get() > 0,
+        "bytes_fetched should be > 0 for source={source_label}",
+    );
+    assert!(
+        metrics.records_decoded.get_or_create(&source).get() > 0,
+        "records_decoded should be > 0 for source={source_label}",
+    );
+
+    for stage in ["source", "fetch", "decode", "sink_dispatch"] {
+        let labels = StageLabels {
+            stage: stage.to_string(),
+            source: source_label.clone(),
+        };
+        let inflight_total = metrics.stage_inflight_bytes.get_or_create(&labels).get();
+        assert_eq!(
+            inflight_total, 0,
+            "stage_inflight_bytes{{stage={stage}}} should read 0 post-drain; saw {inflight_total}",
+        );
+    }
+
+    let sink_inflight_final = metrics.sink_inflight_bytes.get_or_create(&sink_labels).get();
+    assert_eq!(
+        sink_inflight_final, 0,
+        "runtime_sink_inflight_bytes{{sink={sink_id}}} \
+         must read 0 after the pipeline drains; saw {sink_inflight_final}",
+    );
+    assert_eq!(
+        metrics.sink_queue_depth.get_or_create(&sink_labels).get(),
+        0,
+        "sink_queue_depth must read 0 post-drain",
+    );
+
+    let ack_frontier = metrics.ack_frontier.get_or_create(&source).get();
+    assert!(
+        ack_frontier >= 9,
+        "ack_frontier should reflect the last acked sequence (≥9); saw {ack_frontier}",
+    );
+    assert_eq!(
+        metrics.pending_ranges.get_or_create(&source).get(),
+        0,
+        "pending_ranges must drain to 0 post-pipeline",
+    );
+
+    // Histogram + sink-commit-counter assertions go through `encode`:
+    // we render the Registry to Prometheus text and assert each
+    // expected `_bucket{le="+Inf"} N` series has N >= 1 for every
+    // per-stage histogram, plus the sink_commits_total series shows
+    // the expected committed count.
+    let mut registry = Registry::default();
+    metrics.register(&mut registry);
+    let mut rendered = String::new();
+    encode(&mut rendered, &registry).expect("encode");
+
+    for stage in ["source", "fetch", "decode", "sink_dispatch"] {
+        let expected =
+            format!("runtime_stage_latency_seconds_count{{stage=\"{stage}\",source=\"{source_label}\"}}");
+        let line = rendered
+            .lines()
+            .find(|l| l.starts_with(&expected))
+            .unwrap_or_else(|| {
+                panic!(
+                    "stage_latency_seconds{{stage={stage}}} _count line missing; \
+                     rendered output was:\n{rendered}"
+                )
+            });
+        let count: u64 = line
+            .rsplit(' ')
+            .next()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_else(|| {
+                panic!("could not parse trailing count from {line:?}")
+            });
+        assert!(
+            count > 0,
+            "stage_latency_seconds{{stage={stage}}} should have observations; \
+             saw count={count}",
+        );
+    }
+
+    let ack_count_line = format!("runtime_ack_lag_seconds_count{{source=\"{source_label}\"}}");
+    let ack_count: u64 = rendered
+        .lines()
+        .find(|l| l.starts_with(&ack_count_line))
+        .and_then(|l| l.rsplit(' ').next().and_then(|s| s.parse().ok()))
+        .unwrap_or_else(|| panic!("ack_lag_seconds _count missing; rendered:\n{rendered}"));
+    assert!(
+        ack_count > 0,
+        "ack_lag_seconds should have at least one observation; saw count={ack_count}",
+    );
+
+    let sink_commits_committed = format!(
+        "runtime_sink_commits_total{{source=\"{source_label}\",sink=\"{sink_id}\",result=\"committed\"}}"
+    );
+    let sink_commits_count: u64 = rendered
+        .lines()
+        .find(|l| l.starts_with(&sink_commits_committed))
+        .and_then(|l| l.rsplit(' ').next().and_then(|s| s.parse().ok()))
+        .unwrap_or_else(|| {
+            panic!("sink_commits_total{{result=committed}} missing; rendered:\n{rendered}")
         });
     assert_eq!(
-        sink_inflight_final,
-        Some(0.0),
-        "runtime_sink_inflight_bytes{{sink=metrics-bench-sink-named-series}} \
-         must read 0 after the pipeline drains; saw {sink_inflight_final:?}",
+        sink_commits_count, 10,
+        "sink_commits_total{{result=committed}} should equal the 10 produced batches; \
+         saw {sink_commits_count}",
     );
 }
 
@@ -305,7 +326,10 @@ async fn process_recorder_captures_all_named_series_after_10_batches() {
 /// counter increment.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn backpressure_reason_fires_on_retrying_sleep() {
-    let snapshotter = init_metrics_recorder();
+    // Backpressure-reason counter now lives in RuntimeMetrics rather
+    // than the metrics-rs global recorder; the snapshotter remains
+    // installed for the other test in this binary but isn't read here.
+    let _snapshotter = init_metrics_recorder();
 
     // BenchSink with MaybeCommitted-then-Ok script on seq=0
     // forces the runtime through the retry sleep path. The
@@ -323,29 +347,20 @@ async fn backpressure_reason_fires_on_retrying_sleep() {
     });
     sink.set_latency_fn(latency);
 
-    let source_label = drive_pipeline("retrying", 3, sink, 50).await;
+    let (source_label, metrics) = drive_pipeline("retrying", 3, sink, 50).await;
 
-    let snapshot_vec = snapshotter.snapshot().into_vec();
-    let retrying_count: Option<u64> = snapshot_vec
-        .iter()
-        .find(|(k, _, _, _)| {
-            k.key().name() == runtime_metrics::BACKPRESSURE_REASON
-                && k.key()
-                    .labels()
-                    .any(|l| l.key() == "reason" && l.value() == "retrying")
-                && k.key()
-                    .labels()
-                    .any(|l| l.key() == "source" && l.value() == source_label)
+    let retrying_count = metrics
+        .backpressure_reason
+        .get_or_create(&SourceReasonLabels {
+            source: source_label.clone(),
+            reason: "retrying".to_string(),
         })
-        .and_then(|(_, _, _, v)| match v {
-            DebugValue::Counter(c) => Some(*c),
-            _ => None,
-        });
+        .get();
 
     assert!(
-        matches!(retrying_count, Some(n) if n >= 1),
+        retrying_count >= 1,
         "BACKPRESSURE_REASON{{reason=retrying, source={source_label}}} \
          should have incremented at least once over a forced-retry run; \
-         saw {retrying_count:?}",
+         saw {retrying_count}",
     );
 }

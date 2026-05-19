@@ -158,6 +158,7 @@ const BACKPRESSURE_TIMER_THRESHOLD: Duration = Duration::from_millis(10);
 async fn with_backpressure_timer<T>(
     source_id: &SourceId,
     reason: crate::metrics::BackpressureReason,
+    metrics: &crate::metrics::RuntimeMetrics,
     fut: impl Future<Output = T>,
 ) -> T {
     let mut fut = std::pin::pin!(fut);
@@ -165,12 +166,13 @@ async fn with_backpressure_timer<T>(
         biased;
         out = &mut fut => out,
         () = tokio::time::sleep(BACKPRESSURE_TIMER_THRESHOLD) => {
-            metrics::counter!(
-                crate::metrics::BACKPRESSURE_REASON,
-                "source" => source_id.0.clone(),
-                "reason" => reason.as_label(),
-            )
-            .increment(1);
+            metrics
+                .backpressure_reason
+                .get_or_create(&crate::metrics::SourceReasonLabels {
+                    source: source_id.0.clone(),
+                    reason: reason.as_label().to_string(),
+                })
+                .inc();
             fut.await
         }
     }
@@ -623,7 +625,7 @@ impl Runtime {
             progress_tx,
             progress_rx: _progress_rx,
             source_byte_budget,
-            runtime_metrics: _runtime_metrics,
+            runtime_metrics,
             admission_recorder,
             ack_through_recorder,
             ack_through_observer,
@@ -689,6 +691,7 @@ impl Runtime {
                 test_fetch_killswitch.clone(),
                 stage_bytes.clone(),
                 hard_abort_token.clone(),
+                Arc::clone(&runtime_metrics),
             )));
         }
         drop(descriptor_rx);
@@ -711,6 +714,7 @@ impl Runtime {
                 completion_tx.clone(),
                 stage_bytes.clone(),
                 hard_abort_token.clone(),
+                Arc::clone(&runtime_metrics),
             )));
         }
         drop(fetched_rx);
@@ -738,6 +742,7 @@ impl Runtime {
                 completion_tx.clone(),
                 stage_bytes.clone(),
                 hard_abort_token.clone(),
+                Arc::clone(&runtime_metrics),
             )));
         }
         drop(sink_commit_rx);
@@ -759,6 +764,7 @@ impl Runtime {
             ack_through_recorder,
             ack_through_observer,
             stage_bytes.clone(),
+            Arc::clone(&runtime_metrics),
         )
         .await;
 
@@ -1057,6 +1063,7 @@ async fn per_source_actor(
     ack_through_recorder: Option<AckThroughRecorder>,
     ack_through_observer: Option<AckThroughObserver>,
     stage_bytes: StageInflightBytes,
+    metrics: Arc<crate::metrics::RuntimeMetrics>,
 ) -> RuntimeResult<()> {
     let source_id = source.id().clone();
     let bp = options.backpressure_for(&source_id);
@@ -1180,31 +1187,35 @@ async fn per_source_actor(
                                     groups_since_flush = 0;
                                 }
                                 progress.last_acked_sequence = Some(f);
-                                metrics::histogram!(
-                                    crate::metrics::ACK_LAG_SECONDS,
-                                    "source" => source_id.0.clone(),
-                                )
-                                .record(ack_lag_start.elapsed().as_secs_f64());
+                                metrics
+                                    .ack_lag_seconds
+                                    .get_or_create(&crate::metrics::SourceLabels {
+                                        source: source_id.0.clone(),
+                                    })
+                                    .observe(ack_lag_start.elapsed().as_secs_f64());
                             }
-                            metrics::gauge!(
-                                crate::metrics::ACK_FRONTIER,
-                                "source" => source_id.0.clone(),
-                            )
-                            .set(f as f64);
+                            metrics
+                                .ack_frontier
+                                .get_or_create(&crate::metrics::SourceLabels {
+                                    source: source_id.0.clone(),
+                                })
+                                .set(f as i64);
                         }
                         progress.pending_ranges_total = coordinator.pending_count();
                         let _ = progress_tx.send(progress);
 
-                        metrics::gauge!(
-                            crate::metrics::PENDING_RANGES,
-                            "source" => source_id.0.clone(),
-                        )
-                        .set(coordinator.pending_count() as f64);
-                        metrics::gauge!(
-                            crate::metrics::BUFFER_CONSUMER_SEQUENCE_LAG,
-                            "source" => source_id.0.clone(),
-                        )
-                        .set(source.pending_count() as f64);
+                        metrics
+                            .pending_ranges
+                            .get_or_create(&crate::metrics::SourceLabels {
+                                source: source_id.0.clone(),
+                            })
+                            .set(coordinator.pending_count() as i64);
+                        metrics
+                            .buffer_consumer_seq_lag
+                            .get_or_create(&crate::metrics::SourceLabels {
+                                source: source_id.0.clone(),
+                            })
+                            .set(source.pending_count() as i64);
                         // Per-stage breakdown (§1.4 closeout). Each
                         // stage atomic tracks the bytes attached to
                         // reservations currently owned by that
@@ -1212,7 +1223,7 @@ async fn per_source_actor(
                         // sync without manual decrement on early-
                         // return paths. Sum equals
                         // `budget.in_flight()` under quiescence.
-                        emit_stage_inflight_gauges(&stage_bytes, &source_id);
+                        emit_stage_inflight_gauges(&stage_bytes, &source_id, &metrics);
                     }
                     Some(WriteCompletion::Fatal(e)) => {
                         return Err(e);
@@ -1226,12 +1237,13 @@ async fn per_source_actor(
                         )));
                     }
                 }
-                metrics::histogram!(
-                    crate::metrics::STAGE_LATENCY_SECONDS,
-                    "stage" => "source",
-                    "source" => source_id.0.clone(),
-                )
-                .record(stage_start.elapsed().as_secs_f64());
+                metrics
+                    .stage_latency_seconds
+                    .get_or_create(&crate::metrics::StageLabels {
+                        stage: "source".to_string(),
+                        source: source_id.0.clone(),
+                    })
+                    .observe(stage_start.elapsed().as_secs_f64());
             }
 
             // 3. Admission arm — only when admission is open AND
@@ -1239,6 +1251,7 @@ async fn per_source_actor(
             biased_arm = with_backpressure_timer(
                 &source_id,
                 crate::metrics::BackpressureReason::SourceBudget,
+                &metrics,
                 admission_attempt(
                     &source_id,
                     &budget,
@@ -1270,12 +1283,13 @@ async fn per_source_actor(
                 if descriptors.is_empty() {
                     drop(reservation);
                     drop(batch_permit);
-                    metrics::histogram!(
-                        crate::metrics::STAGE_LATENCY_SECONDS,
-                        "stage" => "source",
-                        "source" => source_id.0.clone(),
-                    )
-                    .record(stage_start.elapsed().as_secs_f64());
+                    metrics
+                        .stage_latency_seconds
+                        .get_or_create(&crate::metrics::StageLabels {
+                            stage: "source".to_string(),
+                            source: source_id.0.clone(),
+                        })
+                        .observe(stage_start.elapsed().as_secs_f64());
                     tokio::time::sleep(options.poll_interval).await;
                     continue;
                 }
@@ -1293,12 +1307,12 @@ async fn per_source_actor(
                 }
                 coordinator.register_pending(seq, seq)?;
                 in_flight = in_flight.saturating_add(1);
-                info!(target: "metric_probe", source = %source_id.0, "DESCRIPTORS_HANDED_OUT_TOTAL +1");
-                metrics::counter!(
-                    crate::metrics::DESCRIPTORS_HANDED_OUT_TOTAL,
-                    "source" => source_id.0.clone(),
-                )
-                .increment(1);
+                metrics
+                    .descriptors_handed_out
+                    .get_or_create(&crate::metrics::SourceLabels {
+                        source: source_id.0.clone(),
+                    })
+                    .inc();
 
                 if descriptor_tx
                     .send(AdmittedDescriptor {
@@ -1313,12 +1327,13 @@ async fn per_source_actor(
                         "descriptor lost: source={source_id} seq={seq} cause=worker-stage-closed",
                     )));
                 }
-                metrics::histogram!(
-                    crate::metrics::STAGE_LATENCY_SECONDS,
-                    "stage" => "source",
-                    "source" => source_id.0.clone(),
-                )
-                .record(stage_start.elapsed().as_secs_f64());
+                metrics
+                    .stage_latency_seconds
+                    .get_or_create(&crate::metrics::StageLabels {
+                        stage: "source".to_string(),
+                        source: source_id.0.clone(),
+                    })
+                    .observe(stage_start.elapsed().as_secs_f64());
             }
         }
     }
@@ -1338,7 +1353,11 @@ async fn per_source_actor(
 /// completion arm after every committed unit; covers all stages
 /// (`source` / `fetch` / `decode` / `sink_dispatch`) and is the
 /// canonical emission site for the per-stage breakdown.
-fn emit_stage_inflight_gauges(stage_bytes: &StageInflightBytes, source_id: &SourceId) {
+fn emit_stage_inflight_gauges(
+    stage_bytes: &StageInflightBytes,
+    source_id: &SourceId,
+    metrics: &crate::metrics::RuntimeMetrics,
+) {
     let source_label = source_id.0.clone();
     for (stage_label, atomic) in [
         ("source", &stage_bytes.source),
@@ -1346,12 +1365,13 @@ fn emit_stage_inflight_gauges(stage_bytes: &StageInflightBytes, source_id: &Sour
         ("decode", &stage_bytes.decode),
         ("sink_dispatch", &stage_bytes.sink_dispatch),
     ] {
-        metrics::gauge!(
-            crate::metrics::STAGE_INFLIGHT_BYTES,
-            "stage" => stage_label,
-            "source" => source_label.clone(),
-        )
-        .set(atomic.load(Ordering::SeqCst) as f64);
+        metrics
+            .stage_inflight_bytes
+            .get_or_create(&crate::metrics::StageLabels {
+                stage: stage_label.to_string(),
+                source: source_label.clone(),
+            })
+            .set(atomic.load(Ordering::SeqCst) as i64);
     }
 }
 
@@ -1416,21 +1436,24 @@ async fn fetch_worker(
     test_fetch_killswitch: Option<TestFetchKillswitch>,
     stage_bytes: StageInflightBytes,
     hard_abort_token: CancellationToken,
+    metrics: Arc<crate::metrics::RuntimeMetrics>,
 ) -> RuntimeResult<()> {
     let source_label = source_id.0.clone();
     loop {
-        metrics::gauge!(
-            crate::metrics::STAGE_QUEUE_DEPTH,
-            "stage" => "fetch",
-            "source" => source_label.clone(),
-        )
-        .set(descriptor_rx.len() as f64);
-        metrics::gauge!(
-            crate::metrics::STAGE_INFLIGHT_BYTES,
-            "stage" => "fetch",
-            "source" => source_label.clone(),
-        )
-        .set(stage_bytes.fetch.load(Ordering::SeqCst) as f64);
+        metrics
+            .stage_queue_depth
+            .get_or_create(&crate::metrics::StageLabels {
+                stage: "fetch".to_string(),
+                source: source_label.clone(),
+            })
+            .set(descriptor_rx.len() as i64);
+        metrics
+            .stage_inflight_bytes
+            .get_or_create(&crate::metrics::StageLabels {
+                stage: "fetch".to_string(),
+                source: source_label.clone(),
+            })
+            .set(stage_bytes.fetch.load(Ordering::SeqCst) as i64);
 
         let admitted = tokio::select! {
             biased;
@@ -1493,12 +1516,13 @@ async fn fetch_worker(
                 return Ok(());
             }
         };
-        metrics::histogram!(
-            crate::metrics::STAGE_LATENCY_SECONDS,
-            "stage" => "fetch",
-            "source" => source_label.clone(),
-        )
-        .record(stage_start.elapsed().as_secs_f64());
+        metrics
+            .stage_latency_seconds
+            .get_or_create(&crate::metrics::StageLabels {
+                stage: "fetch".to_string(),
+                source: source_label.clone(),
+            })
+            .observe(stage_start.elapsed().as_secs_f64());
         // §4 fetch-stage byte throughput. `_count` on
         // STAGE_LATENCY_SECONDS already gives the batches-fetched
         // rate; this counter gives the byte rate against the
@@ -1509,16 +1533,17 @@ async fn fetch_worker(
             .iter()
             .map(|e| e.raw_bytes.len() as u64 + e.raw_metadata.len() as u64)
             .sum();
-        info!(target: "metric_probe", source = %source_label, bytes = fetched_bytes, "BYTES_FETCHED_TOTAL +N");
-        metrics::counter!(
-            crate::metrics::BYTES_FETCHED_TOTAL,
-            "source" => source_label.clone(),
-        )
-        .increment(fetched_bytes);
+        metrics
+            .bytes_fetched
+            .get_or_create(&crate::metrics::SourceLabels {
+                source: source_label.clone(),
+            })
+            .inc_by(fetched_bytes);
 
         let send_result = with_backpressure_timer(
             &source_id,
             crate::metrics::BackpressureReason::DecodeBudget,
+            &metrics,
             fetched_tx.send(FetchedBatch {
                 source_batch,
                 reservation,
@@ -1584,22 +1609,25 @@ async fn decode_worker(
     completion_tx: mpsc::Sender<WriteCompletion>,
     stage_bytes: StageInflightBytes,
     hard_abort_token: CancellationToken,
+    metrics: Arc<crate::metrics::RuntimeMetrics>,
 ) -> RuntimeResult<()> {
     let source_label = source_id.0.clone();
     let bp = options.backpressure_for(&source_id);
     loop {
-        metrics::gauge!(
-            crate::metrics::STAGE_QUEUE_DEPTH,
-            "stage" => "decode",
-            "source" => source_label.clone(),
-        )
-        .set(fetched_rx.len() as f64);
-        metrics::gauge!(
-            crate::metrics::STAGE_INFLIGHT_BYTES,
-            "stage" => "decode",
-            "source" => source_label.clone(),
-        )
-        .set(stage_bytes.decode.load(Ordering::SeqCst) as f64);
+        metrics
+            .stage_queue_depth
+            .get_or_create(&crate::metrics::StageLabels {
+                stage: "decode".to_string(),
+                source: source_label.clone(),
+            })
+            .set(fetched_rx.len() as i64);
+        metrics
+            .stage_inflight_bytes
+            .get_or_create(&crate::metrics::StageLabels {
+                stage: "decode".to_string(),
+                source: source_label.clone(),
+            })
+            .set(stage_bytes.decode.load(Ordering::SeqCst) as i64);
 
         let fetched = tokio::select! {
             biased;
@@ -1633,20 +1661,23 @@ async fn decode_worker(
                 admitted_sequence,
                 &bp,
                 &mut reservation,
+                &metrics,
             ) => r,
         };
-        metrics::histogram!(
-            crate::metrics::STAGE_LATENCY_SECONDS,
-            "stage" => "decode",
-            "source" => source_label.clone(),
-        )
-        .record(stage_start.elapsed().as_secs_f64());
+        metrics
+            .stage_latency_seconds
+            .get_or_create(&crate::metrics::StageLabels {
+                stage: "decode".to_string(),
+                source: source_label.clone(),
+            })
+            .observe(stage_start.elapsed().as_secs_f64());
 
         match outcome {
             Ok(DecodeOutcome::Live { commit, range }) => {
                 let send_result = with_backpressure_timer(
                     &source_id,
                     crate::metrics::BackpressureReason::SinkBudget,
+                    &metrics,
                     sink_commit_tx.send(SinkCommitEnvelope {
                         commit: *commit,
                         range,
@@ -1720,6 +1751,7 @@ async fn decode_one(
     admitted_sequence: u64,
     bp: &SourceBackpressureOptions,
     reservation: &mut ByteReservation,
+    metrics: &crate::metrics::RuntimeMetrics,
 ) -> RuntimeResult<DecodeOutcome> {
     // Per-entry envelope validation.
     let envelopes =
@@ -1802,12 +1834,12 @@ async fn decode_one(
     // §4 decode-stage record throughput. Live + dry-run both pay
     // the decode work, so the counter increments before branching
     // on dry_run.
-    info!(target: "metric_probe", source = %decoded.source.0, rows = row_count, "RECORDS_DECODED_TOTAL +N");
-    metrics::counter!(
-        crate::metrics::RECORDS_DECODED_TOTAL,
-        "source" => decoded.source.0.clone(),
-    )
-    .increment(row_count);
+    metrics
+        .records_decoded
+        .get_or_create(&crate::metrics::SourceLabels {
+            source: decoded.source.0.clone(),
+        })
+        .inc_by(row_count);
 
     if options.dry_run {
         debug!(low, high, rows = row_count, "dry-run: skipping sink write");
@@ -1862,21 +1894,24 @@ async fn writer_worker(
     completion_tx: mpsc::Sender<WriteCompletion>,
     stage_bytes: StageInflightBytes,
     hard_abort_token: CancellationToken,
+    metrics: Arc<crate::metrics::RuntimeMetrics>,
 ) -> RuntimeResult<()> {
     let source_label = source_id.0.clone();
     let sink_label = sink_id.0.clone();
     loop {
-        metrics::gauge!(
-            crate::metrics::SINK_QUEUE_DEPTH,
-            "sink" => sink_label.clone(),
-        )
-        .set(sink_commit_rx.len() as f64);
-        metrics::gauge!(
-            crate::metrics::STAGE_INFLIGHT_BYTES,
-            "stage" => "sink_dispatch",
-            "source" => source_label.clone(),
-        )
-        .set(stage_bytes.sink_dispatch.load(Ordering::SeqCst) as f64);
+        metrics
+            .sink_queue_depth
+            .get_or_create(&crate::metrics::SinkLabels {
+                sink: sink_label.clone(),
+            })
+            .set(sink_commit_rx.len() as i64);
+        metrics
+            .stage_inflight_bytes
+            .get_or_create(&crate::metrics::StageLabels {
+                stage: "sink_dispatch".to_string(),
+                source: source_label.clone(),
+            })
+            .set(stage_bytes.sink_dispatch.load(Ordering::SeqCst) as i64);
 
         let envelope = tokio::select! {
             biased;
@@ -1900,28 +1935,31 @@ async fn writer_worker(
         // closeout calls for. Drop on the success path / error
         // path / abort path decrements automatically.
         reservation.attach_stage(Arc::clone(&stage_bytes.sink_dispatch));
-        metrics::gauge!(
-            crate::metrics::SINK_INFLIGHT_BYTES,
-            "sink" => sink_label.clone(),
-        )
-        .set(stage_bytes.sink_dispatch.load(Ordering::SeqCst) as f64);
+        metrics
+            .sink_inflight_bytes
+            .get_or_create(&crate::metrics::SinkLabels {
+                sink: sink_label.clone(),
+            })
+            .set(stage_bytes.sink_dispatch.load(Ordering::SeqCst) as i64);
         let stage_start = std::time::Instant::now();
         let attempt =
-            write_with_retry(&sink, commit, &options, &source_id, &hard_abort_token).await;
-        metrics::histogram!(
-            crate::metrics::STAGE_LATENCY_SECONDS,
-            "stage" => "sink_dispatch",
-            "source" => source_label.clone(),
-        )
-        .record(stage_start.elapsed().as_secs_f64());
-        info!(target: "metric_probe", source = %source_label, sink = %sink_label, result = attempt.outcome.as_label(), "SINK_COMMITS_TOTAL +1");
-        metrics::counter!(
-            crate::metrics::SINK_COMMITS_TOTAL,
-            "source" => source_label.clone(),
-            "sink" => sink_label.clone(),
-            "result" => attempt.outcome.as_label(),
-        )
-        .increment(1);
+            write_with_retry(&sink, commit, &options, &source_id, &hard_abort_token, &metrics)
+                .await;
+        metrics
+            .stage_latency_seconds
+            .get_or_create(&crate::metrics::StageLabels {
+                stage: "sink_dispatch".to_string(),
+                source: source_label.clone(),
+            })
+            .observe(stage_start.elapsed().as_secs_f64());
+        metrics
+            .sink_commits
+            .get_or_create(&crate::metrics::SourceSinkResultLabels {
+                source: source_label.clone(),
+                sink: sink_label.clone(),
+                result: attempt.outcome.as_label().to_string(),
+            })
+            .inc();
 
         match attempt.inner {
             Ok(WriteSuccess::Committed { result }) => {
@@ -1973,11 +2011,12 @@ async fn writer_worker(
         // The post-drop read of `stage_bytes.sink_dispatch` is
         // the now-decremented total (the reservation's Drop
         // updated the atomic before this line ran).
-        metrics::gauge!(
-            crate::metrics::SINK_INFLIGHT_BYTES,
-            "sink" => sink_label.clone(),
-        )
-        .set(stage_bytes.sink_dispatch.load(Ordering::SeqCst) as f64);
+        metrics
+            .sink_inflight_bytes
+            .get_or_create(&crate::metrics::SinkLabels {
+                sink: sink_label.clone(),
+            })
+            .set(stage_bytes.sink_dispatch.load(Ordering::SeqCst) as i64);
     }
 }
 
@@ -2023,6 +2062,7 @@ async fn write_with_retry(
     options: &RuntimeOptions,
     source_id: &SourceId,
     hard_abort_token: &CancellationToken,
+    metrics: &crate::metrics::RuntimeMetrics,
 ) -> WriteAttempt {
     use crate::metrics::SinkCommitOutcome;
     let mut attempt = 0u32;
@@ -2069,6 +2109,7 @@ async fn write_with_retry(
                 let slept = with_backpressure_timer(
                     source_id,
                     crate::metrics::BackpressureReason::Retrying,
+                    metrics,
                     sleep_with_abort(backoff, hard_abort_token),
                 )
                 .await;
@@ -2112,6 +2153,7 @@ async fn write_with_retry(
                         let slept = with_backpressure_timer(
                             source_id,
                             crate::metrics::BackpressureReason::Retrying,
+                            metrics,
                             sleep_with_abort(backoff, hard_abort_token),
                         )
                         .await;
