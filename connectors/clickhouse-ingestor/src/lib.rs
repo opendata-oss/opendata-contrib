@@ -27,8 +27,6 @@
 pub mod bench;
 pub mod config;
 pub mod error;
-pub mod metrics;
-pub mod metrics_recorder;
 pub mod metrics_registry;
 pub mod metrics_server;
 

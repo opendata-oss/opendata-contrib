@@ -21,10 +21,10 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use clap::Parser;
-use clickhouse_ingestor::metrics_recorder;
 use clickhouse_ingestor::metrics_registry::MetricsRegistry;
 use clickhouse_ingestor::metrics_server;
 use clickhouse_ingestor::{ClickHouseWriter, IngestorConfig, OtlpLogsClickHouseAdapter};
+use metrics_exporter_prometheus::PrometheusBuilder;
 use opendata_ingest_clickhouse::ClickHouseSink;
 use opendata_ingest_otel::logs::OtlpLogsDecoder;
 use opendata_ingest_runtime::envelope::{ConfiguredEnvelope, PayloadEncoding, SignalType};
@@ -101,12 +101,13 @@ async fn main() -> Result<()> {
     // by writer_config until row 8.4).
     info!(config = ?cfg, "configuration loaded");
 
-    // Install the metrics-rs recorder before any code that records or
-    // describes metrics runs. The recorder is built in
-    // `metrics_recorder::build_recorder` so the histogram-bucket
-    // configuration has unit-test coverage that fails on regressions
-    // (see `metrics_recorder::tests`).
-    let recorder = metrics_recorder::build_recorder()?;
+    // Stage-1 cleanup (C4): runtime + plugin emissions now flow
+    // through prometheus-client (`MetricsRegistry`), so the
+    // `metrics-rs` recorder only needs to render the buffer crate's
+    // emissions. Buffer-side counters are name-only with no
+    // `_seconds` histograms, so the default builder (no bucket
+    // matchers) is sufficient.
+    let recorder = PrometheusBuilder::new().build_recorder();
     let metrics_handle = recorder.handle();
     metrics::set_global_recorder(recorder)
         .map_err(|e| anyhow::anyhow!("install global metrics recorder: {e}"))?;

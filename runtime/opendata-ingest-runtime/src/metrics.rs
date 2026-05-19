@@ -1,16 +1,16 @@
-//! Runtime stage metric name skeleton + Stage-1 typed metric struct.
+//! Runtime metric surface — typed `prometheus-client` `Family<_, _>`
+//! for every metric the runtime emits, plus the per-metric label
+//! structs.
 //!
-//! RFC 0002 rev 6 §Backpressure Model > required metrics defined the
-//! canonical metric names; Phase 4.2 published them as string
-//! constants below so plugin and runtime code shared a single source
-//! of truth via `metrics::counter!(...)` macros.
-//!
-//! Stage 1 of the 2026-05-19 metrics migration adds [`RuntimeMetrics`]
-//! — a typed `prometheus_client::metrics::family::Family<_, _>` for
-//! every metric the runtime emits, plus typed `EncodeLabelSet`
-//! structs. The string constants stay during the C2 transition (call
-//! sites switch one batch at a time); they'll be deleted in C2 once
-//! every emission routes through the typed struct.
+//! Pre-Stage-1 this module exposed string constants consumed by
+//! `metrics::counter!(...)`-style macros (RFC 0002 rev 6
+//! §Backpressure Model > required metrics). The Stage-1 migration
+//! (2026-05-19) replaced every emission site with typed
+//! `Family<L, Counter|Gauge|Histogram>` access via
+//! [`RuntimeMetrics`]; the bin constructs `Arc<RuntimeMetrics>`,
+//! registers it against the shared `Registry`, and threads it
+//! through `RuntimeBuilder::with_runtime_metrics`. The legacy
+//! string constants were deleted in C4 of that migration.
 
 use std::sync::Arc;
 
@@ -20,44 +20,6 @@ use prometheus_client::metrics::family::Family;
 use prometheus_client::metrics::gauge::Gauge;
 use prometheus_client::metrics::histogram::Histogram;
 use prometheus_client::registry::Registry;
-
-pub const STAGE_QUEUE_DEPTH: &str = "runtime_stage_queue_depth";
-pub const STAGE_INFLIGHT_BYTES: &str = "runtime_stage_inflight_bytes";
-pub const STAGE_LATENCY_SECONDS: &str = "runtime_stage_latency_seconds";
-pub const ACK_FRONTIER: &str = "runtime_ack_frontier";
-pub const PENDING_RANGES: &str = "runtime_pending_ranges";
-pub const BACKPRESSURE_REASON: &str = "runtime_backpressure_reason";
-pub const SINK_COMMITS_TOTAL: &str = "runtime_sink_commits_total";
-pub const SINK_QUEUE_DEPTH: &str = "runtime_sink_queue_depth";
-pub const SINK_INFLIGHT_BYTES: &str = "runtime_sink_inflight_bytes";
-pub const DESCRIPTORS_HANDED_OUT_TOTAL: &str = "runtime_descriptors_handed_out_total";
-pub const ACK_LAG_SECONDS: &str = "runtime_ack_lag_seconds";
-/// `head_sequence − last_acked_sequence`, as observed by the consumer
-/// at the last manifest read/write. Surfaced as a gauge labelled
-/// `source` so the Phase 8 cell-bench bottleneck classifier can detect
-/// when ingestor work falls behind manifest growth.
-pub const BUFFER_CONSUMER_SEQUENCE_LAG: &str = "buffer_consumer_sequence_lag";
-
-// =========================================================================
-// Row-8.4 instrumentation-gap §4 — per-stage throughput counters.
-//
-// `STAGE_LATENCY_SECONDS{stage}._count` already gives per-stage batch
-// rates via `rate(...)`; these counters add the byte and record axes
-// the histograms can't reconstruct.
-// =========================================================================
-
-/// Counter. Bytes pulled out of the buffer source (sum of
-/// `SourceEntry.raw_bytes + raw_metadata` per fetched batch).
-/// Labelled by `source`. `rate(...)` answers "is the fetcher keeping
-/// up with the producer's write rate?" — instrumentation-gaps §4.
-pub const BYTES_FETCHED_TOTAL: &str = "ingestor_bytes_fetched_total";
-
-/// Counter. Records produced by the decoder stage (one increment per
-/// `TypedRecords::record_count()`). Labelled by `source`. Combined
-/// with `STAGE_LATENCY_SECONDS{stage="decode"}._count`, lets us tell
-/// "are batches arriving slowly?" from "are batches arriving fine
-/// but each one is small?" — instrumentation-gaps §4.
-pub const RECORDS_DECODED_TOTAL: &str = "ingestor_records_decoded_total";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BackpressureReason {

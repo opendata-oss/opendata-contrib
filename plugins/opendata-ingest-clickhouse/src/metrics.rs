@@ -1,11 +1,15 @@
-//! Phase 7 ClickHouse-side metric name constants + Stage-1 typed
-//! `prometheus-client` Family<_, _> surface ([`ClickHouseMetrics`]).
+//! ClickHouse-plugin metric surface — typed `prometheus-client`
+//! `Family<_, _>` for every chunk + commit + HTTP-attempt metric the
+//! plugin emits, plus the per-metric label structs and the per-
+//! attempt result enum.
 //!
-//! The writer + sink emit these per chunk (= per HTTP INSERT) and per
-//! commit. Stage 1 of the 2026-05-19 metrics migration (see
-//! `plans/odb-high-throughput/stage1-metrics-migration-plan.md`) adds
-//! the typed struct; the string constants below stay until the C3
-//! call-site migration commit and are deleted there.
+//! Pre-Stage-1 this module exposed string constants consumed by
+//! `metrics::counter|gauge|histogram!(...)`-style macros. The
+//! Stage-1 migration (2026-05-19) replaced every emission site with
+//! typed `Family<L, ...>` access via [`ClickHouseMetrics`]; the bin
+//! constructs `Arc<ClickHouseMetrics>` and threads it through
+//! `ClickHouseSink::new_with_metrics` + `ClickHouseWriter::new_with_metrics`.
+//! The legacy string constants were deleted in C4 of that migration.
 
 use std::sync::Arc;
 
@@ -16,50 +20,7 @@ use prometheus_client::metrics::gauge::Gauge;
 use prometheus_client::metrics::histogram::Histogram;
 use prometheus_client::registry::Registry;
 
-/// Histogram. One sample per `execute_chunk` call.
-pub const SERIALIZATION_DURATION_SECONDS: &str = "clickhouse_serialization_duration_seconds";
-
-/// Histogram. One sample per `execute_chunk` call. Records the
-/// byte length of the serialized chunk body.
-pub const SERIALIZED_BYTES: &str = "clickhouse_serialized_bytes";
-
-/// Histogram. One sample per `execute_chunk` call. Records the row
-/// count of the chunk.
-pub const CHUNK_ROWS: &str = "clickhouse_chunk_rows";
-
-/// Histogram. One sample per HTTP INSERT attempt; labelled with
-/// the attempt outcome.
-pub const INSERT_DURATION_SECONDS: &str = "clickhouse_insert_duration_seconds";
-
-/// Gauge. Concurrent HTTP requests in flight from the writer (row
-/// 7.5). Wired here so the constant lives next to the rest of the
-/// writer surface.
-pub const HTTP_CONCURRENT_INFLIGHT: &str = "clickhouse_http_concurrent_inflight";
-
-/// Counter. Rows successfully committed to ClickHouse, labelled by
-/// `_odb_run_id` (extracted from each record's `LogAttributes` before
-/// the adapter plans chunks). Distinguishes loss from delayed drain
-/// during the row-8.4 ingestor drain ladder: the harness compares this
-/// against loadgen's produced count to attribute backlog to drain rate
-/// vs data loss without scanning the CH table.
-///
-/// Cardinality: one label value per active run_id. Bench workloads
-/// emit ~1–3 active run_ids at a time and the harness wipes the
-/// registry between cell deploys, so growth is bounded.
-pub const ROWS_COMMITTED_TOTAL: &str = "clickhouse_ingestor_rows_committed_total";
-
-/// Counter. Bytes successfully committed to ClickHouse (sum of row
-/// approximate byte sizes), aggregated across runs. Companion to
-/// [`ROWS_COMMITTED_TOTAL`] for the §4 commit-stage throughput rate.
-pub const COMMIT_BYTES_TOTAL: &str = "ingestor_commit_bytes_total";
-
-/// Counter. HTTP-level commit errors broken out by status code (or
-/// the synthetic labels `"timeout"`, `"connect"`, `"network"` for
-/// transport failures). Lets §4 separate ClickHouse-side 5xx from
-/// network-side timeouts when drain rate falls.
-pub const INSERT_ERRORS_TOTAL: &str = "clickhouse_insert_errors_total";
-
-/// Per-attempt result label on `INSERT_DURATION_SECONDS`.
+/// Per-attempt result label on `clickhouse_insert_duration_seconds`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InsertResult {
     Ok,

@@ -369,7 +369,7 @@ pub fn collect_bench_samples(snapshot: Snapshot) -> (StageSamples, ClickHouseSam
             continue;
         };
         match name {
-            n if n == opendata_ingest_runtime::metrics::STAGE_LATENCY_SECONDS => {
+            n if n == "runtime_stage_latency_seconds" => {
                 let stage_label = key.key().labels().find_map(|l| {
                     if l.key() == "stage" {
                         Some(l.value().to_string())
@@ -415,7 +415,7 @@ pub fn collect_bench_samples(snapshot: Snapshot) -> (StageSamples, ClickHouseSam
 pub fn collect_stage_samples_destructive(snapshot: Snapshot) -> StageSamples {
     let mut samples = StageSamples::default();
     for (key, _unit, _desc, value) in snapshot.into_vec() {
-        if key.key().name() != opendata_ingest_runtime::metrics::STAGE_LATENCY_SECONDS {
+        if key.key().name() != "runtime_stage_latency_seconds" {
             continue;
         }
         let DebugValue::Histogram(hist) = value else {
