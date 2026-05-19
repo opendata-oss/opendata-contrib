@@ -18,16 +18,8 @@ use thiserror::Error;
 use tracing::{debug, warn};
 
 use crate::adapter::InsertChunk;
-use crate::metrics::{
-    CHUNK_ROWS, HTTP_CONCURRENT_INFLIGHT, INSERT_DURATION_SECONDS, INSERT_ERRORS_TOTAL,
-    InsertResult, SERIALIZATION_DURATION_SECONDS, SERIALIZED_BYTES,
-};
+use crate::metrics::InsertResult;
 use crate::serializer::{ChunkSerializer, SerializationFormat, build_serializer};
-
-/// Metric name shared with `clickhouse-ingestor::metrics`. Emitted
-/// per-attempt by the writer; the registry-side `describe_counter!`
-/// still lives in the binary crate's metrics module.
-const RETRY_COUNT_TOTAL: &str = "ingestor_retry_count_total";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WriterErrorClass {
@@ -158,11 +150,9 @@ pub struct ClickHouseWriter {
     /// Some when `http_client_mode == Pooled`; None when PerCall
     /// (each call constructs a fresh client).
     pooled_client: Option<reqwest::Client>,
-    /// Stage-1 typed metric struct. C3 routes all writer-side
-    /// `metrics::*!` calls (chunk histograms, insert-duration,
-    /// http_concurrent_inflight, retry counter, insert_errors)
-    /// through this Arc.
-    #[allow(dead_code)]
+    /// Stage-1 typed metric struct. All writer-side emission
+    /// (chunk histograms, insert-duration, http_concurrent_inflight,
+    /// retry counter, insert_errors) routes through this Arc.
     metrics: Arc<crate::metrics::ClickHouseMetrics>,
 }
 
@@ -270,13 +260,24 @@ impl ClickHouseWriter {
     pub async fn execute_chunk(&self, chunk: &InsertChunk) -> Result<(), WriterError> {
         let format = self.serializer.format();
         let format_label = format.as_label();
+        let format_labels = crate::metrics::FormatLabels {
+            format: format_label.to_string(),
+        };
         let chunk_start = Instant::now();
         let body = self.serializer.serialize(chunk)?;
         let serialize_secs = chunk_start.elapsed().as_secs_f64();
-        metrics::histogram!(SERIALIZATION_DURATION_SECONDS, "format" => format_label)
-            .record(serialize_secs);
-        metrics::histogram!(SERIALIZED_BYTES, "format" => format_label).record(body.len() as f64);
-        metrics::histogram!(CHUNK_ROWS, "format" => format_label).record(chunk.rows_count() as f64);
+        self.metrics
+            .serialization_duration_seconds
+            .get_or_create(&format_labels)
+            .observe(serialize_secs);
+        self.metrics
+            .serialized_bytes
+            .get_or_create(&format_labels)
+            .observe(body.len() as f64);
+        self.metrics
+            .chunk_rows
+            .get_or_create(&format_labels)
+            .observe(chunk.rows_count() as f64);
 
         let sql = render_insert_sql_clean(chunk, format);
         let http_mode = self.http_mode_label();
@@ -303,13 +304,14 @@ impl ClickHouseWriter {
                     WriterErrorClass::RetryBudgetExhausted => InsertResult::RetryBudgetExhausted,
                 },
             };
-            metrics::histogram!(
-                INSERT_DURATION_SECONDS,
-                "format" => format_label,
-                "http_mode" => http_mode,
-                "result" => attempt_label.as_label(),
-            )
-            .record(attempt_secs);
+            self.metrics
+                .insert_duration_seconds
+                .get_or_create(&crate::metrics::FormatHttpResultLabels {
+                    format: format_label.to_string(),
+                    http_mode: http_mode.to_string(),
+                    result: attempt_label.as_label().to_string(),
+                })
+                .observe(attempt_secs);
 
             match result {
                 Ok(()) => {
@@ -323,11 +325,12 @@ impl ClickHouseWriter {
                 }
                 Err(err) => match err.class() {
                     WriterErrorClass::Retryable if attempt < self.config.max_attempts => {
-                        metrics::counter!(
-                            RETRY_COUNT_TOTAL,
-                            "reason" => "retryable",
-                        )
-                        .increment(1);
+                        self.metrics
+                            .retry_count
+                            .get_or_create(&crate::metrics::ReasonLabels {
+                                reason: "retryable".to_string(),
+                            })
+                            .inc();
                         warn!(
                             attempt,
                             token = %chunk.idempotency_token,
@@ -389,10 +392,19 @@ impl ClickHouseWriter {
             req = req.header("X-ClickHouse-Key", &self.config.password);
         }
         let http_mode = self.http_mode_label();
-        metrics::gauge!(HTTP_CONCURRENT_INFLIGHT, "http_mode" => http_mode).increment(1.0);
+        let inflight_labels = crate::metrics::HttpModeLabels {
+            http_mode: http_mode.to_string(),
+        };
+        self.metrics
+            .http_concurrent_inflight
+            .get_or_create(&inflight_labels)
+            .inc();
         let send_result = req.send().await;
-        metrics::gauge!(HTTP_CONCURRENT_INFLIGHT, "http_mode" => http_mode).decrement(1.0);
-        let resp = send_result.map_err(|e| classify_reqwest(&e))?;
+        self.metrics
+            .http_concurrent_inflight
+            .get_or_create(&inflight_labels)
+            .dec();
+        let resp = send_result.map_err(|e| classify_reqwest(&e, &self.metrics))?;
         let status = resp.status();
         let resp_body = resp.text().await.unwrap_or_default();
         if status.is_success() {
@@ -404,7 +416,11 @@ impl ClickHouseWriter {
             );
             return Ok(());
         }
-        Err(classify_status(status.as_u16(), &resp_body))
+        Err(classify_status(
+            status.as_u16(),
+            &resp_body,
+            &self.metrics,
+        ))
     }
 
     /// Run a SQL statement (DDL, SELECT, or INSERT-with-data-in-body).
@@ -428,18 +444,21 @@ impl ClickHouseWriter {
         if !self.config.password.is_empty() {
             req = req.header("X-ClickHouse-Key", &self.config.password);
         }
-        let resp = req.send().await.map_err(|e| classify_reqwest(&e))?;
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| classify_reqwest(&e, &self.metrics))?;
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
         if status.is_success() {
             Ok(body)
         } else {
-            Err(classify_status(status.as_u16(), &body))
+            Err(classify_status(status.as_u16(), &body, &self.metrics))
         }
     }
 }
 
-fn classify_reqwest(err: &reqwest::Error) -> WriterError {
+fn classify_reqwest(err: &reqwest::Error, metrics: &crate::metrics::ClickHouseMetrics) -> WriterError {
     let label = if err.is_timeout() {
         "timeout"
     } else if err.is_connect() {
@@ -449,7 +468,12 @@ fn classify_reqwest(err: &reqwest::Error) -> WriterError {
     } else {
         "network"
     };
-    metrics::counter!(INSERT_ERRORS_TOTAL, "status_code" => label).increment(1);
+    metrics
+        .insert_errors
+        .get_or_create(&crate::metrics::StatusCodeLabels {
+            status_code: label.to_string(),
+        })
+        .inc();
     if err.is_timeout() || err.is_connect() {
         return WriterError::Retryable {
             message: format!("network/timeout: {err}"),
@@ -467,14 +491,15 @@ fn classify_reqwest(err: &reqwest::Error) -> WriterError {
     }
 }
 
-fn classify_status(status: u16, body: &str) -> WriterError {
+fn classify_status(status: u16, body: &str, metrics: &crate::metrics::ClickHouseMetrics) -> WriterError {
     // §4 commit_errors_total{status_code}: emit before classifying so
     // operators can rate() by literal HTTP code (429 vs 503 vs 4xx).
-    metrics::counter!(
-        INSERT_ERRORS_TOTAL,
-        "status_code" => status.to_string(),
-    )
-    .increment(1);
+    metrics
+        .insert_errors
+        .get_or_create(&crate::metrics::StatusCodeLabels {
+            status_code: status.to_string(),
+        })
+        .inc();
     if status == 429 || (500..600).contains(&status) {
         return WriterError::Retryable {
             message: format!("status {status}: {body}"),
@@ -549,19 +574,22 @@ mod tests {
 
     #[test]
     fn classify_status_503_is_retryable() {
-        let err = classify_status(503, "service unavailable");
+        let metrics = crate::metrics::ClickHouseMetrics::new();
+        let err = classify_status(503, "service unavailable", &metrics);
         assert_eq!(err.class(), WriterErrorClass::Retryable);
     }
 
     #[test]
     fn classify_status_429_is_retryable() {
-        let err = classify_status(429, "too many requests");
+        let metrics = crate::metrics::ClickHouseMetrics::new();
+        let err = classify_status(429, "too many requests", &metrics);
         assert_eq!(err.class(), WriterErrorClass::Retryable);
     }
 
     #[test]
     fn classify_status_400_is_non_retryable() {
-        let err = classify_status(400, "bad request");
+        let metrics = crate::metrics::ClickHouseMetrics::new();
+        let err = classify_status(400, "bad request", &metrics);
         assert_eq!(err.class(), WriterErrorClass::NonRetryable);
     }
 

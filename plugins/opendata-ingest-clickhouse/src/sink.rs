@@ -24,7 +24,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use tracing::info;
 
 use opendata_ingest_otel::logs::{DecodedLogRecord, TypedDecodedLogs};
 use opendata_ingest_runtime::decoded_batch::{DecodedBatch, DecodedRecords};
@@ -35,7 +34,6 @@ use opendata_ingest_runtime::sink::{
 };
 
 use crate::adapter::{Adapter, ClickHouseAdapterBatch};
-use crate::metrics::{COMMIT_BYTES_TOTAL, ROWS_COMMITTED_TOTAL};
 use crate::writer::{ClickHouseWriter, WriterErrorClass};
 
 /// LogAttributes key loadgen stamps on every record to identify the
@@ -225,19 +223,18 @@ where
                 // `rate(...{run_id="..."}[1m])` to track live drain
                 // progress without scanning ClickHouse.
                 for (run_id, count) in &rows_by_run_id {
-                    info!(target: "metric_probe", run_id = %run_id, count = *count, "ROWS_COMMITTED_TOTAL +count");
-                    metrics::counter!(
-                        ROWS_COMMITTED_TOTAL,
-                        "run_id" => run_id.clone(),
-                    )
-                    .increment(*count);
+                    self.metrics
+                        .rows_committed
+                        .get_or_create(&crate::metrics::RunIdLabels {
+                            run_id: run_id.clone(),
+                        })
+                        .inc_by(*count);
                 }
                 // §4 commit-stage byte throughput. `bytes_written` here
                 // is the sum of serialized RowValue lengths the writer
                 // sent; it's the same number reported in
                 // SinkCommitResult.bytes_written.
-                info!(target: "metric_probe", bytes = bytes_written, "COMMIT_BYTES_TOTAL +bytes");
-                metrics::counter!(COMMIT_BYTES_TOTAL).increment(bytes_written);
+                self.metrics.commit_bytes.inc_by(bytes_written);
                 Ok(SinkCommitResult {
                     bytes_written,
                     rows_written,
