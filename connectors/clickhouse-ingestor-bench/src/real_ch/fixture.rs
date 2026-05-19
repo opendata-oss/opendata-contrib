@@ -150,14 +150,28 @@ impl RealClickHouseFixture {
 
     /// Order-independent fingerprint of all post-FINAL rows in
     /// `<self.database>.<table>`. Wraps each row as
-    /// `toString(tuple(*))` then sums `cityHash64` across rows.
-    /// Sum is associative + commutative, so the result doesn't
-    /// depend on storage iteration order — two tables receiving
-    /// the same logical rows via different wire formats produce
-    /// the same fingerprint.
+    /// `toString(tuple(* EXCEPT _odb_clickhouse_inserted_at))` then
+    /// sums `cityHash64` across rows. Sum is associative +
+    /// commutative, so the result doesn't depend on storage
+    /// iteration order — two tables receiving the same logical rows
+    /// via different wire formats produce the same fingerprint.
+    ///
+    /// `_odb_clickhouse_inserted_at` is excluded because it carries a
+    /// server-side `DEFAULT now64(9)` (set per row at INSERT
+    /// materialization). Two separate INSERTs against sibling tables
+    /// — the format-equivalence test does exactly this — fire
+    /// `now64(9)` at slightly different wall-clock instants and
+    /// therefore can never produce identical values in that column.
+    /// The writer's projection (the [`COLUMNS`] const in
+    /// `opendata_ingest_clickhouse::adapter::logs`) already omits the
+    /// column for the same reason; this query stays consistent with
+    /// what the writer actually controls.
+    ///
+    /// [`COLUMNS`]: opendata_ingest_clickhouse::adapter::logs::COLUMNS
     pub async fn hash_rows_in(&self, table: &str) -> Result<u64, FixtureError> {
         self.count_scalar(&format!(
-            "SELECT sum(cityHash64(toString(tuple(*)))) FROM {}.{} FINAL",
+            "SELECT sum(cityHash64(toString(tuple(* EXCEPT _odb_clickhouse_inserted_at)))) \
+             FROM {}.{} FINAL",
             self.database, table
         ))
         .await
