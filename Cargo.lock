@@ -490,6 +490,7 @@ dependencies = [
  "opendata-ingest-otel",
  "opendata-ingest-runtime",
  "opentelemetry-proto",
+ "prometheus-client",
  "prost",
  "reqwest",
  "serde",
@@ -796,6 +797,12 @@ name = "downcast-rs"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "75b325c5dbd37f80359721ad39aca5a29fb04c89279657cffdda8736d0c0b9d2"
+
+[[package]]
+name = "dtoa"
+version = "1.0.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4c3cf4824e2d5f025c7b531afcb2325364084a16806f6d47fbc1f5fbd9960590"
 
 [[package]]
 name = "dunce"
@@ -2252,6 +2259,7 @@ dependencies = [
  "metrics",
  "opendata-ingest-otel",
  "opendata-ingest-runtime",
+ "prometheus-client",
  "reqwest",
  "serde",
  "serde_json",
@@ -2284,6 +2292,7 @@ dependencies = [
  "metrics",
  "opendata-buffer",
  "opendata-common",
+ "prometheus-client",
  "serde",
  "slatedb",
  "thiserror 2.0.18",
@@ -2577,6 +2586,29 @@ dependencies = [
  "syn 2.0.117",
  "version_check",
  "yansi",
+]
+
+[[package]]
+name = "prometheus-client"
+version = "0.24.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cca3d75b4566b9a29fe1ed623587fb058e826eb329a0be4b7c4da1ebb2d7a6ca"
+dependencies = [
+ "dtoa",
+ "itoa",
+ "parking_lot",
+ "prometheus-client-derive-encode",
+]
+
+[[package]]
+name = "prometheus-client-derive-encode"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9adf1691c04c0a5ff46ff8f262b58beb07b0dbb61f96f9f54f6cbd82106ed87f"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
 ]
 
 [[package]]

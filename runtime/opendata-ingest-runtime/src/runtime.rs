@@ -540,6 +540,13 @@ pub struct Runtime {
     /// can clone the `Arc` via [`Runtime::source_byte_budget`] and
     /// observe `in_flight()` mid-run.
     source_byte_budget: Arc<SourceByteBudget>,
+    /// Stage-1 typed metric surface (see
+    /// `crate::metrics::RuntimeMetrics`). Stored even when the
+    /// builder didn't supply one — fallback is a fresh
+    /// `Arc::new(RuntimeMetrics::new())` so call sites can emit
+    /// unconditionally regardless of whether the bin wired a shared
+    /// registry. Wiring at call sites lands in C2.
+    runtime_metrics: Arc<crate::metrics::RuntimeMetrics>,
     admission_recorder: Option<AdmissionRecorder>,
     ack_through_recorder: Option<AckThroughRecorder>,
     ack_through_observer: Option<AckThroughObserver>,
@@ -552,6 +559,7 @@ pub struct RuntimeBuilder {
     decoder: Option<Arc<dyn Decoder>>,
     sink: Option<Arc<dyn Sink>>,
     options: RuntimeOptions,
+    runtime_metrics: Option<Arc<crate::metrics::RuntimeMetrics>>,
     admission_recorder: Option<AdmissionRecorder>,
     ack_through_recorder: Option<AckThroughRecorder>,
     ack_through_observer: Option<AckThroughObserver>,
@@ -566,12 +574,20 @@ impl Runtime {
             decoder: None,
             sink: None,
             options: RuntimeOptions::default(),
+            runtime_metrics: None,
             admission_recorder: None,
             ack_through_recorder: None,
             ack_through_observer: None,
             test_fetch_delay: None,
             test_fetch_killswitch: None,
         }
+    }
+
+    /// Stage-1 typed metric struct (see
+    /// `crate::metrics::RuntimeMetrics`). C2 routes every `metrics::*!`
+    /// call site through this Arc; for now it's plumbing only.
+    pub fn runtime_metrics(&self) -> &Arc<crate::metrics::RuntimeMetrics> {
+        &self.runtime_metrics
     }
 
     pub fn options(&self) -> &RuntimeOptions {
@@ -607,6 +623,7 @@ impl Runtime {
             progress_tx,
             progress_rx: _progress_rx,
             source_byte_budget,
+            runtime_metrics: _runtime_metrics,
             admission_recorder,
             ack_through_recorder,
             ack_through_observer,
@@ -911,6 +928,19 @@ impl RuntimeBuilder {
         self
     }
 
+    /// Supply the typed metric struct the runtime will emit into.
+    /// Stage 1 plumbing only — call sites still emit through
+    /// `metrics::*!` until C2. When absent the builder default-
+    /// constructs an unregistered `RuntimeMetrics` so emission code
+    /// has somewhere to write regardless of the bin wiring.
+    pub fn with_runtime_metrics(
+        mut self,
+        metrics: Arc<crate::metrics::RuntimeMetrics>,
+    ) -> Self {
+        self.runtime_metrics = Some(metrics);
+        self
+    }
+
     pub fn build(self) -> RuntimeResult<Runtime> {
         let source = self
             .source
@@ -942,6 +972,9 @@ impl RuntimeBuilder {
         let (progress_tx, progress_rx) = watch::channel(RuntimeProgress::default());
         let source_byte_budget =
             SourceByteBudget::new(source.id().clone(), primary_bp.max_inflight_bytes);
+        let runtime_metrics = self
+            .runtime_metrics
+            .unwrap_or_else(|| Arc::new(crate::metrics::RuntimeMetrics::new()));
         Ok(Runtime {
             source,
             decoder,
@@ -951,6 +984,7 @@ impl RuntimeBuilder {
             progress_tx,
             progress_rx,
             source_byte_budget,
+            runtime_metrics,
             admission_recorder: self.admission_recorder,
             ack_through_recorder: self.ack_through_recorder,
             ack_through_observer: self.ack_through_observer,

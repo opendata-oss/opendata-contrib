@@ -14,6 +14,7 @@ path = "src/lib.rs"
 async-trait = "0.1"
 hex = { workspace = true }
 metrics = { workspace = true }
+prometheus-client = { workspace = true }
 opendata-ingest-otel = { path = "../opendata-ingest-otel" }
 opendata-ingest-runtime = { path = "../../runtime/opendata-ingest-runtime" }
 reqwest = { workspace = true }

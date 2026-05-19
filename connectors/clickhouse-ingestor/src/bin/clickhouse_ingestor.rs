@@ -22,6 +22,7 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use clap::Parser;
 use clickhouse_ingestor::metrics_recorder;
+use clickhouse_ingestor::metrics_registry::MetricsRegistry;
 use clickhouse_ingestor::metrics_server;
 use clickhouse_ingestor::{ClickHouseWriter, IngestorConfig, OtlpLogsClickHouseAdapter};
 use opendata_ingest_clickhouse::ClickHouseSink;
@@ -110,6 +111,18 @@ async fn main() -> Result<()> {
     metrics::set_global_recorder(recorder)
         .map_err(|e| anyhow::anyhow!("install global metrics recorder: {e}"))?;
 
+    // Stage-1 typed prometheus-client surface (see
+    // plans/odb-high-throughput/stage1-metrics-migration-plan.md).
+    // The bin owns the Registry; runtime + sink + writer get
+    // `Arc<RuntimeMetrics>` / `Arc<ClickHouseMetrics>` so every
+    // emission lands in the registered Family<_, _>. C1 commits the
+    // plumbing only — call sites still emit through `metrics::*!`
+    // until C2 / C3.
+    let metrics_registry =
+        MetricsRegistry::new(metrics_handle).context("building Stage-1 metrics registry")?;
+    let runtime_metrics = Arc::clone(&metrics_registry.runtime);
+    let clickhouse_metrics = Arc::clone(&metrics_registry.clickhouse);
+
     let object_store = common::create_object_store(&cfg.buffer.object_store)
         .context("constructing object store")?;
     let consumer_config = buffer::ConsumerConfig {
@@ -174,15 +187,24 @@ async fn main() -> Result<()> {
     let mut builder = Runtime::builder()
         .add_source(source)
         .add_decoder(decoder)
-        .with_options(runtime_options);
+        .with_options(runtime_options)
+        .with_runtime_metrics(Arc::clone(&runtime_metrics));
     builder = if cfg.runtime.dry_run {
         builder.set_sink(DryRunSink {
             id: SinkId::from(sink_id),
         })
     } else {
         let adapter = Arc::new(OtlpLogsClickHouseAdapter::new(cfg.logs_adapter_config()));
-        let writer = Arc::new(ClickHouseWriter::new(cfg.writer_config()));
-        builder.set_sink(ClickHouseSink::new(sink_id, adapter, writer))
+        let writer = Arc::new(ClickHouseWriter::new_with_metrics(
+            cfg.writer_config(),
+            Arc::clone(&clickhouse_metrics),
+        ));
+        builder.set_sink(ClickHouseSink::new_with_metrics(
+            sink_id,
+            adapter,
+            writer,
+            Arc::clone(&clickhouse_metrics),
+        ))
     };
     let runtime = builder
         .build()
@@ -204,7 +226,8 @@ async fn main() -> Result<()> {
     })?;
     let metrics_shutdown = shutdown.clone();
     let metrics_task = tokio::spawn(async move {
-        if let Err(e) = metrics_server::serve(metrics_handle, metrics_addr, metrics_shutdown).await
+        if let Err(e) =
+            metrics_server::serve(metrics_registry, metrics_addr, metrics_shutdown).await
         {
             error!(error = %e, "metrics server exited with error");
         }

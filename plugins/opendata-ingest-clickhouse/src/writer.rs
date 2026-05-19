@@ -158,10 +158,26 @@ pub struct ClickHouseWriter {
     /// Some when `http_client_mode == Pooled`; None when PerCall
     /// (each call constructs a fresh client).
     pooled_client: Option<reqwest::Client>,
+    /// Stage-1 typed metric struct. C3 routes all writer-side
+    /// `metrics::*!` calls (chunk histograms, insert-duration,
+    /// http_concurrent_inflight, retry counter, insert_errors)
+    /// through this Arc.
+    #[allow(dead_code)]
+    metrics: Arc<crate::metrics::ClickHouseMetrics>,
 }
 
 impl ClickHouseWriter {
     pub fn new(config: WriterConfig) -> Self {
+        Self::new_with_metrics(config, Arc::new(crate::metrics::ClickHouseMetrics::new()))
+    }
+
+    /// Stage-1 explicit-metric constructor. Use this from the bin so
+    /// every writer instance emits against the same registered
+    /// `Registry`.
+    pub fn new_with_metrics(
+        config: WriterConfig,
+        metrics: Arc<crate::metrics::ClickHouseMetrics>,
+    ) -> Self {
         let serializer = build_serializer(config.serialization_format);
         let pooled_client = match &config.http_client_mode {
             HttpClientMode::PerCall => None,
@@ -189,11 +205,18 @@ impl ClickHouseWriter {
             config,
             serializer,
             pooled_client,
+            metrics,
         }
     }
 
     pub fn config(&self) -> &WriterConfig {
         &self.config
+    }
+
+    /// Accessor for the Stage-1 typed metric surface; C3 reads from
+    /// this inside the writer's per-chunk + per-attempt emission.
+    pub fn metrics(&self) -> &Arc<crate::metrics::ClickHouseMetrics> {
+        &self.metrics
     }
 
     /// `http_mode` label for the per-attempt

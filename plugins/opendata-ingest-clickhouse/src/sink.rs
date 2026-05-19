@@ -61,6 +61,14 @@ where
     adapter: Arc<A>,
     writer: Arc<ClickHouseWriter>,
     budget: SinkBudget,
+    /// Stage-1 typed metric struct. Stage C3 routes
+    /// `metrics::counter!(ROWS_COMMITTED_TOTAL, ...)` and
+    /// `metrics::counter!(COMMIT_BYTES_TOTAL)` through this Arc; until
+    /// then it's plumbing only and the existing `metrics-rs` emission
+    /// is unchanged. `Default::default()` is used when callers don't
+    /// supply one, so unit tests don't need to construct a metric
+    /// struct.
+    metrics: Arc<crate::metrics::ClickHouseMetrics>,
 }
 
 impl<A> ClickHouseSink<A>
@@ -68,12 +76,37 @@ where
     A: Adapter<Input = DecodedLogRecord> + Send + Sync + 'static,
 {
     pub fn new(id: impl Into<SinkId>, adapter: Arc<A>, writer: Arc<ClickHouseWriter>) -> Self {
+        Self::new_with_metrics(
+            id,
+            adapter,
+            writer,
+            Arc::new(crate::metrics::ClickHouseMetrics::new()),
+        )
+    }
+
+    /// Stage-1 explicit-metric constructor. The bin uses this so the
+    /// sink emits against the registered Registry; tests + the
+    /// shorter `new()` constructor default-construct an unregistered
+    /// `ClickHouseMetrics`.
+    pub fn new_with_metrics(
+        id: impl Into<SinkId>,
+        adapter: Arc<A>,
+        writer: Arc<ClickHouseWriter>,
+        metrics: Arc<crate::metrics::ClickHouseMetrics>,
+    ) -> Self {
         Self {
             id: id.into(),
             adapter,
             writer,
             budget: SinkBudget::default(),
+            metrics,
         }
+    }
+
+    /// Accessor for the Stage-1 typed metric surface; C3 reads from
+    /// this inside the per-commit row + byte counter emission.
+    pub fn metrics(&self) -> &Arc<crate::metrics::ClickHouseMetrics> {
+        &self.metrics
     }
 
     pub fn with_budget(mut self, budget: SinkBudget) -> Self {

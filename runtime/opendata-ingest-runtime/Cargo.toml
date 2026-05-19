@@ -16,6 +16,7 @@ async-trait = "0.1"
 buffer = { workspace = true }
 bytes = { workspace = true }
 metrics = { workspace = true }
+prometheus-client = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
