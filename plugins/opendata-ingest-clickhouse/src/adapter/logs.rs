@@ -106,6 +106,12 @@ fn chunking_fingerprint(config: &LogsAdapterConfig) -> String {
     hex::encode(&digest[..8])
 }
 
+// Writer-side INSERT column list. `_odb_clickhouse_inserted_at` is
+// intentionally absent — it has `DEFAULT now64(9)` server-side so the
+// writer omits it from the projection and CH evaluates the default
+// per-row at INSERT materialization time. `_odb_gateway_received_at`
+// IS in the list because the adapter writes the gateway stamp (or
+// NULL) per row.
 pub const COLUMNS: &[&str] = &[
     "Timestamp",
     "ObservedTimestamp",
@@ -124,6 +130,7 @@ pub const COLUMNS: &[&str] = &[
     "_odb_data_path",
     "_odb_ingestion_time_ms",
     "_adapter_version",
+    "_odb_gateway_received_at",
 ];
 
 impl Adapter for OtlpLogsClickHouseAdapter {
@@ -292,7 +299,19 @@ fn build_token(
 }
 
 fn log_row(rec: &DecodedLogRecord, config: &LogsAdapterConfig) -> Vec<RowValue> {
-    let resource = btree_to_owned(&rec.resource_attributes);
+    // Extract `_odb_gateway_received_at` from `resource_attributes` and
+    // drop it from the map so the typed CH column carries the value and
+    // the `ResourceAttributes Map(...)` column doesn't double-store it.
+    // The OTel decoder string-coerces every AnyValue (logs.rs's
+    // `string_value()` does `i.to_string()` on IntValue), so the
+    // attribute arrives as a stringified u64 of unix-epoch nanoseconds.
+    // A bad parse → `None` (dropped from the map regardless) keeps the
+    // row insertable even if a future producer accidentally writes a
+    // non-integer value.
+    let mut resource = btree_to_owned(&rec.resource_attributes);
+    let gateway_received_at: Option<u64> = resource
+        .remove("_odb_gateway_received_at")
+        .and_then(|s| s.parse::<u64>().ok());
     let log_attrs = btree_to_owned(&rec.log_attributes);
     vec![
         RowValue::DateTime64Nanos(rec.timestamp_unix_nano),
@@ -312,6 +331,7 @@ fn log_row(rec: &DecodedLogRecord, config: &LogsAdapterConfig) -> Vec<RowValue> 
         RowValue::String(rec.source.data_path.clone()),
         RowValue::Int64(rec.source.ingestion_time_ms),
         RowValue::UInt32(config.adapter_version),
+        RowValue::NullableDateTime64Nanos(gateway_received_at),
     ]
 }
 
@@ -331,6 +351,15 @@ fn severity_to_u8(severity_number: i32) -> u8 {
 /// IMPORTANT: any change to a column that participates in `ORDER BY`
 /// requires a new table plus backfill (RFC 0003 dedupe constraint).
 pub fn logs_table_ddl(config: &LogsAdapterConfig) -> String {
+    // Two Stage 2 e2e-latency columns appear after `_adapter_version`:
+    //   * `_odb_gateway_received_at` is Nullable so the in-place
+    //     `ALTER TABLE … ADD COLUMN` against tables that predate
+    //     Stage 2 leaves their existing rows with NULL gateway
+    //     timestamps; the harness filters those out of quantile math.
+    //   * `_odb_clickhouse_inserted_at` uses `DEFAULT now64(9)` so CH
+    //     evaluates it server-side per row at INSERT materialization.
+    //     The adapter omits this column from its INSERT projection so
+    //     the default fires.
     format!(
         "CREATE TABLE IF NOT EXISTS {db}.{table} (\n\
          Timestamp           DateTime64(9)               CODEC(Delta, ZSTD),\n\
@@ -349,7 +378,9 @@ pub fn logs_table_ddl(config: &LogsAdapterConfig) -> String {
          _odb_manifest_path       LowCardinality(String),\n\
          _odb_data_path           String,\n\
          _odb_ingestion_time_ms   Int64,\n\
-         _adapter_version         UInt32\n\
+         _adapter_version         UInt32,\n\
+         _odb_gateway_received_at    Nullable(DateTime64(9)),\n\
+         _odb_clickhouse_inserted_at DateTime64(9) DEFAULT now64(9)\n\
          )\n\
          ENGINE = ReplacingMergeTree(_adapter_version)\n\
          PARTITION BY toDate(Timestamp)\n\
@@ -666,6 +697,144 @@ mod tests {
             "ORDER BY must include the source-coordinate suffix"
         );
         assert!(ddl.contains("PARTITION BY toDate(Timestamp)"));
+    }
+
+    #[test]
+    fn ddl_carries_stage2_e2e_latency_columns() {
+        let ddl = logs_table_ddl(&LogsAdapterConfig::default());
+        assert!(
+            ddl.contains("_odb_gateway_received_at    Nullable(DateTime64(9))"),
+            "DDL must declare the gateway column as nullable so the in-place ALTER \
+             leaves pre-Stage-2 rows with NULL gateway timestamps: {ddl}"
+        );
+        assert!(
+            ddl.contains("_odb_clickhouse_inserted_at DateTime64(9) DEFAULT now64(9)"),
+            "DDL must declare the insert column with a server-side now64(9) default \
+             so the adapter doesn't have to populate it explicitly: {ddl}"
+        );
+    }
+
+    #[test]
+    fn columns_const_includes_gateway_but_omits_inserted_at() {
+        // _odb_clickhouse_inserted_at MUST NOT appear in the writer's
+        // INSERT column projection: that's what makes CH evaluate
+        // `now64(9)` server-side. _odb_gateway_received_at MUST appear
+        // because the adapter writes the stamped value (or NULL).
+        assert!(
+            COLUMNS.contains(&"_odb_gateway_received_at"),
+            "COLUMNS missing gateway column"
+        );
+        assert!(
+            !COLUMNS.contains(&"_odb_clickhouse_inserted_at"),
+            "COLUMNS must NOT include _odb_clickhouse_inserted_at; CH evaluates now64(9) server-side"
+        );
+        // Row vector length follows COLUMNS length one-for-one.
+        assert_eq!(
+            COLUMNS.len(),
+            18,
+            "after Stage 2, the writer emits 18 columns per row"
+        );
+    }
+
+    #[test]
+    fn gateway_attribute_extracted_into_typed_column_and_removed_from_resource_map() {
+        let adapter = OtlpLogsClickHouseAdapter::new(LogsAdapterConfig {
+            max_chunk_rows: 100,
+            ..LogsAdapterConfig::default()
+        });
+        let mut r = rec(11, 0, 0);
+        // Mirror exactly what the OTel decoder would land in the map:
+        // a stringified i64 of unix-epoch nanoseconds.
+        let gateway_ts_ns: u64 = 1_700_000_000_123_456_789;
+        r.resource_attributes
+            .insert("_odb_gateway_received_at".into(), gateway_ts_ns.to_string());
+        // A second, unrelated resource attribute that MUST survive.
+        r.resource_attributes
+            .insert("service.namespace".into(), "responsive".into());
+
+        let chunks = adapter
+            .plan(ClickHouseAdapterBatch {
+                records: vec![r],
+                identity: ident(11, 11),
+                bytes: 0,
+            })
+            .expect("plan");
+        let row = &chunks[0].rows[0];
+
+        // Typed column at position 17 carries the parsed timestamp.
+        match &row[17] {
+            RowValue::NullableDateTime64Nanos(Some(v)) => assert_eq!(*v, gateway_ts_ns),
+            other => panic!("position 17 wrong shape: {other:?}"),
+        }
+        // ResourceAttributes (position 6) keeps unrelated keys but
+        // does NOT carry _odb_gateway_received_at any more.
+        match &row[6] {
+            RowValue::StringMap(m) => {
+                assert!(
+                    !m.contains_key("_odb_gateway_received_at"),
+                    "adapter must drop _odb_gateway_received_at from ResourceAttributes \
+                     after extracting it; map still had it: {m:?}"
+                );
+                assert_eq!(
+                    m.get("service.namespace").map(String::as_str),
+                    Some("responsive"),
+                    "unrelated resource attribute clobbered: {m:?}"
+                );
+            }
+            other => panic!("position 6 wrong shape: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn missing_gateway_attribute_lands_as_null() {
+        let adapter = OtlpLogsClickHouseAdapter::new(LogsAdapterConfig {
+            max_chunk_rows: 100,
+            ..LogsAdapterConfig::default()
+        });
+        let chunks = adapter
+            .plan(ClickHouseAdapterBatch {
+                records: vec![rec(1, 0, 0)], // rec() doesn't stamp the attribute
+                identity: ident(1, 1),
+                bytes: 0,
+            })
+            .expect("plan");
+        match &chunks[0].rows[0][17] {
+            RowValue::NullableDateTime64Nanos(None) => (),
+            other => panic!("expected NullableDateTime64Nanos(None), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn non_numeric_gateway_attribute_is_dropped_and_lands_as_null() {
+        // Defensive: if somehow a non-integer string ends up under the
+        // key, the row must still insert cleanly with NULL gateway
+        // rather than fail the whole batch.
+        let adapter = OtlpLogsClickHouseAdapter::new(LogsAdapterConfig {
+            max_chunk_rows: 100,
+            ..LogsAdapterConfig::default()
+        });
+        let mut r = rec(1, 0, 0);
+        r.resource_attributes
+            .insert("_odb_gateway_received_at".into(), "not-a-number".into());
+        let chunks = adapter
+            .plan(ClickHouseAdapterBatch {
+                records: vec![r],
+                identity: ident(1, 1),
+                bytes: 0,
+            })
+            .expect("plan");
+        match &chunks[0].rows[0][17] {
+            RowValue::NullableDateTime64Nanos(None) => (),
+            other => panic!("expected NullableDateTime64Nanos(None) for bad parse, got {other:?}"),
+        }
+        // Even on a bad parse, the key must be removed from the map.
+        match &chunks[0].rows[0][6] {
+            RowValue::StringMap(m) => assert!(
+                !m.contains_key("_odb_gateway_received_at"),
+                "bad-parse path still removes the key from ResourceAttributes",
+            ),
+            other => panic!("position 6 wrong shape: {other:?}"),
+        }
     }
 
     #[test]

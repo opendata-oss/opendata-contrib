@@ -72,6 +72,7 @@ fn clickhouse_type_for_column(name: &str) -> Result<&'static str, WriterError> {
         "_odb_data_path" => "String",
         "_odb_ingestion_time_ms" => "Int64",
         "_adapter_version" => "UInt32",
+        "_odb_gateway_received_at" => "Nullable(DateTime64(9))",
         other => {
             return Err(WriterError::Serialization(format!(
                 "no RowBinary type table entry for column {other:?}; \

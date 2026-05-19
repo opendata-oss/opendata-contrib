@@ -41,6 +41,11 @@ pub enum RowValue {
     UInt64(u64),
     Int64(i64),
     DateTime64Nanos(u64),
+    /// `Nullable(DateTime64(9))` — used by the Stage 2 e2e latency
+    /// columns. `None` materializes the CH `NULL` literal in JSON and
+    /// the 1-byte null marker in RowBinary; `Some(ns)` writes the
+    /// value with the same i64-LE wire form as `DateTime64Nanos`.
+    NullableDateTime64Nanos(Option<u64>),
     StringMap(BTreeMap<String, String>),
 }
 
@@ -60,6 +65,10 @@ impl RowValue {
             // ClickHouse accepts a string literal for DateTime64(9). We
             // emit ISO-8601 with nanosecond precision.
             RowValue::DateTime64Nanos(ns) => JsonValue::String(format_datetime64_ns(*ns)),
+            RowValue::NullableDateTime64Nanos(None) => JsonValue::Null,
+            RowValue::NullableDateTime64Nanos(Some(ns)) => {
+                JsonValue::String(format_datetime64_ns(*ns))
+            }
             RowValue::StringMap(m) => {
                 let mut obj = serde_json::Map::with_capacity(m.len());
                 for (k, v) in m {
@@ -100,6 +109,19 @@ impl RowValue {
                 // i64 for the wire. Real-world timestamps fit i64.
                 let signed = *ns as i64;
                 out.extend_from_slice(&signed.to_le_bytes());
+            }
+            RowValue::NullableDateTime64Nanos(opt) => {
+                // CH RowBinary Nullable(T): one byte null-marker
+                // (0 = not null, 1 = null), then T's encoding if not
+                // null. When null, the value field is omitted entirely.
+                match opt {
+                    None => out.push(1),
+                    Some(ns) => {
+                        out.push(0);
+                        let signed = *ns as i64;
+                        out.extend_from_slice(&signed.to_le_bytes());
+                    }
+                }
             }
             RowValue::StringMap(m) => {
                 write_varuint(out, m.len() as u64);
@@ -317,5 +339,39 @@ mod tests {
         m.insert("k".to_string(), "v".to_string());
         let json = RowValue::StringMap(m).to_json();
         assert_eq!(json.as_object().unwrap().get("k").unwrap(), "v");
+    }
+
+    // Stage 2 — Nullable(DateTime64(9)) encoding.
+
+    #[test]
+    fn nullable_datetime64_some_json_is_iso8601() {
+        let json = RowValue::NullableDateTime64Nanos(Some(1_700_000_000_123_456_789)).to_json();
+        assert_eq!(json.as_str().unwrap(), "2023-11-14 22:13:20.123456789");
+    }
+
+    #[test]
+    fn nullable_datetime64_none_json_is_null() {
+        let json = RowValue::NullableDateTime64Nanos(None).to_json();
+        assert!(json.is_null(), "expected JSON null, got {json:?}");
+    }
+
+    #[test]
+    fn nullable_datetime64_some_row_binary_byte_layout() {
+        let mut buf = Vec::new();
+        // Pick a value with distinctive bytes so the LE order is
+        // visually obvious in the assertion.
+        RowValue::NullableDateTime64Nanos(Some(0x1234_5678_9abc_def0)).write_row_binary(&mut buf);
+        assert_eq!(
+            buf,
+            vec![0x00, 0xf0, 0xde, 0xbc, 0x9a, 0x78, 0x56, 0x34, 0x12],
+            "expected 1-byte not-null marker (0x00) followed by i64 LE bytes",
+        );
+    }
+
+    #[test]
+    fn nullable_datetime64_none_row_binary_is_single_null_byte() {
+        let mut buf = Vec::new();
+        RowValue::NullableDateTime64Nanos(None).write_row_binary(&mut buf);
+        assert_eq!(buf, vec![0x01], "null marker alone, no value bytes");
     }
 }
