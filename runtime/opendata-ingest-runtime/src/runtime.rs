@@ -1259,6 +1259,7 @@ async fn per_source_actor(
                 }
                 coordinator.register_pending(seq, seq)?;
                 in_flight = in_flight.saturating_add(1);
+                info!(target: "metric_probe", source = %source_id.0, "DESCRIPTORS_HANDED_OUT_TOTAL +1");
                 metrics::counter!(
                     crate::metrics::DESCRIPTORS_HANDED_OUT_TOTAL,
                     "source" => source_id.0.clone(),
@@ -1474,6 +1475,7 @@ async fn fetch_worker(
             .iter()
             .map(|e| e.raw_bytes.len() as u64 + e.raw_metadata.len() as u64)
             .sum();
+        info!(target: "metric_probe", source = %source_label, bytes = fetched_bytes, "BYTES_FETCHED_TOTAL +N");
         metrics::counter!(
             crate::metrics::BYTES_FETCHED_TOTAL,
             "source" => source_label.clone(),
@@ -1766,6 +1768,7 @@ async fn decode_one(
     // §4 decode-stage record throughput. Live + dry-run both pay
     // the decode work, so the counter increments before branching
     // on dry_run.
+    info!(target: "metric_probe", source = %decoded.source.0, rows = row_count, "RECORDS_DECODED_TOTAL +N");
     metrics::counter!(
         crate::metrics::RECORDS_DECODED_TOTAL,
         "source" => decoded.source.0.clone(),
@@ -1877,6 +1880,7 @@ async fn writer_worker(
             "source" => source_label.clone(),
         )
         .record(stage_start.elapsed().as_secs_f64());
+        info!(target: "metric_probe", source = %source_label, sink = %sink_label, result = attempt.outcome.as_label(), "SINK_COMMITS_TOTAL +1");
         metrics::counter!(
             crate::metrics::SINK_COMMITS_TOTAL,
             "source" => source_label.clone(),
