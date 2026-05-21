@@ -23,7 +23,13 @@ use opendata_ingest_runtime::source::SourceId;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
-use support::{FakeDecoder, FakeSink, in_memory_buffer_source, logs_envelope};
+use std::sync::atomic::Ordering;
+
+use opendata_ingest_runtime::metrics::{RuntimeMetrics, SourceLabels};
+use support::{
+    FakeDecoder, FakeSink, ProgrammableSink, ScriptedWrite, counting_in_memory_buffer_source,
+    in_memory_buffer_source, logs_envelope,
+};
 
 fn options_with_fetch_concurrency(fetch_concurrency: u32) -> RuntimeOptions {
     RuntimeOptions {
@@ -1718,5 +1724,420 @@ async fn pipeline_hard_abort_during_parked_sink_unwinds_pipeline() {
     );
 
     let _ = shutdown;
+    fx.producer.close().await.expect("close producer");
+}
+
+// ===================================================================
+// K>1 admission tests (phase06 follow-up). See
+// plans/odb-high-throughput/phase06-k-gt-1-admission-impl.md §8.2.
+// ===================================================================
+
+/// INV-ADMISSION-CONTIGUOUS holds at K>1. Same shape as
+/// `pipeline_register_pending_called_in_admission_order` but with
+/// `max_descriptors_per_poll=16` and a larger `max_inflight_batches`
+/// so the admission actor admits in batches > 1. With 100 source
+/// batches produced up-front, the first admission cycle has plenty
+/// of descriptors waiting; the register-all loop must observe them
+/// in source-sequence order even though fetch workers complete
+/// out-of-order under the alternating fast/slow fetch delay.
+#[tokio::test]
+async fn pipeline_admission_batched_k_gt_1_register_order() {
+    let fx = in_memory_buffer_source(
+        "ingest/test/pipeline/k-gt-1-order/manifest",
+        "ingest/test/pipeline/k-gt-1-order/data",
+    )
+    .await;
+    let batch_count = 100u64;
+    for i in 0..batch_count {
+        fx.producer
+            .produce(
+                vec![Bytes::from(format!("payload-{i}").into_bytes())],
+                logs_envelope(),
+            )
+            .await
+            .expect("produce");
+        fx.producer.flush().await.expect("flush");
+    }
+
+    let sink = FakeSink::new("fake-sink");
+    let captured = Arc::clone(&sink.captured);
+
+    let recorder: AdmissionRecorder = Arc::new(Mutex::new(Vec::new()));
+    let recorder_runtime = Arc::clone(&recorder);
+
+    // Same alternating delay as the K=1 register-order test —
+    // forces fetch completions out of order so we're testing the
+    // structural admission ordering, not happenstance.
+    let delay_fn: Arc<dyn Fn(u64) -> Duration + Send + Sync> = Arc::new(|seq: u64| {
+        if seq.is_multiple_of(2) {
+            Duration::from_millis(1)
+        } else {
+            Duration::from_millis(10)
+        }
+    });
+
+    let mut opts = options_with_fetch_concurrency(4);
+    opts.max_descriptors_per_poll = 16;
+    opts.source_defaults.max_inflight_batches = 32;
+    let metrics = Arc::new(RuntimeMetrics::new());
+
+    let runtime = Runtime::builder()
+        .add_source(fx.source)
+        .add_decoder(FakeDecoder::permissive())
+        .set_sink(sink)
+        .with_options(opts)
+        .with_runtime_metrics(Arc::clone(&metrics))
+        .with_admission_recorder(recorder_runtime)
+        .with_test_fetch_delay(delay_fn)
+        .build()
+        .expect("build");
+    let mut progress_rx = runtime.progress();
+
+    let shutdown = CancellationToken::new();
+    let shutdown_run = shutdown.clone();
+    let handle = tokio::spawn(async move { runtime.run(shutdown_run).await });
+
+    timeout(Duration::from_secs(30), async {
+        loop {
+            progress_rx
+                .changed()
+                .await
+                .expect("progress channel closed");
+            let p = *progress_rx.borrow();
+            if p.source_ranges_committed >= batch_count {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("runtime did not commit all batches in time");
+
+    shutdown.cancel();
+    handle
+        .await
+        .expect("runtime task join")
+        .expect("runtime exited cleanly");
+
+    let events = recorder.lock().unwrap().clone();
+    assert_eq!(events.len(), batch_count as usize);
+    let expected: Vec<(SourceId, u64)> = (0..batch_count)
+        .map(|i| (SourceId::from("buffer"), i))
+        .collect();
+    assert_eq!(
+        events, expected,
+        "INV-ADMISSION-CONTIGUOUS must hold at K>1: register order = source-sequence order",
+    );
+
+    let mut committed = captured.lock().unwrap().clone();
+    committed.sort_by_key(|c| c.low_sequence);
+    assert_eq!(committed.len(), batch_count as usize);
+    for (i, c) in committed.iter().enumerate() {
+        assert_eq!(c.low_sequence, i as u64);
+        assert_eq!(c.high_sequence, i as u64);
+    }
+
+    // K_effective sanity: 100 descriptors over fewer than 100 calls
+    // means batching happened at least once. (Not a tight bound —
+    // depends on producer-side timing — but if K=1 had regressed
+    // this would fail.)
+    let calls = metrics
+        .admission_next_descriptors_calls
+        .get_or_create(&SourceLabels {
+            source: "buffer".into(),
+        })
+        .get();
+    assert!(
+        calls < batch_count,
+        "K_effective > 1 expected; saw {calls} calls for {batch_count} descriptors",
+    );
+
+    fx.producer.close().await.expect("close producer");
+}
+
+/// **Load-bearing amortization proof.** Counts manifest GETs at the
+/// `ObjectStore::get_opts` boundary and asserts a single admission
+/// cycle with `max_descriptors_per_poll=8` corresponds to exactly
+/// one manifest GET (not 8).
+///
+/// Test sizing keeps the actor permit-blocked after the first cycle:
+/// `max_inflight_batches=8`, exactly 8 batches produced, sink pool=1
+/// gating on every write. The first sink call parks indefinitely;
+/// the 7 trailing commits queue behind it head-of-line; no
+/// `WriteCompletion` ever returns; admission's batch semaphore stays
+/// drained. With no permits returned, admission cannot do a
+/// follow-up `next_descriptors` call before the assertion fires.
+#[tokio::test]
+async fn pipeline_admission_amortizes_manifest_gets() {
+    let fx = counting_in_memory_buffer_source(
+        "ingest/test/pipeline/k-gt-1-amortize/manifest",
+        "ingest/test/pipeline/k-gt-1-amortize/data",
+    )
+    .await;
+    let batch_count = 8u64;
+    for i in 0..batch_count {
+        fx.producer
+            .produce(
+                vec![Bytes::from(format!("payload-{i}").into_bytes())],
+                logs_envelope(),
+            )
+            .await
+            .expect("produce");
+        fx.producer.flush().await.expect("flush");
+    }
+
+    // Producer-side setup wrote / read the manifest. Reset both
+    // counters so only the runtime's manifest reads count below.
+    fx.manifest_gets.store(0, Ordering::SeqCst);
+    fx.data_gets.store(0, Ordering::SeqCst);
+
+    let sink = ProgrammableSink::new(
+        opendata_ingest_runtime::sink::SinkId::from("programmable"),
+        // Script never runs: the gate parks every write before the
+        // script is consulted. Provide enough Ok entries so a buggy
+        // gate doesn't surface as "exhausted script" instead of
+        // "didn't park."
+        vec![ScriptedWrite::Ok { rows_written: 1 }; batch_count as usize],
+        opendata_ingest_runtime::sink::CommitStatus::Committed,
+    );
+    // Gate writes (also_gate_write=true) so EVERY write call parks.
+    // With sink pool=1 the head-of-line block stops all further
+    // commits; with pool>1 it wouldn't.
+    let gate = sink.block_until_released(true);
+
+    let mut opts = options_with_fetch_concurrency(4);
+    opts.max_descriptors_per_poll = 8;
+    opts.source_defaults.max_inflight_batches = 8; // matched to produced count
+    opts.sink.max_concurrent_commits = 1;
+
+    let metrics = Arc::new(RuntimeMetrics::new());
+    let recorder: AdmissionRecorder = Arc::new(Mutex::new(Vec::new()));
+    let recorder_runtime = Arc::clone(&recorder);
+
+    let runtime = Runtime::builder()
+        .add_source(fx.source)
+        .add_decoder(FakeDecoder::permissive())
+        .set_sink(sink)
+        .with_options(opts)
+        .with_runtime_metrics(Arc::clone(&metrics))
+        .with_admission_recorder(recorder_runtime)
+        .build()
+        .expect("build");
+
+    let shutdown = CancellationToken::new();
+    let shutdown_run = shutdown.clone();
+    let handle = tokio::spawn(async move { runtime.run(shutdown_run).await });
+
+    // Wait for the register-all pass to complete (recorder reaches
+    // 8). Because the first sink call parks via the gate and
+    // pool=1 blocks the rest, no completion fires → no permit
+    // returns → admission cannot do a second cycle.
+    timeout(Duration::from_secs(10), async {
+        loop {
+            if recorder.lock().unwrap().len() >= batch_count as usize {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .expect("admission did not register 8 descriptors in time");
+
+    // Also wait for the first write to enter the gate, so we know
+    // the pipeline has fully drained admission → fetch → decode →
+    // sink. This is a stronger "no second admission" signal: a
+    // second admission cycle could only happen after a permit
+    // returns, which requires a completion, which requires the
+    // gated write to return — which it can't while gate is held.
+    gate.wait_for_entry().await;
+
+    // Object-store boundary assertion: exactly one manifest GET
+    // for the K=8 cycle.
+    let manifest_gets = fx.manifest_gets.load(Ordering::SeqCst);
+    assert_eq!(
+        manifest_gets, 1,
+        "K=8 admission cycle must hit one manifest GET, not 8",
+    );
+
+    // Runtime-metric assertions: paired confirmation at the
+    // crate-internal boundary.
+    let calls = metrics
+        .admission_next_descriptors_calls
+        .get_or_create(&SourceLabels {
+            source: "buffer".into(),
+        })
+        .get();
+    assert_eq!(calls, 1, "exactly one next_descriptors call");
+
+    let handed_out = metrics
+        .descriptors_handed_out
+        .get_or_create(&SourceLabels {
+            source: "buffer".into(),
+        })
+        .get();
+    assert_eq!(handed_out, 8, "all 8 descriptors handed out");
+
+    let releases = metrics
+        .admission_extension_releases
+        .get_or_create(&SourceLabels {
+            source: "buffer".into(),
+        })
+        .get();
+    assert_eq!(
+        releases, 0,
+        "no excess gates released (buffer returned full K_target)",
+    );
+
+    // Release the gate, drain, confirm clean shutdown.
+    drop(gate);
+    shutdown.cancel();
+    handle
+        .await
+        .expect("runtime task join")
+        .expect("runtime exited cleanly");
+
+    fx.producer.close().await.expect("close producer");
+}
+
+/// When the buffer returns fewer descriptors than the extension
+/// loop acquired gates for, the excess gates' Drop must release the
+/// batch permits + byte reservations AND increment
+/// `runtime_admission_extension_releases_total` by the overshoot.
+///
+/// With K_target=16 capped by `max_inflight_batches=8`, cycle 1
+/// acquires 8 gates and the buffer returns 5 → 3 releases. The 5
+/// in-flight descriptors hold 5 batch_permits, leaving 3 free —
+/// admission immediately runs a second cycle that acquires 3 gates
+/// (1 blocking + 2 try_acquire) and `next_descriptors` returns 0,
+/// adding 3 more releases (total = 6).
+///
+/// To keep the assertion deterministic, `poll_interval` is set to
+/// 60 s so a third cycle cannot fire during the assertion window:
+/// after cycle 2's empty-poll branch, the actor sleeps for 60 s
+/// before the next admission attempt. The test asserts on the
+/// post-cycle-2 frozen state.
+#[tokio::test]
+async fn pipeline_admission_k_gt_1_releases_excess_permits() {
+    let fx = in_memory_buffer_source(
+        "ingest/test/pipeline/k-gt-1-release/manifest",
+        "ingest/test/pipeline/k-gt-1-release/data",
+    )
+    .await;
+    let batch_count = 5u64;
+    for i in 0..batch_count {
+        fx.producer
+            .produce(
+                vec![Bytes::from(format!("payload-{i}").into_bytes())],
+                logs_envelope(),
+            )
+            .await
+            .expect("produce");
+        fx.producer.flush().await.expect("flush");
+    }
+
+    let sink = ProgrammableSink::new(
+        opendata_ingest_runtime::sink::SinkId::from("programmable"),
+        vec![ScriptedWrite::Ok { rows_written: 1 }; batch_count as usize],
+        opendata_ingest_runtime::sink::CommitStatus::Committed,
+    );
+    let gate = sink.block_until_released(true);
+
+    let mut opts = options_with_fetch_concurrency(4);
+    opts.max_descriptors_per_poll = 16;
+    opts.source_defaults.max_inflight_batches = 8; // caps gates to 8
+    opts.sink.max_concurrent_commits = 1;
+    // poll_interval kept short so shutdown.cancel() lands promptly
+    // — the actor's empty-poll branch sleeps for this duration
+    // before re-entering the select! and observing shutdown.
+    opts.poll_interval = Duration::from_millis(50);
+
+    let metrics = Arc::new(RuntimeMetrics::new());
+    let recorder: AdmissionRecorder = Arc::new(Mutex::new(Vec::new()));
+    let recorder_runtime = Arc::clone(&recorder);
+
+    let runtime = Runtime::builder()
+        .add_source(fx.source)
+        .add_decoder(FakeDecoder::permissive())
+        .set_sink(sink)
+        .with_options(opts)
+        .with_runtime_metrics(Arc::clone(&metrics))
+        .with_admission_recorder(recorder_runtime)
+        .build()
+        .expect("build");
+
+    let shutdown = CancellationToken::new();
+    let shutdown_run = shutdown.clone();
+    let handle = tokio::spawn(async move { runtime.run(shutdown_run).await });
+
+    // Wait for cycle 2 to complete (overshoot in cycle 1 + first
+    // empty cycle). With the sink gated and pool=1, no completion
+    // ever fires, so admission keeps spinning in empty cycles —
+    // each adds 3 to releases. The deterministic invariant under
+    // any number of cycles N ≥ 2 is:
+    //
+    //     releases == 3 * calls   (after cycle N's release-increment)
+    //     releases == 3 * (calls - 1)   (briefly, between cycle N's
+    //                                   call-increment in step 9
+    //                                   and its release-increment
+    //                                   in step 11 — a window of a
+    //                                   handful of synchronous ops)
+    //
+    // Cycle 1 contributes 3 (overshoot 8-5). Each empty cycle (2,
+    // 3, ...) contributes 3 (gates = 1 + 2 try_acquire on the 2
+    // permits left after the blocking gate consumes 1 of the 3
+    // free permits).
+    let calls_label = SourceLabels {
+        source: "buffer".into(),
+    };
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if metrics
+                .admission_next_descriptors_calls
+                .get_or_create(&calls_label)
+                .get()
+                >= 2
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .expect("admission did not complete cycle 2 in time");
+
+    // Snapshot atomically-enough: read calls first, then releases.
+    // Any cycle that fires between these two reads can leave
+    // releases trailing calls by one cycle's worth (3); the
+    // invariant tolerates that with the `||` branch.
+    let calls = metrics
+        .admission_next_descriptors_calls
+        .get_or_create(&calls_label)
+        .get();
+    let releases = metrics
+        .admission_extension_releases
+        .get_or_create(&calls_label)
+        .get();
+    assert!(calls >= 2, "saw {calls} calls (expected at least 2)");
+    assert!(
+        releases == 3 * calls || releases == 3 * (calls.saturating_sub(1)),
+        "releases must equal 3 × cycles (cycle 1 overshoot 8-5 + each \
+         empty cycle's 3-gate release); saw calls={calls} releases={releases}",
+    );
+
+    let handed_out = metrics
+        .descriptors_handed_out
+        .get_or_create(&calls_label)
+        .get();
+    assert_eq!(handed_out, 5, "5 descriptors handed out (cycle 1)");
+
+    let recorded = recorder.lock().unwrap().len();
+    assert_eq!(recorded, 5, "5 descriptors registered with the coordinator");
+
+    drop(gate);
+    shutdown.cancel();
+    handle
+        .await
+        .expect("runtime task join")
+        .expect("runtime exited cleanly");
+
     fx.producer.close().await.expect("close producer");
 }

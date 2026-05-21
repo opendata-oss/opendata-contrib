@@ -15,6 +15,9 @@
 
 #![allow(dead_code)] // Not every integration test uses every fixture.
 
+pub mod counting_store;
+pub use counting_store::CountingObjectStore;
+
 use std::any::Any;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -596,6 +599,52 @@ pub async fn buffer_source_on_store_with_producer(
     last_acked_sequence: Option<u64>,
 ) -> BufferFixtureParts {
     build_buffer_fixture(store, manifest_path, data_prefix, last_acked_sequence).await
+}
+
+pub struct CountingBufferFixture {
+    pub store: Arc<CountingObjectStore>,
+    pub producer: buffer::Producer,
+    pub source: BufferSource,
+    pub manifest_path: String,
+    pub data_prefix: String,
+    pub manifest_gets: Arc<std::sync::atomic::AtomicU64>,
+    pub data_gets: Arc<std::sync::atomic::AtomicU64>,
+}
+
+/// Like [`in_memory_buffer_source`] but layers a path-filtered
+/// `CountingObjectStore` over the in-memory store. The counters
+/// reflect every GET against the underlying store after the wrapper
+/// is built — producer-side activity will increment them during
+/// fixture setup, so callers should `store(0, ...)` both counters
+/// after producing test data and before exercising the runtime.
+pub async fn counting_in_memory_buffer_source(
+    manifest_path: &str,
+    data_prefix: &str,
+) -> CountingBufferFixture {
+    let inner: Arc<dyn ObjectStore> =
+        Arc::new(slatedb::object_store::memory::InMemory::new());
+    let counting = Arc::new(CountingObjectStore::new(
+        Arc::clone(&inner),
+        manifest_path.to_string(),
+    ));
+    let manifest_gets = counting.manifest_gets_counter();
+    let data_gets = counting.data_gets_counter();
+    let fixture = build_buffer_fixture(
+        Arc::clone(&counting) as Arc<dyn ObjectStore>,
+        manifest_path,
+        data_prefix,
+        None,
+    )
+    .await;
+    CountingBufferFixture {
+        store: counting,
+        producer: fixture.producer,
+        source: fixture.source,
+        manifest_path: manifest_path.into(),
+        data_prefix: data_prefix.into(),
+        manifest_gets,
+        data_gets,
+    }
 }
 
 pub struct BufferFixtureParts {

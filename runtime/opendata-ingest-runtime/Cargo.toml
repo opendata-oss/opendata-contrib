@@ -25,4 +25,5 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 common = { workspace = true }
+futures = { workspace = true }
 slatedb = { workspace = true }
