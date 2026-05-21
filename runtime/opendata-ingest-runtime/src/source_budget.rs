@@ -488,9 +488,7 @@ mod tests {
         // accept, but `current + bytes` would overflow u64. checked_add
         // must surface this as None, not silently saturate.
         let b = budget(u64::MAX);
-        let _huge = b
-            .try_reserve(u64::MAX - 10)
-            .expect("first big claim fits");
+        let _huge = b.try_reserve(u64::MAX - 10).expect("first big claim fits");
         assert!(
             b.try_reserve(100).is_none(),
             "checked_add must reject overflow",

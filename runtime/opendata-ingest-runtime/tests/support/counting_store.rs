@@ -22,8 +22,8 @@ use bytes::Bytes;
 use futures::stream::BoxStream;
 use slatedb::object_store::path::Path;
 use slatedb::object_store::{
-    GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutMultipartOptions,
-    PutOptions, PutPayload, PutResult, Result as OsResult,
+    GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
+    PutMultipartOptions, PutOptions, PutPayload, PutResult, Result as OsResult,
 };
 
 pub struct CountingObjectStore {

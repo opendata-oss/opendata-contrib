@@ -621,8 +621,7 @@ pub async fn counting_in_memory_buffer_source(
     manifest_path: &str,
     data_prefix: &str,
 ) -> CountingBufferFixture {
-    let inner: Arc<dyn ObjectStore> =
-        Arc::new(slatedb::object_store::memory::InMemory::new());
+    let inner: Arc<dyn ObjectStore> = Arc::new(slatedb::object_store::memory::InMemory::new());
     let counting = Arc::new(CountingObjectStore::new(
         Arc::clone(&inner),
         manifest_path.to_string(),

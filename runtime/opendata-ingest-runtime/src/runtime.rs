@@ -954,10 +954,7 @@ impl RuntimeBuilder {
     /// `metrics::*!` until C2. When absent the builder default-
     /// constructs an unregistered `RuntimeMetrics` so emission code
     /// has somewhere to write regardless of the bin wiring.
-    pub fn with_runtime_metrics(
-        mut self,
-        metrics: Arc<crate::metrics::RuntimeMetrics>,
-    ) -> Self {
+    pub fn with_runtime_metrics(mut self, metrics: Arc<crate::metrics::RuntimeMetrics>) -> Self {
         self.runtime_metrics = Some(metrics);
         self
     }
@@ -1298,16 +1295,18 @@ async fn per_source_actor(
                 // keep the atomic in sync automatically; the fetch
                 // worker re-attaches to `stage.fetch` on recv.
                 reservation.attach_stage(Arc::clone(&stage_bytes.source));
-                let mut gates: Vec<AdmissionGate> = Vec::with_capacity(
-                    options.max_descriptors_per_poll.max(1),
-                );
-                gates.push(AdmissionGate { batch_permit, reservation });
 
-                // Step 3 — compute advisory K_target. Saturating sub
-                // because `in_flight` can transiently exceed
-                // `capacity` (oversize batches, reconcile-grow at
-                // decode). The authoritative gates are
-                // `try_acquire_owned` and `try_reserve`.
+                // Step 3 — compute advisory K_target BEFORE
+                // allocating gates Vec so a pathological operator
+                // knob (e.g. INGESTOR__RUNTIME__MAX_DESCRIPTORS_PER_POLL=1000000)
+                // can't drive a huge upfront allocation; the real
+                // semaphore + byte-budget caps clamp k_target down
+                // to what's actually achievable this cycle.
+                // Saturating sub because `in_flight` can transiently
+                // exceed `capacity` (oversize batches, reconcile-grow
+                // at decode). The authoritative gates are
+                // `try_acquire_owned` and `try_reserve`; k_target is
+                // an advisory loop bound.
                 let estimated = bp.estimated_max_batch_bytes.max(1);
                 let room_bytes = budget.capacity().saturating_sub(budget.in_flight());
                 let room_units = (room_bytes / estimated) as usize;
@@ -1316,6 +1315,9 @@ async fn per_source_actor(
                     .max(1)
                     .min(1usize.saturating_add(batch_semaphore.available_permits()))
                     .min(1usize.saturating_add(room_units));
+
+                let mut gates: Vec<AdmissionGate> = Vec::with_capacity(k_target);
+                gates.push(AdmissionGate { batch_permit, reservation });
 
                 // Step 4–5 — opportunistically extend the gate Vec
                 // up to K_target.
@@ -2062,9 +2064,15 @@ async fn writer_worker(
             })
             .set(stage_bytes.sink_dispatch.load(Ordering::SeqCst) as i64);
         let stage_start = std::time::Instant::now();
-        let attempt =
-            write_with_retry(&sink, commit, &options, &source_id, &hard_abort_token, &metrics)
-                .await;
+        let attempt = write_with_retry(
+            &sink,
+            commit,
+            &options,
+            &source_id,
+            &hard_abort_token,
+            &metrics,
+        )
+        .await;
         metrics
             .stage_latency_seconds
             .get_or_create(&crate::metrics::StageLabels {

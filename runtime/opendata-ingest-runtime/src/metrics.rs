@@ -200,10 +200,9 @@ impl RuntimeMetrics {
             stage_latency_seconds: Family::<StageLabels, Histogram>::new_with_constructor(
                 seconds_histogram,
             ),
-            admission_descriptors_per_call:
-                Family::<SourceLabels, Histogram>::new_with_constructor(
-                    admission_batch_histogram,
-                ),
+            admission_descriptors_per_call: Family::<SourceLabels, Histogram>::new_with_constructor(
+                admission_batch_histogram,
+            ),
         }
     }
 
@@ -421,15 +420,11 @@ mod tests {
         encode(&mut buf, &registry).expect("encode");
 
         assert!(
-            buf.contains(
-                "runtime_admission_next_descriptors_calls_total{source=\"buffer\"} 2"
-            ),
+            buf.contains("runtime_admission_next_descriptors_calls_total{source=\"buffer\"} 2"),
             "missing admission-calls counter line. Output was:\n{buf}",
         );
         assert!(
-            buf.contains(
-                "runtime_admission_extension_releases_total{source=\"buffer\"} 3"
-            ),
+            buf.contains("runtime_admission_extension_releases_total{source=\"buffer\"} 3"),
             "missing extension-releases counter line. Output was:\n{buf}",
         );
         // Two observations: 8.0 lands in the 8.0 bucket (and below);
@@ -442,15 +437,11 @@ mod tests {
             "missing descriptors-per-call 8.0 bucket. Output was:\n{buf}",
         );
         assert!(
-            buf.contains(
-                "runtime_admission_descriptors_per_call_sum{source=\"buffer\"} 8.0"
-            ),
+            buf.contains("runtime_admission_descriptors_per_call_sum{source=\"buffer\"} 8.0"),
             "missing descriptors-per-call sum. Output was:\n{buf}",
         );
         assert!(
-            buf.contains(
-                "runtime_admission_descriptors_per_call_count{source=\"buffer\"} 2"
-            ),
+            buf.contains("runtime_admission_descriptors_per_call_count{source=\"buffer\"} 2"),
             "missing descriptors-per-call count. Output was:\n{buf}",
         );
     }
