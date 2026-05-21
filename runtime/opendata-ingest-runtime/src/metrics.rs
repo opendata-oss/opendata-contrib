@@ -86,6 +86,15 @@ fn seconds_histogram() -> Histogram {
     Histogram::new(SECONDS_HISTOGRAM_BUCKETS.iter().copied())
 }
 
+/// Bucket boundaries for `runtime_admission_descriptors_per_call`.
+/// Covers the K_target range we care about (1, 2, 4, 8, 16, 32, 64) plus
+/// a 0 bucket for empty-poll cycles.
+pub const ADMISSION_BATCH_BUCKETS: &[f64] = &[0.0, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0];
+
+fn admission_batch_histogram() -> Histogram {
+    Histogram::new(ADMISSION_BATCH_BUCKETS.iter().copied())
+}
+
 /// `{source}` — used by ack-lag histogram + all `_total` runtime
 /// counters that key off the source name.
 #[derive(Clone, Hash, PartialEq, Eq, Debug, EncodeLabelSet)]
@@ -135,6 +144,16 @@ pub struct RuntimeMetrics {
     pub bytes_fetched: Family<SourceLabels, Counter>,
     pub records_decoded: Family<SourceLabels, Counter>,
     pub sink_commits: Family<SourceSinkResultLabels, Counter>,
+    /// One increment per admission arm cycle that invokes
+    /// `next_descriptors`. Combined with `descriptors_handed_out` it
+    /// yields K_effective = handed_out / calls — the load-bearing
+    /// signal for the K>1 admission optimization.
+    pub admission_next_descriptors_calls: Family<SourceLabels, Counter>,
+    /// Total descriptors released back to the budget + semaphore
+    /// because `next_descriptors` returned fewer descriptors than the
+    /// number of gates the extension loop acquired. Counts
+    /// `gates.len() - descriptors.len()` per overshoot cycle.
+    pub admission_extension_releases: Family<SourceLabels, Counter>,
 
     pub ack_frontier: Family<SourceLabels, Gauge>,
     pub pending_ranges: Family<SourceLabels, Gauge>,
@@ -146,6 +165,12 @@ pub struct RuntimeMetrics {
 
     pub ack_lag_seconds: Family<SourceLabels, Histogram>,
     pub stage_latency_seconds: Family<StageLabels, Histogram>,
+    /// Observed once per admission arm cycle with the number of
+    /// descriptors returned by `next_descriptors`. Bucketed by
+    /// [`ADMISSION_BATCH_BUCKETS`]; useful for distinguishing
+    /// "buffer ran dry mid-window" (sample of 1–2) from "K_target
+    /// saturated" (sample at the configured K).
+    pub admission_descriptors_per_call: Family<SourceLabels, Histogram>,
 }
 
 impl RuntimeMetrics {
@@ -158,6 +183,8 @@ impl RuntimeMetrics {
             bytes_fetched: Family::<SourceLabels, Counter>::default(),
             records_decoded: Family::<SourceLabels, Counter>::default(),
             sink_commits: Family::<SourceSinkResultLabels, Counter>::default(),
+            admission_next_descriptors_calls: Family::<SourceLabels, Counter>::default(),
+            admission_extension_releases: Family::<SourceLabels, Counter>::default(),
 
             ack_frontier: Family::<SourceLabels, Gauge>::default(),
             pending_ranges: Family::<SourceLabels, Gauge>::default(),
@@ -173,6 +200,10 @@ impl RuntimeMetrics {
             stage_latency_seconds: Family::<StageLabels, Histogram>::new_with_constructor(
                 seconds_histogram,
             ),
+            admission_descriptors_per_call:
+                Family::<SourceLabels, Histogram>::new_with_constructor(
+                    admission_batch_histogram,
+                ),
         }
     }
 
@@ -206,6 +237,16 @@ impl RuntimeMetrics {
             "runtime_sink_commits",
             "Sink commit attempts labeled by source, sink, and result.",
             self.sink_commits.clone(),
+        );
+        registry.register(
+            "runtime_admission_next_descriptors_calls",
+            "Admission-arm invocations of next_descriptors per source.",
+            self.admission_next_descriptors_calls.clone(),
+        );
+        registry.register(
+            "runtime_admission_extension_releases",
+            "Excess gates released when next_descriptors returned fewer descriptors than gates acquired.",
+            self.admission_extension_releases.clone(),
         );
 
         registry.register(
@@ -253,6 +294,11 @@ impl RuntimeMetrics {
             "runtime_stage_latency_seconds",
             "Per-batch latency at each stage, labeled by stage and source.",
             self.stage_latency_seconds.clone(),
+        );
+        registry.register(
+            "runtime_admission_descriptors_per_call",
+            "Descriptors returned by each next_descriptors invocation in the admission arm.",
+            self.admission_descriptors_per_call.clone(),
         );
     }
 }

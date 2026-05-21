@@ -34,9 +34,13 @@
 //! Invariants pinned in this row:
 //!
 //! - INV-ADMISSION-CONTIGUOUS — the actor's admission arm is the
-//!   only call site for `AckCoordinator::register_pending`. It
-//!   runs synchronously inside the actor's task between
-//!   `next_descriptors` and `descriptor_tx.send`.
+//!   only call site for `AckCoordinator::register_pending`. Each
+//!   admission cycle calls `next_descriptors(K)` once, then
+//!   synchronously calls `register_pending` for **every** returned
+//!   descriptor in source-sequence order **before** sending any of
+//!   them on `descriptor_tx`. At K=1 this degenerates to today's
+//!   register-then-send pattern; at K>1 the two-pass register-all
+//!   then send-all structure preserves the invariant.
 //! - INV-FRONTIER-NEVER-OVER-HOLE — completion arm calls
 //!   `mark_committed` + `advance_frontier` on each completion.
 //! - INV-ACK-CALLED-ON-ADVANCE — `ack_through` only fires when
@@ -373,11 +377,22 @@ pub struct RuntimeOptions {
     /// How long to sleep when [`BufferSource::next_descriptors`]
     /// returns an empty descriptor list (no more visible batches).
     pub poll_interval: Duration,
-    /// Maximum number of descriptors to request per poll. Phase 6
-    /// row 6.1 forces this to 1 inside the admission arm
-    /// (`next_descriptors(K=1)`) so every descriptor is registered
-    /// before it leaves the synchronous arm; the field is kept on
-    /// the options struct for back-compat with Phase 5 callers.
+    /// Maximum descriptors to request from `next_descriptors` per
+    /// admission cycle. Default `8` — amortizes the per-cycle
+    /// manifest GET across up to K descriptors so a saturated source
+    /// hits one manifest GET per ~K admissions instead of one per
+    /// descriptor.
+    ///
+    /// Backpressure invariant preserved at any K: the admission arm's
+    /// blocking gate still parks until at least one batch permit + one
+    /// byte reservation are in hand. After the gate opens, the arm
+    /// opportunistically claims up to `K - 1` additional permits +
+    /// reservations non-blockingly, then calls
+    /// `next_descriptors(gates.len())`. Excess gates (when the buffer
+    /// returns fewer descriptors than the loop acquired) are released
+    /// via Drop. Registration with the AckCoordinator is synchronous,
+    /// in source-sequence order, before any descriptor leaves the arm
+    /// — INV-ADMISSION-CONTIGUOUS holds at any K.
     pub max_descriptors_per_poll: usize,
     /// Max retries per source range before a non-fatal sink failure
     /// is bubbled up as `RuntimeError::Sink`. Shadowed by
@@ -408,7 +423,7 @@ impl Default for RuntimeOptions {
             ack_flush_policy: AckFlushPolicy::default(),
             dry_run: true,
             poll_interval: Duration::from_millis(250),
-            max_descriptors_per_poll: 1,
+            max_descriptors_per_poll: 8,
             max_retry_attempts: 3,
             retry_backoff: Duration::from_millis(100),
             source_defaults: SourceBackpressureOptions::default(),
@@ -1262,27 +1277,100 @@ async fn per_source_actor(
             ), if admission_open => {
                 // Time the admission arm body and record one
                 // `runtime_stage_latency_seconds{stage=source}` sample
-                // per arm execution. The parked time on backpressure
-                // is already accounted for by `with_backpressure_timer`
-                // above; this only measures the synchronous + the
-                // `next_descriptors` + the `descriptor_tx.send` work.
+                // per arm execution (one per cycle, not one per
+                // descriptor — the cycle is the unit of work). The
+                // parked time on backpressure is already accounted
+                // for by `with_backpressure_timer` above; this only
+                // measures the synchronous + the `next_descriptors`
+                // + the `descriptor_tx.send` work.
                 let stage_start = std::time::Instant::now();
-                let AdmissionGate { batch_permit, mut reservation } = biased_arm;
-                // Attach the reservation to the source-stage atomic
-                // so it shows up in `runtime_stage_inflight_bytes{
-                // stage=source}` until the fetch worker calls
-                // `attach_stage(stage.fetch)` on recv. Drop /
-                // reconcile keep the atomic in sync automatically.
-                reservation.attach_stage(Arc::clone(&stage_bytes.source));
 
-                // K=1: register every descriptor before it leaves
-                // the synchronous arm.
+                // K>1 admission protocol (see plans/odb-high-
+                // throughput/phase06-k-gt-1-admission-impl.md §4.1).
+                //
+                // Step 1 — blocking gate already opened: `biased_arm`
+                // carries one batch_permit + one byte reservation.
+                let AdmissionGate { batch_permit, mut reservation } = biased_arm;
+                // Step 2 — attach the first reservation to the
+                // source-stage atomic so it shows up in
+                // `runtime_stage_inflight_bytes{stage=source}` while
+                // the manifest GET is in flight. Drop / reconcile
+                // keep the atomic in sync automatically; the fetch
+                // worker re-attaches to `stage.fetch` on recv.
+                reservation.attach_stage(Arc::clone(&stage_bytes.source));
+                let mut gates: Vec<AdmissionGate> = Vec::with_capacity(
+                    options.max_descriptors_per_poll.max(1),
+                );
+                gates.push(AdmissionGate { batch_permit, reservation });
+
+                // Step 3 — compute advisory K_target. Saturating sub
+                // because `in_flight` can transiently exceed
+                // `capacity` (oversize batches, reconcile-grow at
+                // decode). The authoritative gates are
+                // `try_acquire_owned` and `try_reserve`.
+                let estimated = bp.estimated_max_batch_bytes.max(1);
+                let room_bytes = budget.capacity().saturating_sub(budget.in_flight());
+                let room_units = (room_bytes / estimated) as usize;
+                let k_target = options
+                    .max_descriptors_per_poll
+                    .max(1)
+                    .min(1usize.saturating_add(batch_semaphore.available_permits()))
+                    .min(1usize.saturating_add(room_units));
+
+                // Step 4–5 — opportunistically extend the gate Vec
+                // up to K_target.
+                let extras_target = k_target.saturating_sub(1);
+                for _ in 0..extras_target {
+                    let Ok(permit) = Arc::clone(&batch_semaphore).try_acquire_owned()
+                    else {
+                        break;
+                    };
+                    let Some(mut extra) = budget.try_reserve(bp.estimated_max_batch_bytes)
+                    else {
+                        // Permit acquired but no byte room — drop the
+                        // permit (back to the semaphore) and stop
+                        // extending this cycle.
+                        drop(permit);
+                        break;
+                    };
+                    extra.attach_stage(Arc::clone(&stage_bytes.source));
+                    gates.push(AdmissionGate { batch_permit: permit, reservation: extra });
+                }
+
+                // Step 7 — one manifest GET per cycle, returning up
+                // to gates.len() descriptors.
                 let descriptors = source
-                    .next_descriptors(1, SourceBudget::default())
+                    .next_descriptors(gates.len(), SourceBudget::default())
                     .await?;
+                // Step 13a — count the call regardless of how many
+                // descriptors came back (including the empty case).
+                metrics
+                    .admission_next_descriptors_calls
+                    .get_or_create(&crate::metrics::SourceLabels {
+                        source: source_id.0.clone(),
+                    })
+                    .inc();
+                // Step 13b — histogram observes descriptors.len()
+                // (may be 0 in the empty-poll branch below).
+                metrics
+                    .admission_descriptors_per_call
+                    .get_or_create(&crate::metrics::SourceLabels {
+                        source: source_id.0.clone(),
+                    })
+                    .observe(descriptors.len() as f64);
+
+                // Step 8 — empty poll. Drop all gates (releases
+                // permits + bytes, detaches the source-stage atomic
+                // via Drop), record stage latency, sleep, continue.
                 if descriptors.is_empty() {
-                    drop(reservation);
-                    drop(batch_permit);
+                    let released = gates.len() as u64;
+                    drop(gates);
+                    metrics
+                        .admission_extension_releases
+                        .get_or_create(&crate::metrics::SourceLabels {
+                            source: source_id.0.clone(),
+                        })
+                        .inc_by(released);
                     metrics
                         .stage_latency_seconds
                         .get_or_create(&crate::metrics::StageLabels {
@@ -1294,39 +1382,71 @@ async fn per_source_actor(
                     continue;
                 }
 
-                let descriptor = descriptors.into_iter().next().expect("len checked");
-                let seq = descriptor.sequence;
-
-                // INV-ADMISSION-CONTIGUOUS: synchronous register
-                // before send. Recorder hook fires immediately
-                // before register_pending so a test sees the
-                // admission order even when fetch/decode/sink
-                // stages complete out of order.
-                if let Some(recorder) = admission_recorder.as_ref() {
-                    recorder.lock().unwrap().push((source_id.clone(), seq));
+                // Step 9 — truncate excess gates if buffer returned
+                // fewer descriptors than the loop acquired. Count
+                // `gates.len() - descriptors.len()` (NOT
+                // `k_target - descriptors.len()` — the extension
+                // loop may have broken before reaching k_target).
+                let admitted = descriptors.len();
+                if admitted < gates.len() {
+                    let released = (gates.len() - admitted) as u64;
+                    gates.truncate(admitted);
+                    metrics
+                        .admission_extension_releases
+                        .get_or_create(&crate::metrics::SourceLabels {
+                            source: source_id.0.clone(),
+                        })
+                        .inc_by(released);
                 }
-                coordinator.register_pending(seq, seq)?;
-                in_flight = in_flight.saturating_add(1);
-                metrics
-                    .descriptors_handed_out
-                    .get_or_create(&crate::metrics::SourceLabels {
-                        source: source_id.0.clone(),
-                    })
-                    .inc();
+                debug_assert_eq!(gates.len(), admitted);
 
-                if descriptor_tx
-                    .send(AdmittedDescriptor {
-                        descriptor,
-                        reservation,
-                        batch_permit,
-                    })
-                    .await
-                    .is_err()
-                {
-                    return Err(RuntimeError::Pipeline(format!(
-                        "descriptor lost: source={source_id} seq={seq} cause=worker-stage-closed",
-                    )));
+                // Step 10 — register-all pass. Synchronous, in
+                // source-sequence order. INV-ADMISSION-CONTIGUOUS:
+                // every descriptor's `register_pending` is observed
+                // before any descriptor leaves the arm on
+                // `descriptor_tx.send`.
+                for descriptor in &descriptors {
+                    let seq = descriptor.sequence;
+                    if let Some(recorder) = admission_recorder.as_ref() {
+                        recorder.lock().unwrap().push((source_id.clone(), seq));
+                    }
+                    coordinator.register_pending(seq, seq)?;
+                    in_flight = in_flight.saturating_add(1);
+                    metrics
+                        .descriptors_handed_out
+                        .get_or_create(&crate::metrics::SourceLabels {
+                            source: source_id.0.clone(),
+                        })
+                        .inc();
                 }
+
+                // Step 11 — send-all pass. The two passes are
+                // separated so a send-failure mid-batch leaves the
+                // remaining undriven descriptors + their gates owned
+                // by this stack; their Drop releases permits + bytes
+                // on the error return. Already-sent descriptors are
+                // in-flight at workers and replay on restart per RFC
+                // 0003.
+                let mut send_iter = descriptors.into_iter().zip(gates.into_iter());
+                while let Some((descriptor, gate)) = send_iter.next() {
+                    let seq = descriptor.sequence;
+                    if descriptor_tx
+                        .send(AdmittedDescriptor {
+                            descriptor,
+                            reservation: gate.reservation,
+                            batch_permit: gate.batch_permit,
+                        })
+                        .await
+                        .is_err()
+                    {
+                        // Remaining (descriptor, gate) tuples drop
+                        // here via Drop of send_iter on early return.
+                        return Err(RuntimeError::Pipeline(format!(
+                            "descriptor lost: source={source_id} seq={seq} cause=worker-stage-closed",
+                        )));
+                    }
+                }
+
                 metrics
                     .stage_latency_seconds
                     .get_or_create(&crate::metrics::StageLabels {
@@ -2199,7 +2319,7 @@ mod tests {
     fn default_options_are_dry_run_logs() {
         let opts = RuntimeOptions::default();
         assert!(opts.dry_run, "default must be dry-run for safety");
-        assert_eq!(opts.max_descriptors_per_poll, 1);
+        assert_eq!(opts.max_descriptors_per_poll, 8);
         assert!(matches!(
             opts.ack_flush_policy,
             AckFlushPolicy::EveryCommitGroup
