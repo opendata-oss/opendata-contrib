@@ -106,6 +106,52 @@ impl SourceByteBudget {
         }
     }
 
+    /// Non-blocking variant of [`reserve`]. Returns `Some` if `bytes`
+    /// fit immediately; `None` otherwise (budget full, would overflow
+    /// `u64`, or a racing reservation won the CAS).
+    ///
+    /// Used by the K>1 admission extension path: after the blocking
+    /// gate claims the first reservation, the admission arm tries
+    /// non-blockingly to claim more reservations to amortize a single
+    /// manifest GET across multiple descriptors. The blocking gate
+    /// continues to use [`reserve`].
+    ///
+    /// A zero-byte reservation is admitted unconditionally, matching
+    /// [`reserve`]'s contract.
+    ///
+    /// Uses `checked_add` (not `saturating_add`) so a u64 overflow
+    /// returns `None` rather than silently saturating and admitting
+    /// the reservation. [`reserve`] uses `saturating_add` because its
+    /// loop re-polls after a failed capacity check; this function
+    /// returns immediately and must not silently misclassify
+    /// overflow.
+    pub fn try_reserve(self: &Arc<Self>, bytes: u64) -> Option<ByteReservation> {
+        if bytes == 0 {
+            return Some(ByteReservation {
+                budget: Arc::clone(self),
+                held: 0,
+                stage: None,
+            });
+        }
+        let current = self.in_flight.load(Ordering::SeqCst);
+        let next = current.checked_add(bytes)?;
+        if next > self.capacity {
+            return None;
+        }
+        if self
+            .in_flight
+            .compare_exchange(current, next, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return None;
+        }
+        Some(ByteReservation {
+            budget: Arc::clone(self),
+            held: bytes,
+            stage: None,
+        })
+    }
+
     /// Snapshot of currently in-flight bytes. Used by the
     /// `runtime_stage_inflight_bytes{stage,source}` gauge.
     pub fn in_flight(&self) -> u64 {
@@ -418,5 +464,101 @@ mod tests {
         let r = b.reserve(0).await;
         assert_eq!(r.held(), 0);
         assert_eq!(b.in_flight(), 100);
+    }
+
+    #[tokio::test]
+    async fn try_reserve_succeeds_when_room() {
+        let b = budget(100);
+        let r = b.try_reserve(40).expect("room for 40");
+        assert_eq!(r.held(), 40);
+        assert_eq!(b.in_flight(), 40);
+    }
+
+    #[tokio::test]
+    async fn try_reserve_returns_none_when_full() {
+        let b = budget(100);
+        let _full = b.reserve(100).await;
+        assert!(b.try_reserve(1).is_none(), "must not admit over capacity");
+        assert_eq!(b.in_flight(), 100, "no bytes consumed on failed attempt");
+    }
+
+    #[tokio::test]
+    async fn try_reserve_returns_none_on_overflow() {
+        // Capacity at u64::MAX so the capacity check itself would
+        // accept, but `current + bytes` would overflow u64. checked_add
+        // must surface this as None, not silently saturate.
+        let b = budget(u64::MAX);
+        let _huge = b
+            .try_reserve(u64::MAX - 10)
+            .expect("first big claim fits");
+        assert!(
+            b.try_reserve(100).is_none(),
+            "checked_add must reject overflow",
+        );
+        assert_eq!(b.in_flight(), u64::MAX - 10);
+    }
+
+    #[tokio::test]
+    async fn try_reserve_does_not_park_under_pressure() {
+        let b = budget(100);
+        let _full = b.reserve(100).await;
+        let before = std::time::Instant::now();
+        let attempt = b.try_reserve(1);
+        let elapsed = before.elapsed();
+        assert!(attempt.is_none());
+        assert!(
+            elapsed < Duration::from_millis(10),
+            "try_reserve must return synchronously when budget is full, took {elapsed:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn try_reserve_then_drop_unwinds_atomically() {
+        let b = budget(100);
+        let r = b.try_reserve(60).expect("room for 60");
+        assert_eq!(b.in_flight(), 60);
+        drop(r);
+        assert_eq!(b.in_flight(), 0, "drop must release held bytes");
+
+        // A subsequent reserve must observe the freed capacity.
+        let r2 = b.try_reserve(100).expect("full capacity is free");
+        assert_eq!(r2.held(), 100);
+    }
+
+    #[tokio::test]
+    async fn try_reserve_zero_bytes_returns_zero_reservation() {
+        let b = budget(100);
+        let _full = b.reserve(100).await;
+        // Zero-byte try-reserve admits unconditionally, like reserve.
+        let r = b.try_reserve(0).expect("zero-byte reserve always admits");
+        assert_eq!(r.held(), 0);
+        assert_eq!(b.in_flight(), 100);
+    }
+
+    #[tokio::test]
+    async fn try_reserve_drop_notifies_blocked_reserve() {
+        // Sanity that a try_reserve's reservation behaves like
+        // reserve's once dropped: notifies waiters so a parked
+        // reserve() unparks.
+        let b = budget(100);
+        let r1 = b.try_reserve(100).expect("first claim fits");
+
+        let b2 = Arc::clone(&b);
+        let (held_tx, held_rx) = tokio::sync::oneshot::channel();
+        let waiter = tokio::spawn(async move {
+            let _r = b2.reserve(50).await;
+            held_tx.send(()).expect("send held");
+        });
+
+        // Waiter must park behind the held claim.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!waiter.is_finished(), "must park behind held claim");
+
+        drop(r1);
+        tokio::time::timeout(Duration::from_secs(2), held_rx)
+            .await
+            .expect("waiter should wake within 2s")
+            .expect("waiter dropped channel");
+        waiter.await.expect("task panicked");
     }
 }
