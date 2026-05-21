@@ -2008,13 +2008,11 @@ async fn pipeline_admission_amortizes_manifest_gets() {
 /// in-flight descriptors hold 5 batch_permits, leaving 3 free —
 /// admission immediately runs a second cycle that acquires 3 gates
 /// (1 blocking + 2 try_acquire) and `next_descriptors` returns 0,
-/// adding 3 more releases (total = 6).
-///
-/// To keep the assertion deterministic, `poll_interval` is set to
-/// 60 s so a third cycle cannot fire during the assertion window:
-/// after cycle 2's empty-poll branch, the actor sleeps for 60 s
-/// before the next admission attempt. The test asserts on the
-/// post-cycle-2 frozen state.
+/// adding 3 more releases. Empty cycles can keep firing while the
+/// sink is parked; the test asserts the deterministic invariant
+/// `releases == 3 × calls` (or `3 × (calls-1)` for the brief window
+/// between cycle N's call-increment and release-increment), which
+/// holds under any number of follow-up empty cycles.
 #[tokio::test]
 async fn pipeline_admission_k_gt_1_releases_excess_permits() {
     let fx = in_memory_buffer_source(

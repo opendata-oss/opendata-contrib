@@ -390,6 +390,41 @@ adapter:
         assert_eq!(adapter.database, "responsive");
         assert_eq!(adapter.table, "logs");
         assert_eq!(adapter.adapter_version, 1);
+
+        // K>1 admission knob default; the YAML above does not set
+        // it, so the chart-side default (8) must come through.
+        // Bench dashboards depend on this default lining up with
+        // the runtime crate's default (also 8).
+        assert_eq!(cfg.runtime.max_descriptors_per_poll, 8);
+    }
+
+    /// Pin that an explicit YAML override for
+    /// `runtime.max_descriptors_per_poll` reaches the parsed
+    /// `RuntimeSection`. Catches a serde-rename or default-only
+    /// regression in the end-to-end YAML→ingestor wiring.
+    #[test]
+    fn runtime_max_descriptors_per_poll_override_parses() {
+        let yaml = r#"
+buffer:
+  manifest_path: m
+  data_prefix: d
+  object_store:
+    type: InMemory
+clickhouse:
+  endpoint: http://x:8123
+  database: db
+  table: t
+runtime:
+  max_descriptors_per_poll: 16
+ack:
+  policy: every_commit_group
+adapter:
+  adapter_version: 1
+  max_chunk_rows: 1
+  max_chunk_bytes: 1
+"#;
+        let cfg: IngestorConfig = serde_yaml::from_str(yaml).expect("parse");
+        assert_eq!(cfg.runtime.max_descriptors_per_poll, 16);
     }
 
     /// Row 8.4 wiring sanity: sink.serialization_format,

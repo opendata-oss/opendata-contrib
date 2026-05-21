@@ -379,4 +379,79 @@ mod tests {
             "missing stage-latency histogram sum. Output was:\n{buf}",
         );
     }
+
+    /// Pin the exact exported names for the K>1 admission metrics
+    /// added by phase06's K>1 follow-up. The bench dashboards and
+    /// the §10.4a paired K=1/K=8 reference run depend on these
+    /// exact strings; if a metric rename slips in, the bench
+    /// queries silently return no data and the run is invisible.
+    #[test]
+    fn admission_metrics_encode_with_expected_names() {
+        let metrics = Arc::new(RuntimeMetrics::new());
+        let mut registry = Registry::default();
+        metrics.register(&mut registry);
+
+        let labels = SourceLabels {
+            source: "buffer".into(),
+        };
+        // Cycle 1: 8 descriptors returned.
+        metrics
+            .admission_next_descriptors_calls
+            .get_or_create(&labels)
+            .inc();
+        metrics
+            .admission_descriptors_per_call
+            .get_or_create(&labels)
+            .observe(8.0);
+        // Cycle 2 (overshoot fixture): 3 gates released.
+        metrics
+            .admission_next_descriptors_calls
+            .get_or_create(&labels)
+            .inc();
+        metrics
+            .admission_descriptors_per_call
+            .get_or_create(&labels)
+            .observe(0.0);
+        metrics
+            .admission_extension_releases
+            .get_or_create(&labels)
+            .inc_by(3);
+
+        let mut buf = String::new();
+        encode(&mut buf, &registry).expect("encode");
+
+        assert!(
+            buf.contains(
+                "runtime_admission_next_descriptors_calls_total{source=\"buffer\"} 2"
+            ),
+            "missing admission-calls counter line. Output was:\n{buf}",
+        );
+        assert!(
+            buf.contains(
+                "runtime_admission_extension_releases_total{source=\"buffer\"} 3"
+            ),
+            "missing extension-releases counter line. Output was:\n{buf}",
+        );
+        // Two observations: 8.0 lands in the 8.0 bucket (and below);
+        // 0.0 lands in the 0.0 bucket (and all above). Both buckets
+        // 8.0 and +Inf see both samples → 2.
+        assert!(
+            buf.contains(
+                "runtime_admission_descriptors_per_call_bucket{le=\"8.0\",source=\"buffer\"} 2"
+            ),
+            "missing descriptors-per-call 8.0 bucket. Output was:\n{buf}",
+        );
+        assert!(
+            buf.contains(
+                "runtime_admission_descriptors_per_call_sum{source=\"buffer\"} 8.0"
+            ),
+            "missing descriptors-per-call sum. Output was:\n{buf}",
+        );
+        assert!(
+            buf.contains(
+                "runtime_admission_descriptors_per_call_count{source=\"buffer\"} 2"
+            ),
+            "missing descriptors-per-call count. Output was:\n{buf}",
+        );
+    }
 }
