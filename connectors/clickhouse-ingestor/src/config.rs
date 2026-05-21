@@ -143,6 +143,12 @@ pub struct RuntimeSection {
     pub decode_concurrency: u32,
     #[serde(default = "default_oversize_fault_multiplier")]
     pub oversize_fault_multiplier: u32,
+    /// Maximum descriptors requested per `next_descriptors` call in
+    /// the admission arm. Default `8`; amortizes the per-cycle
+    /// manifest GET across up to K descriptors. See
+    /// `plans/odb-high-throughput/phase06-k-gt-1-admission-impl.md`.
+    #[serde(default = "default_max_descriptors_per_poll")]
+    pub max_descriptors_per_poll: usize,
 }
 
 fn default_dry_run() -> bool {
@@ -177,6 +183,9 @@ fn default_decode_concurrency() -> u32 {
 }
 fn default_oversize_fault_multiplier() -> u32 {
     4
+}
+fn default_max_descriptors_per_poll() -> usize {
+    8
 }
 fn default_max_concurrent_commits() -> u32 {
     4

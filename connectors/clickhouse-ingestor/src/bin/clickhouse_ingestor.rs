@@ -153,7 +153,7 @@ async fn main() -> Result<()> {
         ack_flush_policy: cfg.ack_flush_policy(),
         dry_run: cfg.runtime.dry_run,
         poll_interval: std::time::Duration::from_millis(cfg.runtime.poll_interval_ms),
-        max_descriptors_per_poll: 1,
+        max_descriptors_per_poll: cfg.runtime.max_descriptors_per_poll,
         max_retry_attempts: cfg.runtime.retry_max_attempts,
         retry_backoff: std::time::Duration::from_millis(cfg.runtime.retry_initial_backoff_ms),
         // Phase 6 per-source backpressure knobs threaded from
