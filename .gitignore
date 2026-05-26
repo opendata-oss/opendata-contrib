@@ -2,3 +2,7 @@
 **/*.rs.bk
 Cargo.lock.bak
 .DS_Store
+
+# Generated benchmark run output (not source)
+bench-results/
+bench-artifacts/
