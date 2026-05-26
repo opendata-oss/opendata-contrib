@@ -140,7 +140,7 @@ struct SinkOutageSample {
 /// Run every scenario and write `correctness.json` +
 /// `metadata.json` + `raw/correctness/<check>_witness.jsonl`
 /// under `<run_dir>` (e.g.
-/// `bench-results/phase06/correctness-smoke/<UTC>-phase6-smoke/`).
+/// `bench-results/correctness-smoke/<UTC>-smoke/`).
 pub async fn run_smoke(run_dir: &Path) -> RuntimeResult<CorrectnessReport> {
     let started_at = now_rfc3339();
     let raw_dir = run_dir.join("raw").join("correctness");
@@ -203,8 +203,8 @@ pub async fn run_smoke(run_dir: &Path) -> RuntimeResult<CorrectnessReport> {
 
     let metadata = RunMetadata {
         schema_version: 2,
-        phase: "phase06-pipelined-runtime".into(),
-        unit_id: "6.6".into(),
+        phase: "pipelined-runtime".into(),
+        unit_id: "correctness-smoke".into(),
         unit_title: "Pipelined-runtime correctness smoke".into(),
         owner: "Correctness Implementor".into(),
         started_at,

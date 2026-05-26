@@ -1,7 +1,7 @@
 //! `clickhouse-ingestor-bench` binary. Runs the in-memory
 //! correctness smoke and writes `correctness.json` + witness JSONL
 //! files under
-//! `<bench-results-root>/phase06/correctness-smoke/<UTC>-phase6-smoke/`.
+//! `<bench-results-root>/correctness-smoke/<UTC>-smoke/`.
 //!
 //! Real perf-test runs against ClickHouse + S3 are operator work;
 //! the binary here is wired for the smoke run.
@@ -17,15 +17,14 @@ use clickhouse_ingestor_bench::correctness::{run_dir_timestamp, run_smoke};
     about = "Correctness smoke for the OpenData → ClickHouse runtime"
 )]
 struct Args {
-    /// Root directory for bench output. Defaults to
-    /// `plans/odb-high-throughput/bench-results/` relative to the
-    /// current working directory.
-    #[arg(long, default_value = "plans/odb-high-throughput/bench-results")]
+    /// Root directory for bench output. Defaults to `bench-results/`
+    /// relative to the current working directory.
+    #[arg(long, default_value = "bench-results")]
     bench_results_root: PathBuf,
 
     /// Optional override for the run directory name. Useful for
     /// CI to pin a stable name across runs; otherwise the bench
-    /// uses `<UTC>-phase6-smoke`.
+    /// uses `<UTC>-smoke`.
     #[arg(long)]
     run_name: Option<String>,
 }
@@ -43,10 +42,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let run_name = args
         .run_name
-        .unwrap_or_else(|| format!("{}-phase6-smoke", run_dir_timestamp()));
+        .unwrap_or_else(|| format!("{}-smoke", run_dir_timestamp()));
     let run_dir = args
         .bench_results_root
-        .join("phase06")
         .join("correctness-smoke")
         .join(&run_name);
     std::fs::create_dir_all(&run_dir)?;
