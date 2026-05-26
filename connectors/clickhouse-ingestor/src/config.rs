@@ -27,11 +27,6 @@
 //!   retry_max_attempts: 6
 //!   retry_initial_backoff_ms: 100
 //!
-//! commit_group:
-//!   max_rows: 100000
-//!   max_bytes: 33554432
-//!   max_age_ms: 1000
-//!
 //! ack:
 //!   policy: every_commit_group
 //!
@@ -40,6 +35,10 @@
 //!   max_chunk_rows: 100000
 //!   max_chunk_bytes: 33554432
 //! ```
+//!
+//! Chunking thresholds live in the `adapter:` section — they are a
+//! sink-internal concern. Older YAMLs that still set a top-level
+//! `commit_group:` block parse cleanly; the section is ignored.
 
 use std::path::Path;
 use std::time::Duration;
@@ -48,20 +47,21 @@ use figment::Figment;
 use figment::providers::{Env, Format, Yaml};
 use serde::{Deserialize, Serialize};
 
-use crate::ack::AckFlushPolicy;
 use crate::adapter::logs::LogsAdapterConfig;
-use crate::commit_group::CommitGroupThresholds;
 use crate::error::{IngestorError, IngestorResult};
-use crate::writer::WriterConfig;
+use crate::writer::{HttpClientMode, WriterConfig};
+use opendata_ingest_clickhouse::serializer::SerializationFormat;
+use opendata_ingest_runtime::runtime::AckFlushPolicy;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IngestorConfig {
     pub buffer: BufferSection,
     pub clickhouse: ClickHouseSection,
     pub runtime: RuntimeSection,
-    pub commit_group: CommitGroupSection,
     pub ack: AckSection,
     pub adapter: AdapterSection,
+    #[serde(default)]
+    pub sink: SinkSection,
     #[serde(default)]
     pub metrics_server: MetricsServerSection,
 }
@@ -123,6 +123,29 @@ pub struct RuntimeSection {
     pub retry_initial_backoff_ms: u64,
     #[serde(default = "default_request_timeout_secs")]
     pub request_timeout_secs: u64,
+    /// Per-source backpressure knobs. Defaults reproduce the
+    /// library's pipelined profile (`fetch_concurrency = 8`,
+    /// `decode_concurrency = 4`, `max_inflight_batches = 64`,
+    /// `max_inflight_bytes = 256 MiB`, `estimated_max_batch_bytes =
+    /// 4 MiB`, `oversize_fault_multiplier = 4`); an operator can
+    /// override per-deployment via `INGESTOR__RUNTIME__*` env or YAML.
+    #[serde(default = "default_max_inflight_batches")]
+    pub max_inflight_batches: u32,
+    #[serde(default = "default_max_inflight_bytes")]
+    pub max_inflight_bytes: u64,
+    #[serde(default = "default_estimated_max_batch_bytes")]
+    pub estimated_max_batch_bytes: u64,
+    #[serde(default = "default_fetch_concurrency")]
+    pub fetch_concurrency: u32,
+    #[serde(default = "default_decode_concurrency")]
+    pub decode_concurrency: u32,
+    #[serde(default = "default_oversize_fault_multiplier")]
+    pub oversize_fault_multiplier: u32,
+    /// Maximum descriptors requested per `next_descriptors` call in
+    /// the admission arm. Default `8`; amortizes the per-cycle
+    /// manifest GET across up to K descriptors.
+    #[serde(default = "default_max_descriptors_per_poll")]
+    pub max_descriptors_per_poll: usize,
 }
 
 fn default_dry_run() -> bool {
@@ -140,20 +163,56 @@ fn default_retry_backoff_ms() -> u64 {
 fn default_request_timeout_secs() -> u64 {
     30
 }
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CommitGroupSection {
-    pub max_rows: usize,
-    pub max_bytes: usize,
-    pub max_age_ms: u64,
+fn default_max_inflight_batches() -> u32 {
+    64
+}
+fn default_max_inflight_bytes() -> u64 {
+    256 * 1024 * 1024
+}
+fn default_estimated_max_batch_bytes() -> u64 {
+    4 * 1024 * 1024
+}
+fn default_fetch_concurrency() -> u32 {
+    8
+}
+fn default_decode_concurrency() -> u32 {
+    4
+}
+fn default_oversize_fault_multiplier() -> u32 {
+    4
+}
+fn default_max_descriptors_per_poll() -> usize {
+    8
+}
+fn default_max_concurrent_commits() -> u32 {
+    4
 }
 
-impl Default for CommitGroupSection {
+/// Sink-side knobs. The YAML `sink:` block is load-bearing:
+/// `serialization_format` and `http_client_mode` are wired
+/// end-to-end from here into the writer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SinkSection {
+    /// Cap on concurrent in-flight `Sink::write` calls. The runtime
+    /// applies a `.max(1)` floor, so 0 is treated as 1.
+    #[serde(default = "default_max_concurrent_commits")]
+    pub max_concurrent_commits: u32,
+    /// Wire format the writer hands ClickHouse for each chunk.
+    /// Default: `JsonEachRow`.
+    #[serde(default)]
+    pub serialization_format: SerializationFormat,
+    /// HTTP client management mode. Default: `PerCall`; `Pooled`
+    /// reuses a single client across calls.
+    #[serde(default)]
+    pub http_client_mode: HttpClientMode,
+}
+
+impl Default for SinkSection {
     fn default() -> Self {
         Self {
-            max_rows: 100_000,
-            max_bytes: 32 * 1024 * 1024,
-            max_age_ms: 1000,
+            max_concurrent_commits: default_max_concurrent_commits(),
+            serialization_format: SerializationFormat::default(),
+            http_client_mode: HttpClientMode::default(),
         }
     }
 }
@@ -220,14 +279,6 @@ impl IngestorConfig {
         Ok(cfg)
     }
 
-    pub fn commit_group_thresholds(&self) -> CommitGroupThresholds {
-        CommitGroupThresholds {
-            max_rows: self.commit_group.max_rows,
-            max_bytes: self.commit_group.max_bytes,
-            max_age: Duration::from_millis(self.commit_group.max_age_ms),
-        }
-    }
-
     pub fn ack_flush_policy(&self) -> AckFlushPolicy {
         match self.ack.policy {
             AckPolicyKind::EveryCommitGroup => AckFlushPolicy::EveryCommitGroup,
@@ -245,6 +296,8 @@ impl IngestorConfig {
             request_timeout: Duration::from_secs(self.runtime.request_timeout_secs),
             max_attempts: self.runtime.retry_max_attempts,
             initial_backoff: Duration::from_millis(self.runtime.retry_initial_backoff_ms),
+            serialization_format: self.sink.serialization_format,
+            http_client_mode: self.sink.http_client_mode.clone(),
         }
     }
 
@@ -267,6 +320,8 @@ mod tests {
 
     #[test]
     fn defaults_render_via_serde() {
+        // A `commit_group:` block from older YAMLs is parsed and
+        // silently ignored — chunking thresholds live under `adapter:`.
         let yaml = r#"
 buffer:
   manifest_path: ingest/otel/logs/manifest
@@ -300,13 +355,21 @@ adapter:
   max_chunk_bytes: 33554432
 "#;
         let cfg: IngestorConfig = serde_yaml::from_str(yaml).expect("parse");
-        let thresholds = cfg.commit_group_thresholds();
-        assert_eq!(thresholds.max_rows, 100_000);
-        assert_eq!(thresholds.max_age, Duration::from_secs(1));
 
         let writer = cfg.writer_config();
         assert_eq!(writer.endpoint, "http://localhost:8123");
         assert_eq!(writer.max_attempts, 6);
+        // SinkSection is absent in this YAML, so serde(default) on
+        // `IngestorConfig.sink` produces SinkSection::default(), and
+        // `writer_config()` propagates the enum defaults to the
+        // writer (JsonEachRow + PerCall). The bench harness's
+        // production-shaped defaults match these.
+        assert_eq!(
+            writer.serialization_format,
+            SerializationFormat::JsonEachRow
+        );
+        assert_eq!(writer.http_client_mode, HttpClientMode::PerCall);
+        assert_eq!(cfg.sink.max_concurrent_commits, 4);
 
         match cfg.ack_flush_policy() {
             AckFlushPolicy::EveryCommitGroup => {}
@@ -317,6 +380,107 @@ adapter:
         assert_eq!(adapter.database, "responsive");
         assert_eq!(adapter.table, "logs");
         assert_eq!(adapter.adapter_version, 1);
+
+        // Multi-descriptor admission knob default; the YAML above
+        // does not set it, so the default (8) must come through and
+        // match the runtime crate's own default (also 8).
+        assert_eq!(cfg.runtime.max_descriptors_per_poll, 8);
+    }
+
+    /// Pin that an explicit YAML override for
+    /// `runtime.max_descriptors_per_poll` reaches the parsed
+    /// `RuntimeSection`. Catches a serde-rename or default-only
+    /// regression in the end-to-end YAML→ingestor wiring.
+    #[test]
+    fn runtime_max_descriptors_per_poll_override_parses() {
+        let yaml = r#"
+buffer:
+  manifest_path: m
+  data_prefix: d
+  object_store:
+    type: InMemory
+clickhouse:
+  endpoint: http://x:8123
+  database: db
+  table: t
+runtime:
+  max_descriptors_per_poll: 16
+ack:
+  policy: every_commit_group
+adapter:
+  adapter_version: 1
+  max_chunk_rows: 1
+  max_chunk_bytes: 1
+"#;
+        let cfg: IngestorConfig = serde_yaml::from_str(yaml).expect("parse");
+        assert_eq!(cfg.runtime.max_descriptors_per_poll, 16);
+    }
+
+    /// Wiring sanity: sink.serialization_format,
+    /// sink.http_client_mode, and sink.max_concurrent_commits are
+    /// load-bearing — values set in the YAML `sink:` block reach the
+    /// writer rather than being overridden by a default.
+    #[test]
+    fn sink_section_wires_serialization_format_and_http_client_mode() {
+        let yaml = r#"
+buffer:
+  manifest_path: m
+  data_prefix: d
+  object_store:
+    type: InMemory
+clickhouse:
+  endpoint: http://x:8123
+  database: db
+  table: t
+runtime:
+  dry_run: true
+  poll_interval_ms: 250
+  retry_max_attempts: 6
+  retry_initial_backoff_ms: 100
+  request_timeout_secs: 30
+ack:
+  policy: every_commit_group
+adapter:
+  adapter_version: 1
+  max_chunk_rows: 1
+  max_chunk_bytes: 1
+sink:
+  max_concurrent_commits: 16
+  serialization_format: row_binary
+  http_client_mode:
+    mode: pooled
+    pool_max_idle_per_host: 32
+    pool_idle_timeout_ms: 30000
+"#;
+        let cfg: IngestorConfig = serde_yaml::from_str(yaml).expect("parse");
+        assert_eq!(cfg.sink.max_concurrent_commits, 16);
+        assert_eq!(
+            cfg.sink.serialization_format,
+            SerializationFormat::RowBinary
+        );
+        match &cfg.sink.http_client_mode {
+            HttpClientMode::Pooled {
+                pool_max_idle_per_host,
+                pool_idle_timeout_ms,
+            } => {
+                assert_eq!(*pool_max_idle_per_host, 32);
+                assert_eq!(*pool_idle_timeout_ms, 30000);
+            }
+            other => panic!("expected Pooled, got {other:?}"),
+        }
+
+        let writer = cfg.writer_config();
+        assert_eq!(writer.serialization_format, SerializationFormat::RowBinary);
+        match &writer.http_client_mode {
+            HttpClientMode::Pooled {
+                pool_max_idle_per_host,
+                pool_idle_timeout_ms,
+            } => {
+                assert_eq!(*pool_max_idle_per_host, 32);
+                assert_eq!(*pool_idle_timeout_ms, 30000);
+            }
+            other => panic!("expected Pooled, got {other:?}"),
+        }
     }
 
     #[test]

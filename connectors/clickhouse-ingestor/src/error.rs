@@ -1,16 +1,12 @@
-//! Top-level error type for the ingestor pipeline.
+//! Top-level error type for the ingestor binary's wiring code.
 //!
-//! Layer-specific error types (envelope, signal decoder, adapter, writer)
-//! all flow into [`IngestorError`] so the runtime loop can dispatch on a
-//! single error shape.
+//! Carries the variants the config loader and integration tests
+//! spell.
 
 use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum IngestorError {
-    #[error("buffer error: {0}")]
-    Buffer(#[from] buffer::Error),
-
     #[error("metadata envelope: {0}")]
     Envelope(#[from] crate::envelope::EnvelopeError),
 
