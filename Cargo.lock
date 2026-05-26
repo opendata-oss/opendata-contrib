@@ -2160,6 +2160,38 @@ dependencies = [
 ]
 
 [[package]]
+name = "opendata-ingest-clickhouse"
+version = "0.1.2"
+dependencies = [
+ "async-trait",
+ "hex",
+ "metrics",
+ "opendata-ingest-otel",
+ "opendata-ingest-runtime",
+ "prometheus-client",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "urlencoding",
+]
+
+[[package]]
+name = "opendata-ingest-otel"
+version = "0.1.2"
+dependencies = [
+ "bytes",
+ "hex",
+ "opendata-ingest-runtime",
+ "opentelemetry-proto",
+ "prost",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "opendata-ingest-runtime"
 version = "0.1.2"
 dependencies = [

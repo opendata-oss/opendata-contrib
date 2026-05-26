@@ -1,0 +1,27 @@
+[package]
+name = "opendata-ingest-clickhouse"
+version.workspace = true
+edition.workspace = true
+description = "ClickHouse sink plugin for the generic ingest runtime. Implements opendata_ingest_runtime::Sink. Houses the adapter, writer, and ClickHouse-specific config/metrics."
+license = "MIT"
+repository = "https://github.com/opendata-oss/opendata-contrib"
+
+[lib]
+name = "opendata_ingest_clickhouse"
+path = "src/lib.rs"
+
+[dependencies]
+async-trait = "0.1"
+hex = { workspace = true }
+metrics = { workspace = true }
+prometheus-client = { workspace = true }
+opendata-ingest-otel = { path = "../opendata-ingest-otel" }
+opendata-ingest-runtime = { path = "../../runtime/opendata-ingest-runtime" }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+urlencoding = { workspace = true }

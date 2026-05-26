@@ -1,0 +1,377 @@
+//! Adapter trait + ClickHouse-shaped insert plan types.
+//!
+//! Adapters consume a drained [`ClickHouseAdapterBatch`] and produce a
+//! deterministic sequence of [`InsertChunk`]s. Each chunk carries a
+//! per-chunk idempotency token of the form
+//! `{manifest}:{database}.{table}:{low}-{high}:{adapter_version}:{chunking_fingerprint}:{chunk_index}`,
+//! so a replay of the same Buffer sequence range under the same
+//! configuration produces identical tokens (and therefore deduplicates
+//! cleanly at the table level). Chunking shape and the chunking
+//! fingerprint are sink-internal concerns; the runtime hands the sink
+//! one [`opendata_ingest_runtime::sink::SinkCommit`] per source range
+//! and never inspects how the sink plans physical writes.
+
+pub mod logs;
+
+use std::collections::BTreeMap;
+
+use opendata_ingest_runtime::identity::CommitIdentity;
+use serde_json::Value as JsonValue;
+
+use thiserror::Error;
+
+#[derive(Debug, Error)]
+pub enum AdapterError {
+    #[error("adapter: {0}")]
+    Plan(String),
+}
+
+pub type AdapterResult<T> = Result<T, AdapterError>;
+
+/// One column value in an [`InsertChunk`] row. Aligns with the column
+/// types expected by the alpha logs DDL — primitive types, plus
+/// `Map(LowCardinality(String), String)` for OTLP attribute maps.
+#[derive(Debug, Clone)]
+pub enum RowValue {
+    String(String),
+    LowCardinalityString(String),
+    UInt8(u8),
+    Int32(i32),
+    UInt32(u32),
+    UInt64(u64),
+    Int64(i64),
+    DateTime64Nanos(u64),
+    /// `Nullable(DateTime64(9))` — used by the e2e latency
+    /// columns. `None` materializes the CH `NULL` literal in JSON and
+    /// the 1-byte null marker in RowBinary; `Some(ns)` writes the
+    /// value with the same i64-LE wire form as `DateTime64Nanos`.
+    NullableDateTime64Nanos(Option<u64>),
+    StringMap(BTreeMap<String, String>),
+}
+
+impl RowValue {
+    /// Serialize this value into the JSONEachRow payload. The alpha
+    /// writer uses JSONEachRow to keep `Map` columns straightforward;
+    /// switching to `RowBinaryWithNamesAndTypes` is a future
+    /// optimization (see RFC 0001 future improvements).
+    pub fn to_json(&self) -> JsonValue {
+        match self {
+            RowValue::String(s) | RowValue::LowCardinalityString(s) => JsonValue::String(s.clone()),
+            RowValue::UInt8(v) => JsonValue::from(*v),
+            RowValue::Int32(v) => JsonValue::from(*v),
+            RowValue::UInt32(v) => JsonValue::from(*v),
+            RowValue::UInt64(v) => JsonValue::from(*v),
+            RowValue::Int64(v) => JsonValue::from(*v),
+            // ClickHouse accepts a string literal for DateTime64(9). We
+            // emit ISO-8601 with nanosecond precision.
+            RowValue::DateTime64Nanos(ns) => JsonValue::String(format_datetime64_ns(*ns)),
+            RowValue::NullableDateTime64Nanos(None) => JsonValue::Null,
+            RowValue::NullableDateTime64Nanos(Some(ns)) => {
+                JsonValue::String(format_datetime64_ns(*ns))
+            }
+            RowValue::StringMap(m) => {
+                let mut obj = serde_json::Map::with_capacity(m.len());
+                for (k, v) in m {
+                    obj.insert(k.clone(), JsonValue::String(v.clone()));
+                }
+                JsonValue::Object(obj)
+            }
+        }
+    }
+
+    /// Append this value's RowBinary encoding to `out` per the
+    /// ClickHouse RowBinary spec. Used by the RowBinary serializer.
+    ///
+    /// * `String` / `LowCardinality(String)` — LEB128 length, then bytes.
+    /// * `UInt8`  — 1 byte LE.
+    /// * `UInt32` — 4 bytes LE.
+    /// * `UInt64` — 8 bytes LE.
+    /// * `Int32`  — 4 bytes LE (two's complement).
+    /// * `Int64`  — 8 bytes LE (two's complement).
+    /// * `DateTime64(9)` — 8 bytes LE, i64 nanoseconds since Unix epoch.
+    /// * `Map(K, V)` — LEB128 count, then alternating K, V (each
+    ///   encoded per its own type rule). Order follows the
+    ///   `BTreeMap` iteration order (lexicographic on key).
+    pub fn write_row_binary(&self, out: &mut Vec<u8>) {
+        match self {
+            RowValue::String(s) | RowValue::LowCardinalityString(s) => {
+                write_varuint(out, s.len() as u64);
+                out.extend_from_slice(s.as_bytes());
+            }
+            RowValue::UInt8(v) => out.push(*v),
+            RowValue::Int32(v) => out.extend_from_slice(&v.to_le_bytes()),
+            RowValue::UInt32(v) => out.extend_from_slice(&v.to_le_bytes()),
+            RowValue::UInt64(v) => out.extend_from_slice(&v.to_le_bytes()),
+            RowValue::Int64(v) => out.extend_from_slice(&v.to_le_bytes()),
+            RowValue::DateTime64Nanos(ns) => {
+                // Wire encoding is i64 ns. `DateTime64Nanos` is stored
+                // as u64 (matches OTLP's time_unix_nano shape); cast to
+                // i64 for the wire. Real-world timestamps fit i64.
+                let signed = *ns as i64;
+                out.extend_from_slice(&signed.to_le_bytes());
+            }
+            RowValue::NullableDateTime64Nanos(opt) => {
+                // CH RowBinary Nullable(T): one byte null-marker
+                // (0 = not null, 1 = null), then T's encoding if not
+                // null. When null, the value field is omitted entirely.
+                match opt {
+                    None => out.push(1),
+                    Some(ns) => {
+                        out.push(0);
+                        let signed = *ns as i64;
+                        out.extend_from_slice(&signed.to_le_bytes());
+                    }
+                }
+            }
+            RowValue::StringMap(m) => {
+                write_varuint(out, m.len() as u64);
+                for (k, v) in m {
+                    write_varuint(out, k.len() as u64);
+                    out.extend_from_slice(k.as_bytes());
+                    write_varuint(out, v.len() as u64);
+                    out.extend_from_slice(v.as_bytes());
+                }
+            }
+        }
+    }
+}
+
+/// LEB128 unsigned varint encoding. ClickHouse RowBinary header
+/// and `String` / `Map` length prefixes use this.
+pub fn write_varuint(out: &mut Vec<u8>, mut value: u64) {
+    loop {
+        let byte = (value & 0x7F) as u8;
+        value >>= 7;
+        if value == 0 {
+            out.push(byte);
+            return;
+        }
+        out.push(byte | 0x80);
+    }
+}
+
+fn format_datetime64_ns(unix_nanos: u64) -> String {
+    // ClickHouse accepts ISO-8601 strings with nanosecond precision when
+    // inserting into DateTime64(9). We format as
+    // YYYY-MM-DD HH:MM:SS.NNNNNNNNN UTC.
+    let secs = (unix_nanos / 1_000_000_000) as i64;
+    let nanos = (unix_nanos % 1_000_000_000) as u32;
+
+    chrono_internal::format(secs, nanos)
+}
+
+/// Minimal date/time formatting helper. We avoid taking a hard
+/// dependency on `chrono` here by hand-rolling the small ISO-8601
+/// formatter we need. ClickHouse accepts both
+/// `YYYY-MM-DD HH:MM:SS.NNNNNNNNN` and ISO-8601 `T`-separated forms; we
+/// use the first because it round-trips through `parseDateTimeBestEffort`.
+mod chrono_internal {
+    pub fn format(secs: i64, nanos: u32) -> String {
+        let (year, month, day, hour, minute, second) = parts(secs);
+        format!(
+            "{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:09}",
+            year, month, day, hour, minute, second, nanos
+        )
+    }
+
+    fn is_leap(year: i64) -> bool {
+        (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
+    }
+
+    fn days_in_month(year: i64, month: u32) -> u32 {
+        match month {
+            1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+            4 | 6 | 9 | 11 => 30,
+            2 => {
+                if is_leap(year) {
+                    29
+                } else {
+                    28
+                }
+            }
+            _ => 0,
+        }
+    }
+
+    fn parts(secs: i64) -> (i64, u32, u32, u32, u32, u32) {
+        let day_seconds = 86_400i64;
+        let mut days = secs.div_euclid(day_seconds);
+        let mut sec_of_day = secs.rem_euclid(day_seconds);
+        let hour = (sec_of_day / 3600) as u32;
+        sec_of_day %= 3600;
+        let minute = (sec_of_day / 60) as u32;
+        let second = (sec_of_day % 60) as u32;
+
+        // Days since 1970-01-01.
+        let mut year: i64 = 1970;
+        loop {
+            let dy = if is_leap(year) { 366 } else { 365 };
+            if days >= dy {
+                days -= dy;
+                year += 1;
+            } else if days < 0 {
+                year -= 1;
+                let dy_prev = if is_leap(year) { 366 } else { 365 };
+                days += dy_prev;
+            } else {
+                break;
+            }
+        }
+        let mut month: u32 = 1;
+        loop {
+            let dim = days_in_month(year, month) as i64;
+            if days >= dim {
+                days -= dim;
+                month += 1;
+            } else {
+                break;
+            }
+        }
+        let day = (days + 1) as u32;
+        (year, month, day, hour, minute, second)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn unix_epoch_is_1970_01_01() {
+            assert_eq!(format(0, 0), "1970-01-01 00:00:00.000000000");
+        }
+
+        #[test]
+        fn known_timestamp() {
+            // 2023-11-14 22:13:20 UTC == 1700000000
+            assert_eq!(format(1_700_000_000, 0), "2023-11-14 22:13:20.000000000");
+        }
+
+        #[test]
+        fn leap_year_handling() {
+            // 2020-02-29 00:00:00 UTC == 1582934400
+            assert_eq!(format(1_582_934_400, 0), "2020-02-29 00:00:00.000000000");
+        }
+    }
+}
+
+/// ClickHouse settings that the writer should set for an insert chunk.
+#[derive(Debug, Clone, Default)]
+pub struct ClickHouseSettings {
+    pub insert_quorum: Option<String>,
+    /// `insert_deduplication_token`. Always populated by the adapter
+    /// for traceability; the writer applies it to the insert only when
+    /// `apply_deduplication_token` is true. ClickHouse historically
+    /// only honors the setting on `Replicated*` engines; for a plain
+    /// `ReplacingMergeTree` it can be a no-op or, in some versions,
+    /// reject the insert silently.
+    pub insert_deduplication_token: String,
+    /// Whether the writer should set `insert_deduplication_token` on
+    /// the request. Default true (keeps the alpha guarantee). Set
+    /// false against non-replicated test deployments.
+    pub apply_deduplication_token: bool,
+}
+
+/// One ClickHouse insert request.
+#[derive(Debug, Clone)]
+pub struct InsertChunk {
+    pub database: String,
+    pub table: String,
+    pub columns: Vec<&'static str>,
+    pub rows: Vec<Vec<RowValue>>,
+    pub settings: ClickHouseSettings,
+    pub idempotency_token: String,
+    pub chunk_index: u32,
+    pub observability_labels: Vec<(&'static str, String)>,
+}
+
+impl InsertChunk {
+    pub fn rows_count(&self) -> usize {
+        self.rows.len()
+    }
+}
+
+/// Planning batch handed to a ClickHouse [`Adapter`] — sink-internal
+/// shape that lifts a [`SinkCommit`]'s decoded records plus its
+/// runtime commit identity into a form the adapter can chunk over.
+/// The source range carried inside `identity.range` is the canonical
+/// `low`/`high` for token construction (RFC 0002 §Runtime/Sink
+/// Boundary: sinks derive physical tokens from `CommitIdentity` plus
+/// the sink's own adapter configuration). `bytes` is the cumulative
+/// approximate decoded byte size, used by the adapter's byte-aware
+/// chunker.
+///
+/// [`SinkCommit`]: opendata_ingest_runtime::sink::SinkCommit
+#[derive(Debug, Clone)]
+pub struct ClickHouseAdapterBatch<R> {
+    pub identity: CommitIdentity,
+    pub records: Vec<R>,
+    pub bytes: usize,
+}
+
+pub trait Adapter {
+    type Input;
+
+    /// Plan a deterministic sequence of insert chunks from the
+    /// adapter-internal batch. Implementations must satisfy:
+    ///
+    /// 1. Chunking is a pure function of `(records, configured_thresholds)`.
+    /// 2. The same `(low_sequence, high_sequence, chunk_index)` tuple
+    ///    always produces the same rows on a replay.
+    /// 3. Each chunk's `idempotency_token` is unique within the batch and
+    ///    follows the format documented in RFC 0002.
+    fn plan(&self, batch: ClickHouseAdapterBatch<Self::Input>) -> AdapterResult<Vec<InsertChunk>>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn datetime64_format_round_trips_for_nanos() {
+        let ns: u64 = 1_700_000_000_123_456_789;
+        let s = format_datetime64_ns(ns);
+        assert_eq!(s, "2023-11-14 22:13:20.123456789");
+    }
+
+    #[test]
+    fn row_value_stringmap_serializes_to_object() {
+        let mut m = BTreeMap::new();
+        m.insert("k".to_string(), "v".to_string());
+        let json = RowValue::StringMap(m).to_json();
+        assert_eq!(json.as_object().unwrap().get("k").unwrap(), "v");
+    }
+
+    // Nullable(DateTime64(9)) encoding.
+
+    #[test]
+    fn nullable_datetime64_some_json_is_iso8601() {
+        let json = RowValue::NullableDateTime64Nanos(Some(1_700_000_000_123_456_789)).to_json();
+        assert_eq!(json.as_str().unwrap(), "2023-11-14 22:13:20.123456789");
+    }
+
+    #[test]
+    fn nullable_datetime64_none_json_is_null() {
+        let json = RowValue::NullableDateTime64Nanos(None).to_json();
+        assert!(json.is_null(), "expected JSON null, got {json:?}");
+    }
+
+    #[test]
+    fn nullable_datetime64_some_row_binary_byte_layout() {
+        let mut buf = Vec::new();
+        // Pick a value with distinctive bytes so the LE order is
+        // visually obvious in the assertion.
+        RowValue::NullableDateTime64Nanos(Some(0x1234_5678_9abc_def0)).write_row_binary(&mut buf);
+        assert_eq!(
+            buf,
+            vec![0x00, 0xf0, 0xde, 0xbc, 0x9a, 0x78, 0x56, 0x34, 0x12],
+            "expected 1-byte not-null marker (0x00) followed by i64 LE bytes",
+        );
+    }
+
+    #[test]
+    fn nullable_datetime64_none_row_binary_is_single_null_byte() {
+        let mut buf = Vec::new();
+        RowValue::NullableDateTime64Nanos(None).write_row_binary(&mut buf);
+        assert_eq!(buf, vec![0x01], "null marker alone, no value bytes");
+    }
+}
