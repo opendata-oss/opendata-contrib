@@ -1,0 +1,2134 @@
+//! Pipeline-specific integration tests.
+//!
+//! Each test pins one named pipeline-correctness invariant (admission
+//! ordering under parallel fetch, byte-budget reconciliation,
+//! graceful drain, and so on).
+
+#[path = "support/mod.rs"]
+mod support;
+
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::time::Duration;
+
+use bytes::Bytes;
+use opendata_ingest_runtime::envelope::{ConfiguredEnvelope, PayloadEncoding, SignalType};
+use opendata_ingest_runtime::runtime::{
+    AckFlushPolicy, AckThroughRecorder, AdmissionRecorder, Runtime, RuntimeOptions,
+    SinkPoolOptions, SourceBackpressureOptions, TestFetchKillswitch,
+};
+use opendata_ingest_runtime::source::SourceId;
+use tokio::time::timeout;
+use tokio_util::sync::CancellationToken;
+
+use std::sync::atomic::Ordering;
+
+use opendata_ingest_runtime::metrics::{RuntimeMetrics, SourceLabels};
+use support::{
+    FakeDecoder, FakeSink, ProgrammableSink, ScriptedWrite, counting_in_memory_buffer_source,
+    in_memory_buffer_source, logs_envelope,
+};
+
+fn options_with_fetch_concurrency(fetch_concurrency: u32) -> RuntimeOptions {
+    RuntimeOptions {
+        configured_envelope: ConfiguredEnvelope {
+            version: 1,
+            signal_type: SignalType::Logs,
+            encoding: PayloadEncoding::OtlpProtobuf,
+        },
+        ack_flush_policy: AckFlushPolicy::EveryCommitGroup,
+        dry_run: false,
+        poll_interval: Duration::from_millis(2),
+        max_descriptors_per_poll: 1,
+        max_retry_attempts: 0,
+        retry_backoff: Duration::from_millis(0),
+        source_defaults: SourceBackpressureOptions {
+            fetch_concurrency,
+            // The `serial()` profile is too tight under
+            // parallelism: max_inflight_batches = 1 forces admission
+            // to wait for each commit before issuing the next one.
+            // Bump up so the actor can queue ahead of the fetch
+            // pool and exercise the structural admission ordering.
+            max_inflight_batches: 16,
+            ..SourceBackpressureOptions::default()
+        },
+        source_overrides: Default::default(),
+        sink: SinkPoolOptions::default(),
+    }
+}
+
+/// INV-ADMISSION-CONTIGUOUS under parallel fetch.
+///
+/// Run 100 source batches through the runtime with
+/// `fetch_concurrency = 4` and a synthetic fetch-delay function
+/// that injects alternating fast / slow latencies. Even sequences
+/// fetch at ~1 ms; odd sequences at ~10 ms. The 10× spread forces
+/// fetch completion order to drift relative to admission order
+/// (slow-fetching workers will fall behind), but the actor's
+/// admission arm runs synchronously between `next_descriptors`
+/// and `descriptor_tx.send`, so `register_pending` is called in
+/// admission order regardless of downstream completion ordering.
+///
+/// Assertion: the admission recorder observes `(buffer, 0)`,
+/// `(buffer, 1)`, …, `(buffer, 99)` in strict order.
+#[tokio::test]
+async fn pipeline_register_pending_called_in_admission_order() {
+    let fx = in_memory_buffer_source(
+        "ingest/test/pipeline/admission-order/manifest",
+        "ingest/test/pipeline/admission-order/data",
+    )
+    .await;
+    let batch_count = 100u64;
+    for i in 0..batch_count {
+        fx.producer
+            .produce(
+                vec![Bytes::from(format!("payload-{i}").into_bytes())],
+                logs_envelope(),
+            )
+            .await
+            .expect("produce");
+        fx.producer.flush().await.expect("flush");
+    }
+
+    let sink = FakeSink::new("fake-sink");
+    let captured = Arc::clone(&sink.captured);
+
+    let recorder: AdmissionRecorder = Arc::new(Mutex::new(Vec::new()));
+    let recorder_runtime = Arc::clone(&recorder);
+
+    // Uneven fetch latency: alternating fast/slow by sequence
+    // parity. The spread is large enough that parallel fetch
+    // workers reorder completion relative to admission, but the
+    // admission arm is structurally serial.
+    let delay_fn: Arc<dyn Fn(u64) -> Duration + Send + Sync> = Arc::new(|seq: u64| {
+        if seq.is_multiple_of(2) {
+            Duration::from_millis(1)
+        } else {
+            Duration::from_millis(10)
+        }
+    });
+
+    let runtime = Runtime::builder()
+        .add_source(fx.source)
+        .add_decoder(FakeDecoder::permissive())
+        .set_sink(sink)
+        .with_options(options_with_fetch_concurrency(4))
+        .with_admission_recorder(recorder_runtime)
+        .with_test_fetch_delay(delay_fn)
+        .build()
+        .expect("build");
+    let mut progress_rx = runtime.progress();
+
+    let shutdown = CancellationToken::new();
+    let shutdown_run = shutdown.clone();
+    let handle = tokio::spawn(async move { runtime.run(shutdown_run).await });
+
+    timeout(Duration::from_secs(30), async {
+        loop {
+            progress_rx
+                .changed()
+                .await
+                .expect("progress channel closed");
+            let p = *progress_rx.borrow();
+            if p.source_ranges_committed >= batch_count {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("runtime did not commit all batches in time");
+
+    shutdown.cancel();
+    handle
+        .await
+        .expect("runtime task join")
+        .expect("runtime exited cleanly");
+
+    let events = recorder.lock().unwrap().clone();
+    assert_eq!(
+        events.len(),
+        batch_count as usize,
+        "recorder should observe one (source, seq) per source batch",
+    );
+    let expected: Vec<(SourceId, u64)> = (0..batch_count)
+        .map(|i| (SourceId::from("buffer"), i))
+        .collect();
+    assert_eq!(
+        events, expected,
+        "INV-ADMISSION-CONTIGUOUS: admission arm must call \
+         register_pending in source-sequence order regardless of \
+         per-worker fetch latency"
+    );
+
+    // Sanity: every batch reached the sink exactly once with the
+    // expected range. Captures arrive in fetch-completion order
+    // (not source-sequence order) under parallel fetch, so sort
+    // before checking range coverage.
+    let mut committed = captured.lock().unwrap().clone();
+    committed.sort_by_key(|c| c.low_sequence);
+    assert_eq!(committed.len(), batch_count as usize);
+    for (i, c) in committed.iter().enumerate() {
+        assert_eq!(c.low_sequence, i as u64);
+        assert_eq!(c.high_sequence, i as u64);
+    }
+
+    fx.producer.close().await.expect("close producer");
+}
+
+/// Ack-correctness invariant under `fetch_concurrency = 8`. Every
+/// ack-correctness test must pass under parallel fetch; this is the
+/// smoke version — three batches, NotCommitted/NotCommitted/Ok
+/// script, 8 fetch workers. Acks land only after the Ok lands;
+/// identity stays byte-identical across retries.
+#[tokio::test]
+async fn pipeline_ack_correctness_under_fetch_concurrency_8() {
+    use opendata_ingest_runtime::sink::CommitStatus;
+    use opendata_ingest_runtime::sink::SinkId;
+    use support::{ProgrammableSink, ScriptedWrite};
+
+    let fx = in_memory_buffer_source(
+        "ingest/test/pipeline/concurrent-ack/manifest",
+        "ingest/test/pipeline/concurrent-ack/data",
+    )
+    .await;
+    fx.producer
+        .produce(vec![Bytes::from_static(b"payload")], logs_envelope())
+        .await
+        .expect("produce");
+    fx.producer.flush().await.expect("flush");
+
+    let sink = ProgrammableSink::new(
+        SinkId::from("programmable"),
+        vec![
+            ScriptedWrite::NotCommitted {
+                message: "transient".into(),
+            },
+            ScriptedWrite::NotCommitted {
+                message: "transient".into(),
+            },
+            ScriptedWrite::Ok { rows_written: 1 },
+        ],
+        CommitStatus::Unknown,
+    );
+    let writes = Arc::clone(&sink.write_calls);
+
+    let mut opts = options_with_fetch_concurrency(8);
+    opts.max_retry_attempts = 3;
+
+    let runtime = Runtime::builder()
+        .add_source(fx.source)
+        .add_decoder(FakeDecoder::permissive())
+        .set_sink(sink)
+        .with_options(opts)
+        .build()
+        .expect("build");
+    let mut progress_rx = runtime.progress();
+
+    let shutdown = CancellationToken::new();
+    let shutdown_run = shutdown.clone();
+    let handle = tokio::spawn(async move { runtime.run(shutdown_run).await });
+
+    timeout(Duration::from_secs(10), async {
+        loop {
+            progress_rx
+                .changed()
+                .await
+                .expect("progress channel closed");
+            if progress_rx.borrow().last_acked_sequence == Some(0) {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("runtime did not advance ack frontier");
+
+    shutdown.cancel();
+    handle
+        .await
+        .expect("runtime task join")
+        .expect("runtime exited cleanly");
+
+    let (write_count, identity_count) = {
+        let write_calls = writes.lock().unwrap();
+        let count = write_calls.len();
+        let identities: std::collections::HashSet<_> =
+            write_calls.iter().map(|w| w.identity.clone()).collect();
+        (count, identities.len())
+    };
+    assert_eq!(write_count, 3, "two retries before Ok");
+    assert_eq!(
+        identity_count, 1,
+        "INV-SINK-RETRY-IDEMPOTENT: identity stable across retries",
+    );
+
+    fx.producer.close().await.expect("close producer");
+}
+
+mod large_records {
+    use std::any::Any;
+    use std::sync::Arc;
+
+    use async_trait::async_trait;
+    use opendata_ingest_runtime::decoded_batch::{
+        BatchStats, DecodedBatch, DecodedRecords, SourceCoordinateColumns, TypedRecords,
+        TypedSchema,
+    };
+    use opendata_ingest_runtime::decoder::Decoder;
+    use opendata_ingest_runtime::envelope::MetadataEnvelope;
+    use opendata_ingest_runtime::error::RuntimeResult;
+    use opendata_ingest_runtime::identity::SchemaVersion;
+    use opendata_ingest_runtime::source::SourceBatch;
+
+    /// `TypedRecords` impl that reports a controllable
+    /// `estimated_bytes`. Used by the byte-budget reconciliation
+    /// test to drive the post-decode total above the pessimistic
+    /// admission reservation.
+    pub struct LargeRecords {
+        schema: TypedSchema,
+        count: usize,
+        bytes: usize,
+    }
+
+    impl LargeRecords {
+        pub fn new(count: usize, bytes: usize) -> Self {
+            Self {
+                schema: TypedSchema {
+                    name: "test.large.v1".into(),
+                    version: SchemaVersion(1),
+                },
+                count,
+                bytes,
+            }
+        }
+    }
+
+    impl TypedRecords for LargeRecords {
+        fn record_count(&self) -> usize {
+            self.count
+        }
+        fn estimated_bytes(&self) -> usize {
+            self.bytes
+        }
+        fn schema(&self) -> &TypedSchema {
+            &self.schema
+        }
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    /// Decoder that emits one `DecodedBatch` with the configured
+    /// `estimated_bytes` reported by `LargeRecords`. Otherwise
+    /// identical to `FakeDecoder`.
+    pub struct LargeDecoder {
+        pub bytes_per_batch: usize,
+    }
+
+    #[async_trait]
+    impl Decoder for LargeDecoder {
+        fn accepts(&self, _envelope: &MetadataEnvelope) -> bool {
+            true
+        }
+
+        fn decode(&self, batch: SourceBatch) -> RuntimeResult<Vec<DecodedBatch>> {
+            let entry_count = batch.entries.len();
+            let source = batch.source.clone();
+            let sequence = batch.sequence;
+            let source_columns = SourceCoordinateColumns {
+                manifest_path: batch.manifest_path.clone(),
+                data_path: batch.data_object_path.clone(),
+                sequences: vec![sequence; entry_count],
+                entry_indices: (0..entry_count as u32).collect(),
+                record_indices: vec![0; entry_count],
+                ingestion_time_ms: batch.entries.iter().map(|e| e.ingestion_time_ms).collect(),
+            };
+            Ok(vec![DecodedBatch {
+                source,
+                low_sequence: sequence,
+                high_sequence: sequence,
+                source_entry_count: entry_count as u32,
+                records: DecodedRecords::Typed(Arc::new(LargeRecords::new(
+                    entry_count,
+                    self.bytes_per_batch,
+                ))),
+                source_columns,
+                stats: BatchStats {
+                    source_byte_count: 0,
+                    decoded_byte_estimate: self.bytes_per_batch as u64,
+                },
+                schema_version: SchemaVersion(1),
+            }])
+        }
+    }
+}
+
+/// Metrics smoke: drives a 10-batch pipeline through the full stage
+/// matrix so every metric emission site (queue depth, latency,
+/// inflight bytes, ack frontier, pending ranges, sink commits,
+/// descriptors handed out, ack lag) runs at least once. We don't
+/// snapshot the values — `metrics::with_local_recorder` is
+/// thread-local while the workers are spawned via `tokio::spawn`, so
+/// a `DebuggingRecorder`-based assertion is brittle across the worker
+/// boundary. The benchmark harness uses a process-level recorder
+/// against a real Prometheus endpoint where the named series are
+/// visible end to end.
+#[tokio::test]
+async fn pipeline_metric_emission_smoke_10_batches() {
+    let fx = in_memory_buffer_source(
+        "ingest/test/pipeline/metrics-smoke/manifest",
+        "ingest/test/pipeline/metrics-smoke/data",
+    )
+    .await;
+    for i in 0..10u64 {
+        fx.producer
+            .produce(
+                vec![Bytes::from(format!("payload-{i}").into_bytes())],
+                logs_envelope(),
+            )
+            .await
+            .expect("produce");
+        fx.producer.flush().await.expect("flush");
+    }
+
+    let sink = FakeSink::new("fake-sink");
+
+    let runtime = Runtime::builder()
+        .add_source(fx.source)
+        .add_decoder(FakeDecoder::permissive())
+        .set_sink(sink)
+        .with_options(options_with_fetch_concurrency(4))
+        .build()
+        .expect("build");
+    let mut progress_rx = runtime.progress();
+
+    let shutdown = CancellationToken::new();
+    let shutdown_run = shutdown.clone();
+    let handle = tokio::spawn(async move { runtime.run(shutdown_run).await });
+
+    timeout(Duration::from_secs(10), async {
+        loop {
+            progress_rx.changed().await.expect("progress closed");
+            if progress_rx.borrow().source_ranges_committed >= 10 {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("runtime should commit all 10 batches");
+
+    shutdown.cancel();
+    handle
+        .await
+        .expect("runtime task join")
+        .expect("runtime exited cleanly");
+
+    fx.producer.close().await.expect("close producer");
+}
+
+/// Graceful drain completes in-flight commits.
+///
+/// Run the pipeline against 20 source batches; gate the sink so
+/// all 20 admit and queue ahead of the write stage; cancel the
+/// external shutdown token while writes are parked; release the
+/// sink. Assert: the runtime returns `Ok(())`; every admitted unit
+/// produced exactly one `Sink::write` call; the final progress
+/// snapshot's `last_acked_sequence` equals the highest committed
+/// sequence (19); the durable Buffer ack frontier reflects the
+/// same.
+#[tokio::test]
+async fn pipeline_graceful_drain_completes_inflight_commits() {
+    use opendata_ingest_runtime::sink::{CommitStatus, SinkId};
+    use support::{ProgrammableSink, ScriptedWrite};
+
+    let fx = in_memory_buffer_source(
+        "ingest/test/pipeline/graceful-drain/manifest",
+        "ingest/test/pipeline/graceful-drain/data",
+    )
+    .await;
+    let batch_count = 20u64;
+    for i in 0..batch_count {
+        fx.producer
+            .produce(
+                vec![Bytes::from(format!("payload-{i}").into_bytes())],
+                logs_envelope(),
+            )
+            .await
+            .expect("produce");
+        fx.producer.flush().await.expect("flush");
+    }
+
+    let sink = ProgrammableSink::new(
+        SinkId::from("programmable"),
+        (0..batch_count)
+            .map(|_| ScriptedWrite::Ok { rows_written: 1 })
+            .collect(),
+        CommitStatus::Unknown,
+    );
+    let token = sink.block_until_released(true);
+    let write_calls = Arc::clone(&sink.write_calls);
+
+    let recorder: AdmissionRecorder = Arc::new(Mutex::new(Vec::new()));
+    let recorder_runtime = Arc::clone(&recorder);
+
+    let mut opts = options_with_fetch_concurrency(4);
+    opts.source_defaults = SourceBackpressureOptions {
+        max_inflight_batches: batch_count as u32,
+        fetch_concurrency: 4,
+        decode_concurrency: 2,
+        ..SourceBackpressureOptions::default()
+    };
+    opts.sink = SinkPoolOptions {
+        max_concurrent_commits: 4,
+        ..SinkPoolOptions::default()
+    };
+
+    let runtime = Runtime::builder()
+        .add_source(fx.source)
+        .add_decoder(FakeDecoder::permissive())
+        .set_sink(sink)
+        .with_options(opts)
+        .with_admission_recorder(recorder_runtime)
+        .build()
+        .expect("build");
+    let mut progress_rx = runtime.progress();
+
+    let shutdown = CancellationToken::new();
+    let shutdown_run = shutdown.clone();
+    let handle = tokio::spawn(async move { runtime.run(shutdown_run).await });
+
+    // Wait until all 20 batches have admitted (the recorder is
+    // updated synchronously in the actor's admission arm — the
+    // gated sink keeps everything piled up downstream). Once the
+    // recorder is full, the admission stage has finished its
+    // work and the in-flight units are stalled on the sink write.
+    timeout(Duration::from_secs(10), async {
+        loop {
+            if recorder.lock().unwrap().len() >= batch_count as usize {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("all batches should admit while sink is gated");
+
+    // Cancel admission with units still in-flight. Then release
+    // the sink so the in-flight units can drain.
+    shutdown.cancel();
+    drop(token);
+
+    let result = timeout(Duration::from_secs(15), handle)
+        .await
+        .expect("runtime should drain in-flight commits and exit Ok")
+        .expect("runtime task join");
+    result.expect("runtime exited cleanly");
+
+    // Final progress snapshot.
+    let p = *progress_rx.borrow_and_update();
+    assert_eq!(
+        p.source_ranges_committed, batch_count,
+        "every admitted unit must finish during graceful drain",
+    );
+    assert_eq!(
+        p.last_acked_sequence,
+        Some(batch_count - 1),
+        "durable ack frontier should equal the highest committed sequence",
+    );
+
+    let write_count = write_calls.lock().unwrap().len();
+    assert_eq!(
+        write_count, batch_count as usize,
+        "every admitted unit produced exactly one Sink::write call",
+    );
+
+    fx.producer.close().await.expect("close producer");
+}
+
+/// Oversize-fault gate. The decoder produces a `DecodedBatch`
+/// whose `estimated_bytes` is well above
+/// `estimated_max_batch_bytes × oversize_fault_multiplier`; the
+/// decode worker emits `RuntimeError::Pipeline("oversize decoded
+/// batch: …")`. Pins the worst-case over-subscription cap
+/// (`SourceBackpressureOptions::oversize_fault_multiplier`).
+/// Also asserts the saturating-mul edge case: with both
+/// `estimated_max_batch_bytes = u64::MAX` and
+/// `oversize_fault_multiplier = u32::MAX` the fault must not fire
+/// (effective limit = `u64::MAX`, so any actual size is below).
+#[tokio::test]
+async fn pipeline_oversize_decoded_batch_halts_runtime() {
+    use large_records::LargeDecoder;
+    use opendata_ingest_runtime::error::RuntimeError;
+    use opendata_ingest_runtime::sink::{CommitStatus, SinkId};
+    use support::{ProgrammableSink, ScriptedWrite};
+
+    let fx = in_memory_buffer_source(
+        "ingest/test/pipeline/oversize/manifest",
+        "ingest/test/pipeline/oversize/data",
+    )
+    .await;
+    fx.producer
+        .produce(vec![Bytes::from_static(b"payload")], logs_envelope())
+        .await
+        .expect("produce");
+    fx.producer.flush().await.expect("flush");
+
+    // estimated_max_batch_bytes = 1 MiB, multiplier = 4 → limit 4
+    // MiB. Decoder produces ~10 MiB. Fault must fire.
+    let sink = ProgrammableSink::new(
+        SinkId::from("programmable"),
+        vec![ScriptedWrite::Ok { rows_written: 1 }],
+        CommitStatus::Unknown,
+    );
+    let write_calls = Arc::clone(&sink.write_calls);
+    let pessimistic: u64 = 1 << 20; // 1 MiB
+    let actual: usize = 10 * (1usize << 20); // ~10 MiB
+
+    let mut opts = options_with_fetch_concurrency(1);
+    opts.source_defaults = SourceBackpressureOptions {
+        max_inflight_batches: 1,
+        max_inflight_bytes: 64 * 1024 * 1024,
+        estimated_max_batch_bytes: pessimistic,
+        fetch_concurrency: 1,
+        decode_concurrency: 1,
+        oversize_fault_multiplier: 4,
+    };
+
+    let runtime = Runtime::builder()
+        .add_source(fx.source)
+        .add_decoder(LargeDecoder {
+            bytes_per_batch: actual,
+        })
+        .set_sink(sink)
+        .with_options(opts)
+        .build()
+        .expect("build");
+
+    let shutdown = CancellationToken::new();
+    let shutdown_run = shutdown.clone();
+    let handle = tokio::spawn(async move { runtime.run(shutdown_run).await });
+
+    let join = timeout(Duration::from_secs(5), handle)
+        .await
+        .expect("runtime should halt on oversize")
+        .expect("runtime task join");
+    let err = join.expect_err("oversize batch must halt the runtime");
+    let msg = format!("{err}");
+    assert!(
+        matches!(err, RuntimeError::Pipeline(_)),
+        "expected RuntimeError::Pipeline, got {err:?}",
+    );
+    assert!(
+        msg.contains("oversize decoded batch"),
+        "error message should call out the oversize fault: {msg}",
+    );
+
+    let write_count = write_calls.lock().unwrap().len();
+    assert_eq!(
+        write_count, 0,
+        "oversize fault halts before the sink is touched",
+    );
+
+    let _ = shutdown;
+    fx.producer.close().await.expect("close producer");
+}
+
+/// Saturating-mul edge case of the oversize gate. Setting both
+/// `estimated_max_batch_bytes = u64::MAX` and
+/// `oversize_fault_multiplier = u32::MAX` must NOT overflow the
+/// product (the runtime uses `saturating_mul`), so the effective
+/// limit is `u64::MAX` and no batch can trip the fault. Lets an
+/// operator disable the fault explicitly without bumping into a
+/// hidden overflow.
+#[tokio::test]
+async fn pipeline_oversize_fault_saturating_mul_disables_gate() {
+    use large_records::LargeDecoder;
+    use opendata_ingest_runtime::sink::{CommitStatus, SinkId};
+    use support::{ProgrammableSink, ScriptedWrite};
+
+    let fx = in_memory_buffer_source(
+        "ingest/test/pipeline/oversize-saturating/manifest",
+        "ingest/test/pipeline/oversize-saturating/data",
+    )
+    .await;
+    fx.producer
+        .produce(vec![Bytes::from_static(b"payload")], logs_envelope())
+        .await
+        .expect("produce");
+    fx.producer.flush().await.expect("flush");
+
+    let sink = ProgrammableSink::new(
+        SinkId::from("programmable"),
+        vec![ScriptedWrite::Ok { rows_written: 1 }],
+        CommitStatus::Unknown,
+    );
+
+    let mut opts = options_with_fetch_concurrency(1);
+    opts.source_defaults = SourceBackpressureOptions {
+        max_inflight_batches: 1,
+        max_inflight_bytes: u64::MAX,
+        estimated_max_batch_bytes: u64::MAX,
+        fetch_concurrency: 1,
+        decode_concurrency: 1,
+        oversize_fault_multiplier: u32::MAX,
+    };
+
+    let runtime = Runtime::builder()
+        .add_source(fx.source)
+        .add_decoder(LargeDecoder {
+            bytes_per_batch: 10 * (1usize << 20),
+        })
+        .set_sink(sink)
+        .with_options(opts)
+        .build()
+        .expect("build");
+    let mut progress_rx = runtime.progress();
+
+    let shutdown = CancellationToken::new();
+    let shutdown_run = shutdown.clone();
+    let handle = tokio::spawn(async move { runtime.run(shutdown_run).await });
+
+    timeout(Duration::from_secs(5), async {
+        loop {
+            progress_rx.changed().await.expect("progress closed");
+            if progress_rx.borrow().source_ranges_committed >= 1 {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("runtime should commit the batch when the gate is disabled");
+
+    shutdown.cancel();
+    handle
+        .await
+        .expect("runtime task join")
+        .expect("runtime exited cleanly");
+
+    fx.producer.close().await.expect("close producer");
+}
+
+/// MEDIUM-1 path: decode-time byte reconciliation. The pessimistic
+/// admission reservation is small (`estimated_max_batch_bytes =
+/// 4 KiB`); the decoder produces a `DecodedBatch` reporting a much
+/// larger post-decode footprint (`1 MiB`). When the runtime parks
+/// the sink mid-write, the per-source byte budget's `in_flight()`
+/// reflects the reconciled (post-decode) total — proving the
+/// decode worker called `reservation.reconcile(actual_bytes)` and
+/// that the reservation actually expanded against the shared
+/// budget.
+#[tokio::test]
+async fn pipeline_decode_byte_reconciliation_grows_reservation() {
+    use large_records::LargeDecoder;
+    use opendata_ingest_runtime::sink::{CommitStatus, SinkId};
+    use support::{ProgrammableSink, ScriptedWrite};
+
+    let fx = in_memory_buffer_source(
+        "ingest/test/pipeline/byte-reconciliation/manifest",
+        "ingest/test/pipeline/byte-reconciliation/data",
+    )
+    .await;
+    fx.producer
+        .produce(vec![Bytes::from_static(b"payload")], logs_envelope())
+        .await
+        .expect("produce");
+    fx.producer.flush().await.expect("flush");
+
+    let sink = ProgrammableSink::new(
+        SinkId::from("programmable"),
+        vec![ScriptedWrite::Ok { rows_written: 1 }],
+        CommitStatus::Unknown,
+    );
+    // Gate the write so the test can observe the budget while the
+    // reservation is still alive (it drops at WriteCompletion send,
+    // which is downstream of write).
+    let token = sink.block_until_released(true);
+
+    let pessimistic_bytes: u64 = 4 * 1024;
+    let decoded_bytes: usize = 1024 * 1024;
+    let mut opts = options_with_fetch_concurrency(1);
+    opts.source_defaults = SourceBackpressureOptions {
+        max_inflight_batches: 1,
+        max_inflight_bytes: 16 * 1024 * 1024,
+        estimated_max_batch_bytes: pessimistic_bytes,
+        fetch_concurrency: 1,
+        decode_concurrency: 1,
+        oversize_fault_multiplier: u32::MAX, // disable for this case
+    };
+
+    let runtime = Runtime::builder()
+        .add_source(fx.source)
+        .add_decoder(LargeDecoder {
+            bytes_per_batch: decoded_bytes,
+        })
+        .set_sink(sink)
+        .with_options(opts)
+        .build()
+        .expect("build");
+    let budget = runtime.source_byte_budget();
+
+    let shutdown = CancellationToken::new();
+    let shutdown_run = shutdown.clone();
+    let handle = tokio::spawn(async move { runtime.run(shutdown_run).await });
+
+    // Wait until the gated write parks (`maybe_park` increments the
+    // entry counter before the await). At that point admission has
+    // reserved `pessimistic_bytes`, the decode worker has
+    // reconciled to roughly `decoded_bytes`, and the reservation is
+    // held by the sink writer task across the parked
+    // `Sink::write`.
+    timeout(Duration::from_secs(5), token.wait_for_entry())
+        .await
+        .expect("sink write should park");
+
+    let in_flight = budget.in_flight();
+    assert!(
+        in_flight > pessimistic_bytes,
+        "reservation must have grown past the pessimistic size: \
+         in_flight={in_flight}, pessimistic={pessimistic_bytes}",
+    );
+    // Allow some slack for the source_coords overhead, but the
+    // total should be in the ballpark of the decoder's
+    // `estimated_bytes()`.
+    assert!(
+        in_flight >= decoded_bytes as u64,
+        "reservation must have reconciled to at least the decoder's \
+         estimated_bytes: in_flight={in_flight}, decoded_bytes={decoded_bytes}",
+    );
+
+    drop(token); // release the sink write
+    shutdown.cancel();
+    handle
+        .await
+        .expect("runtime task join")
+        .expect("runtime exited cleanly");
+
+    assert_eq!(
+        budget.in_flight(),
+        0,
+        "reservation must drop back to zero after sink commit",
+    );
+
+    fx.producer.close().await.expect("close producer");
+}
+
+mod hard_abort_sink {
+    use std::sync::Arc;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use async_trait::async_trait;
+    use opendata_ingest_runtime::error::{RuntimeError, RuntimeResult};
+    use opendata_ingest_runtime::identity::CommitIdentity;
+    use opendata_ingest_runtime::sink::{
+        CommitStatus, Sink, SinkBudget, SinkCommit, SinkCommitFailure, SinkCommitResult, SinkId,
+    };
+    use tokio::sync::Notify;
+
+    /// Custom sink for `pipeline_hard_abort_during_parked_sink_unwinds_pipeline`.
+    ///
+    /// **Call-order-based**, not sequence-based, so the test is
+    /// deterministic under any fetch/decode worker schedule: the
+    /// *first* `Sink::write` call (whichever sequence reaches the
+    /// sink first) parks on a `Notify` forever; every subsequent
+    /// call returns `Fatal`. With W writer workers and ≥ 2 batches
+    /// admitted, one writer parks and another fires Fatal —
+    /// regardless of which source sequence each picks up.
+    pub struct GatePeerSink {
+        pub id: SinkId,
+        pub parked_gate: Arc<Notify>,
+        pub parked_entry_count: Arc<AtomicUsize>,
+        pub write_call_count: Arc<AtomicUsize>,
+        pub write_calls: Arc<Mutex<Vec<u64>>>,
+    }
+
+    impl GatePeerSink {
+        pub fn new() -> Self {
+            Self {
+                id: SinkId::from("gate-peer"),
+                parked_gate: Arc::new(Notify::new()),
+                parked_entry_count: Arc::new(AtomicUsize::new(0)),
+                write_call_count: Arc::new(AtomicUsize::new(0)),
+                write_calls: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Sink for GatePeerSink {
+        fn id(&self) -> &SinkId {
+            &self.id
+        }
+        fn write_budget(&self) -> SinkBudget {
+            SinkBudget::default()
+        }
+        async fn write(&self, commit: SinkCommit) -> Result<SinkCommitResult, SinkCommitFailure> {
+            let seq = commit.identity.range.high;
+            self.write_calls.lock().unwrap().push(seq);
+            let call_idx = self.write_call_count.fetch_add(1, Ordering::SeqCst);
+            if call_idx == 0 {
+                // First call into the sink: park forever. The
+                // writer worker awaits this future wrapped in
+                // `select!` against the abort token; when the
+                // supervisor cancels, the select! drops this
+                // future and the sink call unwinds.
+                self.parked_entry_count.fetch_add(1, Ordering::SeqCst);
+                self.parked_gate.notified().await;
+                Err(SinkCommitFailure::NotCommitted(
+                    "should never reach here".into(),
+                ))
+            } else {
+                Err(SinkCommitFailure::Fatal(
+                    format!("test peer fatal on call {call_idx} (seq={seq})").into(),
+                ))
+            }
+        }
+        async fn check_committed(&self, _identity: &CommitIdentity) -> RuntimeResult<CommitStatus> {
+            Ok::<CommitStatus, RuntimeError>(CommitStatus::Unknown)
+        }
+    }
+}
+
+/// INV-FRONTIER-NEVER-OVER-HOLE under runtime-level out-of-order
+/// completion.
+///
+/// Deterministic gating: `ProgrammableSink::set_per_sequence_block(0)`
+/// explicitly holds seq=0's commit on a `Notify` while peer
+/// sequences 1..N flow through W=4 writers and complete. The
+/// coordinator marks each peer as committed but `advance_frontier`
+/// cannot cross the seq=0 hole, so the actor's
+/// `ack_through_recorder` MUST stay empty for the duration of
+/// the hold. Once the test calls `cancel()` to release
+/// seq=0, the actor sees its completion last and
+/// `advance_frontier` collapses [0..N-1] in one pass — emitting
+/// exactly one `ack_through(N-1)`.
+///
+/// The previous revision used 200 ms of latency on seq=0; on a
+/// fast scheduler peer completions could still land in source
+/// order and the test would pass without ever exercising the
+/// hole-in-frontier path. The explicit block makes the sequence
+/// unambiguous regardless of timing.
+#[tokio::test]
+async fn pipeline_runtime_level_out_of_order_completion_no_frontier_hole() {
+    use opendata_ingest_runtime::sink::{CommitStatus, SinkId};
+    use support::{ProgrammableSink, ScriptedWrite};
+
+    let fx = in_memory_buffer_source(
+        "ingest/test/pipeline/out-of-order-completion/manifest",
+        "ingest/test/pipeline/out-of-order-completion/data",
+    )
+    .await;
+    let batch_count = 8u64;
+    for i in 0..batch_count {
+        fx.producer
+            .produce(
+                vec![Bytes::from(format!("payload-{i}").into_bytes())],
+                logs_envelope(),
+            )
+            .await
+            .expect("produce");
+        fx.producer.flush().await.expect("flush");
+    }
+
+    let sink = ProgrammableSink::new(
+        SinkId::from("programmable"),
+        (0..batch_count)
+            .map(|_| ScriptedWrite::Ok { rows_written: 1 })
+            .collect(),
+        CommitStatus::Unknown,
+    );
+    let release_seq_0 = sink.set_per_sequence_block(0);
+    let write_calls = Arc::clone(&sink.write_calls);
+
+    let ack_recorder: AckThroughRecorder = Arc::new(Mutex::new(Vec::new()));
+    let ack_runtime = Arc::clone(&ack_recorder);
+
+    let mut opts = options_with_fetch_concurrency(2);
+    opts.source_defaults = SourceBackpressureOptions {
+        max_inflight_batches: batch_count as u32,
+        fetch_concurrency: 2,
+        decode_concurrency: 2,
+        ..SourceBackpressureOptions::default()
+    };
+    opts.sink = SinkPoolOptions {
+        max_concurrent_commits: 4,
+        retry_max_attempts: 0,
+        retry_initial_backoff_ms: 0,
+    };
+
+    let runtime = Runtime::builder()
+        .add_source(fx.source)
+        .add_decoder(FakeDecoder::permissive())
+        .set_sink(sink)
+        .with_options(opts)
+        .with_ack_through_recorder(ack_runtime)
+        .build()
+        .expect("build");
+    let mut progress_rx = runtime.progress();
+
+    let shutdown = CancellationToken::new();
+    let shutdown_run = shutdown.clone();
+    let handle = tokio::spawn(async move { runtime.run(shutdown_run).await });
+
+    // Wait until every peer sequence (1..N) has its write call
+    // captured AND has resolved Ok (write_calls captures the call
+    // entering BenchSink::write, but ProgrammableSink records the
+    // call BEFORE awaiting maybe_park / latency; a captured-write
+    // doesn't yet mean "committed"). For ProgrammableSink the
+    // write_calls Vec only grows after the sink resolves the
+    // script — wait for `>= batch_count - 1` distinct peer high-
+    // sequences to land before snapshotting the ack recorder.
+    timeout(Duration::from_secs(10), async {
+        loop {
+            let seen: std::collections::HashSet<u64> = write_calls
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|w| w.high_sequence)
+                .collect();
+            // Wait for peer writes to have all hit `write_calls`;
+            // every one of them will have completed past `write`'s
+            // tail since seq=0 is the ONLY blocked sequence and
+            // none of them park.
+            if (1..batch_count).all(|s| seen.contains(&s)) {
+                // Give the actor a moment to process those peer
+                // completions before we snapshot the recorder.
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                return;
+            }
+            drop(seen);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("peer commits should resolve while seq=0 is held");
+
+    // STRICT CHECK: no ack fired while the hole was open. A
+    // runtime that violated INV-FRONTIER-NEVER-OVER-HOLE would
+    // have advanced frontier past seq=0 and the recorder would
+    // be non-empty here.
+    let acks_during_hole = ack_recorder.lock().unwrap().clone();
+    assert!(
+        acks_during_hole.is_empty(),
+        "no ack must fire while the seq=0 hole is open; saw {acks_during_hole:?}",
+    );
+
+    // Release seq=0. The actor processes its completion, the
+    // coordinator walks the entire contiguous run, and a single
+    // `ack_through(N-1)` fires.
+    release_seq_0.cancel();
+
+    timeout(Duration::from_secs(10), async {
+        loop {
+            progress_rx
+                .changed()
+                .await
+                .expect("progress channel closed");
+            if progress_rx.borrow().last_acked_sequence == Some(batch_count - 1) {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("runtime should drain after release");
+
+    shutdown.cancel();
+    handle
+        .await
+        .expect("runtime task join")
+        .expect("runtime exited cleanly");
+
+    // Sanity: every sequence reached the sink exactly once.
+    let mut writes = write_calls.lock().unwrap().clone();
+    writes.sort_by_key(|w| w.high_sequence);
+    assert_eq!(
+        writes.len(),
+        batch_count as usize,
+        "every admitted unit must produce exactly one Sink::write",
+    );
+    for (i, w) in writes.iter().enumerate() {
+        assert_eq!(w.high_sequence, i as u64);
+    }
+
+    // Strict invariant assertion: recorder shows EXACTLY one ack,
+    // jumping straight to N-1. Anything else (multiple acks, an
+    // intermediate ack, a stuck frontier) flags a regression.
+    let recorded = ack_recorder.lock().unwrap().clone();
+    assert_eq!(
+        recorded.len(),
+        1,
+        "expected exactly one ack_through call (the single jump \
+         after seq=0's release); saw {recorded:?}",
+    );
+    assert_eq!(
+        recorded[0],
+        batch_count - 1,
+        "single ack must jump straight to the highest sequence",
+    );
+
+    fx.producer.close().await.expect("close");
+}
+
+/// INV-BACKPRESSURE-BOUNDED-MEMORY under sink outage.
+///
+/// Deterministic gating via `ProgrammableSink::set_per_sequence_block(4)`:
+/// seq=4's commit parks on a `Notify` indefinitely while peer
+/// writes flow through the pool. Backpressure engages against
+/// the per-source byte budget (admission parks once
+/// `max_inflight_bytes` is consumed); `budget.in_flight()` is
+/// sampled by a background poller every 10 ms throughout the
+/// hold. After the test asserts the peak observed against the
+/// design bound, `notify_waiters()` releases seq=4 and the
+/// runtime drains.
+///
+/// Bound:
+///
+///   peak in-flight bytes per source
+///     ≤ max_inflight_bytes
+///       + decode_concurrency
+///         × (oversize_fault_multiplier - 1)
+///         × estimated_max_batch_bytes
+///
+/// Strict additions:
+///   - assert peak ≥ `max_inflight_bytes` while the hole was
+///     open (i.e. backpressure DID engage — latency-based gating
+///     left this as a possibility, not a guarantee).
+///   - assert final `budget.in_flight()` is zero after drain.
+///   - assert frontier reaches N-1 after release.
+#[tokio::test]
+async fn pipeline_slow_sink_injection_caps_inflight_bytes_and_recovers() {
+    use large_records::LargeDecoder;
+    use opendata_ingest_runtime::sink::{CommitStatus, SinkId};
+    use support::{ProgrammableSink, ScriptedWrite};
+
+    let fx = in_memory_buffer_source(
+        "ingest/test/pipeline/slow-sink-injection/manifest",
+        "ingest/test/pipeline/slow-sink-injection/data",
+    )
+    .await;
+    let batch_count = 12u64;
+    for i in 0..batch_count {
+        fx.producer
+            .produce(
+                vec![Bytes::from(format!("payload-{i}").into_bytes())],
+                logs_envelope(),
+            )
+            .await
+            .expect("produce");
+        fx.producer.flush().await.expect("flush");
+    }
+
+    let sink = ProgrammableSink::new(
+        SinkId::from("programmable"),
+        (0..batch_count)
+            .map(|_| ScriptedWrite::Ok { rows_written: 1 })
+            .collect(),
+        CommitStatus::Unknown,
+    );
+    // Deterministic gating on seq=4 — peer writes flow normally
+    // so backpressure has to come from upstream stages (admission
+    // budget, decode reservation), not from sink-pool capacity.
+    let release_seq_4 = sink.set_per_sequence_block(4);
+    // Add a small latency to every write so admission saturates
+    // for a sample window long enough that the 1 ms poller can
+    // observe the peak. Without this the in-memory `Ok` returns
+    // sub-millisecond and the budget bounce is invisible to the
+    // poller; the bound assertion would trivially hold against a
+    // peak of 1×estimated_max_batch_bytes (the held seq=4 alone).
+    let latency_fn: support::SinkLatencyFn = Arc::new(|_seq: u64| Some(Duration::from_millis(20)));
+    sink.set_per_sequence_latency(latency_fn);
+    let write_calls = Arc::clone(&sink.write_calls);
+
+    // Tight byte budget so the bound assertion has teeth. Each
+    // batch reports 8 KiB post-decode; admission reserves 8 KiB
+    // pessimistically; max_inflight_bytes = 32 KiB caps 4 in-
+    // flight (matches max_inflight_batches).
+    let pessimistic: u64 = 8 * 1024;
+    let decoded_bytes: usize = 8 * 1024;
+    let max_inflight_bytes: u64 = 32 * 1024;
+    let max_inflight_batches: u32 = 4;
+    let decode_concurrency: u32 = 2;
+    let oversize_fault_multiplier: u32 = 4;
+    // Design bound: peak in-flight bytes per source ≤
+    //   max_inflight_bytes
+    //   + decode_concurrency × (oversize_fault_multiplier - 1)
+    //     × estimated_max_batch_bytes
+    let bound: u64 = max_inflight_bytes
+        + decode_concurrency as u64 * (oversize_fault_multiplier as u64 - 1) * pessimistic;
+
+    let mut opts = options_with_fetch_concurrency(2);
+    opts.source_defaults = SourceBackpressureOptions {
+        max_inflight_batches,
+        max_inflight_bytes,
+        estimated_max_batch_bytes: pessimistic,
+        fetch_concurrency: 2,
+        decode_concurrency,
+        oversize_fault_multiplier,
+    };
+    opts.sink = SinkPoolOptions {
+        max_concurrent_commits: 4,
+        retry_max_attempts: 0,
+        retry_initial_backoff_ms: 0,
+    };
+
+    let runtime = Runtime::builder()
+        .add_source(fx.source)
+        .add_decoder(LargeDecoder {
+            bytes_per_batch: decoded_bytes,
+        })
+        .set_sink(sink)
+        .with_options(opts)
+        .build()
+        .expect("build");
+    let budget = runtime.source_byte_budget();
+    let mut progress_rx = runtime.progress();
+
+    let shutdown = CancellationToken::new();
+    let shutdown_run = shutdown.clone();
+    let handle = tokio::spawn(async move { runtime.run(shutdown_run).await });
+
+    // Spawn a poller that samples `budget.in_flight()` every 1 ms
+    // throughout the run. Peak is the maximum sample observed
+    // before the actor exits. The 10 ms sampling that the prior
+    // revision used was too coarse: with an in-memory sink the
+    // admission → completion cycle is sub-millisecond, so the
+    // saturated-budget window was easy to miss. 1 ms keeps the
+    // poller cheap (10× more samples over a few-second run) but
+    // catches the brief peaks reliably.
+    let peak = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let peak_poller = Arc::clone(&peak);
+    let budget_poller = Arc::clone(&budget);
+    let poller_stop = CancellationToken::new();
+    let poller_stop_inner = poller_stop.clone();
+    let poller = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                biased;
+                _ = poller_stop_inner.cancelled() => return,
+                _ = tokio::time::sleep(Duration::from_millis(1)) => {
+                    let now = budget_poller.in_flight();
+                    let prev = peak_poller.load(std::sync::atomic::Ordering::SeqCst);
+                    if now > prev {
+                        peak_poller.store(now, std::sync::atomic::Ordering::SeqCst);
+                    }
+                }
+            }
+        }
+    });
+
+    // Wait for backpressure to engage: at least `max_inflight_bytes`
+    // worth of bytes must be in flight at some point during the
+    // hold. This proves the test actually exercised the budget
+    // saturation path — the prior revision only asserted "peak
+    // ≤ bound" which can trivially hold even when backpressure
+    // never engaged (e.g. if all writes complete in source order
+    // before the budget fills).
+    timeout(Duration::from_secs(10), async {
+        loop {
+            if peak.load(std::sync::atomic::Ordering::SeqCst) >= max_inflight_bytes {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect(
+        "backpressure must engage while seq=4 is held: peak in-flight \
+         should reach max_inflight_bytes",
+    );
+
+    // Release seq=4 and wait for full drain. Frontier must reach
+    // batch_count-1 once seq=4 completes.
+    release_seq_4.cancel();
+
+    timeout(Duration::from_secs(10), async {
+        loop {
+            progress_rx
+                .changed()
+                .await
+                .expect("progress channel closed");
+            if progress_rx.borrow().last_acked_sequence == Some(batch_count - 1) {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("runtime should recover and drain after seq=4 is released");
+
+    shutdown.cancel();
+    handle
+        .await
+        .expect("runtime task join")
+        .expect("runtime exited cleanly");
+    poller_stop.cancel();
+    let _ = poller.await;
+
+    let peak_in_flight = peak.load(std::sync::atomic::Ordering::SeqCst);
+    assert!(
+        peak_in_flight <= bound,
+        "INV-BACKPRESSURE-BOUNDED-MEMORY: peak in_flight ({}) must \
+         not exceed the design bound ({}) — \
+         max_inflight_bytes={} + decode_concurrency={} × \
+         (oversize_fault_multiplier={} - 1) × \
+         estimated_max_batch_bytes={}",
+        peak_in_flight,
+        bound,
+        max_inflight_bytes,
+        decode_concurrency,
+        oversize_fault_multiplier,
+        pessimistic,
+    );
+    assert!(
+        peak_in_flight >= max_inflight_bytes,
+        "backpressure must have engaged during the seq=4 hold: \
+         peak in_flight ({peak_in_flight}) should be at least \
+         max_inflight_bytes ({max_inflight_bytes})",
+    );
+
+    // Sanity: every sequence reached the sink and the final
+    // reservation drained back to zero (no leaked permits).
+    let writes = write_calls.lock().unwrap().clone();
+    assert_eq!(
+        writes.len(),
+        batch_count as usize,
+        "every admitted unit must produce exactly one Sink::write",
+    );
+    assert_eq!(
+        budget.in_flight(),
+        0,
+        "byte budget must drain to zero after final completion",
+    );
+
+    fx.producer.close().await.expect("close");
+}
+
+/// INV-ACK-CALLED-ON-ADVANCE.
+///
+/// The per-source actor's completion arm guards `source.ack_through(f)`
+/// behind `f > last_ack_sent`, so out-of-order completions that
+/// arrive but don't advance the coordinator's frontier MUST NOT
+/// produce a redundant `ack_through` call (the buffer-side
+/// `Consumer::ack_through` is durable-immediate per RFC 0003;
+/// invoking it for a non-advancing frontier would re-fence the
+/// manifest for no reason).
+///
+/// Setup:
+/// - Produce 20 batches.
+/// - `fetch_concurrency = 4`, `decode_concurrency = 4`,
+///   `max_inflight_batches = 20`, `max_concurrent_commits = 4`.
+/// - `ProgrammableSink` returns Ok for every write but is gated by
+///   `block_until_released(true)`; the test releases the gate
+///   after all 20 admissions land, so 4 writer workers race to
+///   send their completions to the actor's single-consumer mpsc.
+///   That contention forces some completions to arrive out of
+///   source order — those non-advancing arrivals exercise the
+///   `should_ack == false` branch.
+///
+/// Assertions:
+/// - `recorded` is strictly monotonic (no duplicate frontier).
+/// - `recorded.last() == Some(19)` (durable ack frontier reached
+///   the highest committed sequence).
+/// - `recorded.len() <= 20` (each call is one advance; if any
+///   completion didn't advance, the recorder is shorter).
+/// - `runtime.progress().last_acked_sequence == Some(19)`.
+#[tokio::test]
+async fn pipeline_ack_through_called_only_on_frontier_advance() {
+    use opendata_ingest_runtime::sink::{CommitStatus, SinkId};
+    use support::{ProgrammableSink, ScriptedWrite};
+
+    let fx = in_memory_buffer_source(
+        "ingest/test/pipeline/ack-on-advance/manifest",
+        "ingest/test/pipeline/ack-on-advance/data",
+    )
+    .await;
+    let batch_count = 20u64;
+    for i in 0..batch_count {
+        fx.producer
+            .produce(
+                vec![Bytes::from(format!("payload-{i}").into_bytes())],
+                logs_envelope(),
+            )
+            .await
+            .expect("produce");
+        fx.producer.flush().await.expect("flush");
+    }
+
+    let sink = ProgrammableSink::new(
+        SinkId::from("programmable"),
+        (0..batch_count)
+            .map(|_| ScriptedWrite::Ok { rows_written: 1 })
+            .collect(),
+        CommitStatus::Unknown,
+    );
+    let gate = sink.block_until_released(true);
+
+    let admission_recorder: AdmissionRecorder = Arc::new(Mutex::new(Vec::new()));
+    let admission_runtime = Arc::clone(&admission_recorder);
+    let ack_recorder: AckThroughRecorder = Arc::new(Mutex::new(Vec::new()));
+    let ack_runtime = Arc::clone(&ack_recorder);
+
+    let mut opts = options_with_fetch_concurrency(4);
+    opts.source_defaults = SourceBackpressureOptions {
+        max_inflight_batches: batch_count as u32,
+        fetch_concurrency: 4,
+        decode_concurrency: 4,
+        ..SourceBackpressureOptions::default()
+    };
+    opts.sink = SinkPoolOptions {
+        max_concurrent_commits: 4,
+        retry_max_attempts: 0,
+        retry_initial_backoff_ms: 0,
+    };
+
+    let runtime = Runtime::builder()
+        .add_source(fx.source)
+        .add_decoder(FakeDecoder::permissive())
+        .set_sink(sink)
+        .with_options(opts)
+        .with_admission_recorder(admission_runtime)
+        .with_ack_through_recorder(ack_runtime)
+        .build()
+        .expect("build");
+    let mut progress_rx = runtime.progress();
+
+    let shutdown = CancellationToken::new();
+    let shutdown_run = shutdown.clone();
+    let handle = tokio::spawn(async move { runtime.run(shutdown_run).await });
+
+    // Wait until every batch admits (sink gated, so they queue
+    // ahead of the write stage). Releasing the gate after this
+    // point fans 4 writers loose to race on completion.
+    timeout(Duration::from_secs(10), async {
+        loop {
+            if admission_recorder.lock().unwrap().len() >= batch_count as usize {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("all 20 batches admit while sink gated");
+
+    drop(gate);
+
+    // Wait for full drain — final progress's last_acked_sequence
+    // should equal the highest committed sequence.
+    timeout(Duration::from_secs(10), async {
+        loop {
+            progress_rx
+                .changed()
+                .await
+                .expect("progress channel closed");
+            if progress_rx.borrow().last_acked_sequence == Some(batch_count - 1) {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("runtime should drain to last_acked_sequence = 19");
+
+    shutdown.cancel();
+    handle
+        .await
+        .expect("runtime task join")
+        .expect("runtime exited cleanly");
+
+    let recorded = ack_recorder.lock().unwrap().clone();
+    assert!(
+        !recorded.is_empty(),
+        "ack_through must fire at least once over a 20-batch run",
+    );
+    for window in recorded.windows(2) {
+        let (prev, next) = (window[0], window[1]);
+        assert!(
+            next > prev,
+            "INV-ACK-CALLED-ON-ADVANCE: recorder must be strictly \
+             monotonic — saw {prev} followed by {next} in {recorded:?}",
+        );
+    }
+    assert_eq!(
+        recorded.last().copied(),
+        Some(batch_count - 1),
+        "final ack_through must reach the highest committed sequence",
+    );
+    assert!(
+        recorded.len() <= batch_count as usize,
+        "recorder length cannot exceed batch count: \
+         len={} batch_count={batch_count}",
+        recorded.len(),
+    );
+
+    fx.producer.close().await.expect("close");
+}
+
+/// INV-DESCRIPTOR-LOSS-FATAL.
+///
+/// When the actor's admission arm calls `descriptor_tx.send` and
+/// every fetch worker has dropped its `descriptor_rx` clone, the
+/// channel is closed and `send` returns `Err`. The actor must
+/// surface this as `RuntimeError::Pipeline("descriptor lost: ...")`
+/// rather than hang or swallow the failure.
+///
+/// Setup:
+/// - Produce 8 batches.
+/// - `fetch_concurrency = 1`, `max_inflight_batches = 4`, gated
+///   `ProgrammableSink` (writes parked).
+/// - The actor admits the first 4 sequences synchronously while
+///   the sink is gated; in-flight = 4 = max so admission then
+///   parks on the budget.
+/// - Test trips `TestFetchKillswitch`: the single fetch worker's
+///   `select!` fires the killswitch arm, returns `Ok(())`, and
+///   drops the only `descriptor_rx` clone.
+/// - Test releases the sink. Completions drain; admission unparks
+///   and tries to admit seq=4; `descriptor_tx.send` returns Err
+///   (channel closed); the actor halts with the typed Pipeline
+///   error.
+///
+/// The killswitch is the test-only path that avoids introducing a
+/// `#[cfg(test)]` fetch-worker variant — production code never
+/// supplies one, the worker's `select!` arm parks on
+/// `std::future::pending` in that case (no behavior change).
+#[tokio::test]
+async fn pipeline_dropped_descriptor_send_halts_runtime() {
+    use opendata_ingest_runtime::error::RuntimeError;
+    use opendata_ingest_runtime::sink::{CommitStatus, SinkId};
+    use support::{ProgrammableSink, ScriptedWrite};
+
+    let fx = in_memory_buffer_source(
+        "ingest/test/pipeline/dropped-descriptor/manifest",
+        "ingest/test/pipeline/dropped-descriptor/data",
+    )
+    .await;
+    let batch_count = 8u64;
+    for i in 0..batch_count {
+        fx.producer
+            .produce(
+                vec![Bytes::from(format!("payload-{i}").into_bytes())],
+                logs_envelope(),
+            )
+            .await
+            .expect("produce");
+        fx.producer.flush().await.expect("flush");
+    }
+
+    let sink = ProgrammableSink::new(
+        SinkId::from("programmable"),
+        (0..batch_count)
+            .map(|_| ScriptedWrite::Ok { rows_written: 1 })
+            .collect(),
+        CommitStatus::Unknown,
+    );
+    let gate = sink.block_until_released(true);
+
+    let killswitch: TestFetchKillswitch = TestFetchKillswitch::new();
+    let killswitch_runtime = killswitch.clone();
+    let recorder: AdmissionRecorder = Arc::new(Mutex::new(Vec::new()));
+    let recorder_runtime = Arc::clone(&recorder);
+
+    let mut opts = options_with_fetch_concurrency(1);
+    opts.source_defaults = SourceBackpressureOptions {
+        max_inflight_batches: 4,
+        fetch_concurrency: 1,
+        decode_concurrency: 1,
+        ..SourceBackpressureOptions::default()
+    };
+    opts.sink = SinkPoolOptions {
+        max_concurrent_commits: 4,
+        retry_max_attempts: 0,
+        retry_initial_backoff_ms: 0,
+    };
+
+    let runtime = Runtime::builder()
+        .add_source(fx.source)
+        .add_decoder(FakeDecoder::permissive())
+        .set_sink(sink)
+        .with_options(opts)
+        .with_admission_recorder(recorder_runtime)
+        .with_test_fetch_killswitch(killswitch_runtime)
+        .build()
+        .expect("build");
+
+    let shutdown = CancellationToken::new();
+    let shutdown_run = shutdown.clone();
+    let handle = tokio::spawn(async move { runtime.run(shutdown_run).await });
+
+    // Wait until in-flight hits the max (4) — fetch worker has
+    // drained the descriptor channel into the parked sink writes
+    // and is now parked on `descriptor_rx.recv` with the channel
+    // empty.
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if recorder.lock().unwrap().len() >= 4 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("4 admissions while sink gated");
+
+    // Trip the killswitch. The fetch worker's select! fires the
+    // killswitch arm at its next suspension (already parked on
+    // recv) and exits, dropping its descriptor_rx clone.
+    killswitch.cancel();
+
+    // Give the scheduler a moment to run the fetch worker to its
+    // killswitch-arm exit BEFORE we release the sink. Without this
+    // step the actor could observe a sink completion, attempt to
+    // admit seq=4, and succeed (the channel still has a live
+    // receiver) — that's not the failure mode under test.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Release the gated sink writes. Completions drain into the
+    // actor; in_flight decrements; admission unblocks and tries to
+    // admit seq=4 — descriptor_tx.send fails (zero receivers).
+    drop(gate);
+
+    let join = timeout(Duration::from_secs(5), handle)
+        .await
+        .expect("runtime must halt within 5s after killswitch + sink release")
+        .expect("runtime task join");
+    let err = join.expect_err("runtime must return Pipeline(descriptor lost)");
+    let msg = format!("{err}");
+    assert!(
+        matches!(err, RuntimeError::Pipeline(_)),
+        "expected RuntimeError::Pipeline, got {err:?}: {msg}",
+    );
+    assert!(
+        msg.contains("descriptor lost"),
+        "expected descriptor-lost message, got: {msg}",
+    );
+
+    let _ = shutdown;
+    fx.producer.close().await.expect("close");
+}
+
+/// HIGH finding: hard abort must propagate through parked workers.
+///
+/// Two batches admitted; the sink gates by **call order**, not
+/// sequence — the first `Sink::write` call parks on a `Notify`
+/// forever, every subsequent call returns `Fatal`. With multiple
+/// writer workers, one parks and another fires Fatal regardless of
+/// which source sequence reached the sink first (eliminating the
+/// schedule-sensitive seq-0-before-seq-1 ordering assumption).
+/// `Fatal` → actor returns `Err(RuntimeError::Sink)` → supervisor
+/// cancels `hard_abort_token` → the parked worker's `sink.write`
+/// future is dropped by the `select!` arm and unwinds within
+/// bounded time. The runtime must exit with the typed `Sink` error
+/// (not a generic `Pipeline("hard abort …")`) and the exit must
+/// happen quickly (under 2 seconds) — proving the parked worker
+/// doesn't block supervisor join.
+#[tokio::test]
+async fn pipeline_hard_abort_during_parked_sink_unwinds_pipeline() {
+    use hard_abort_sink::GatePeerSink;
+    use opendata_ingest_runtime::error::RuntimeError;
+
+    let fx = in_memory_buffer_source(
+        "ingest/test/pipeline/hard-abort/manifest",
+        "ingest/test/pipeline/hard-abort/data",
+    )
+    .await;
+    for i in 0..2u64 {
+        fx.producer
+            .produce(
+                vec![Bytes::from(format!("payload-{i}").into_bytes())],
+                logs_envelope(),
+            )
+            .await
+            .expect("produce");
+        fx.producer.flush().await.expect("flush");
+    }
+
+    let sink = GatePeerSink::new();
+    let parked_entry_count = Arc::clone(&sink.parked_entry_count);
+    let write_call_count = Arc::clone(&sink.write_call_count);
+    let write_calls = Arc::clone(&sink.write_calls);
+
+    // Use single fetch + decode concurrency so the actor admits in
+    // strict source-sequence order and the first `Sink::write` is
+    // unambiguously seq=0. Keep `W=2` writer workers so the second
+    // batch can be processed in parallel to the parked one —
+    // otherwise the test would only exercise the recv-loop abort
+    // path, not the parked-`sink.write` abort path.
+    let mut opts = options_with_fetch_concurrency(1);
+    opts.source_defaults = SourceBackpressureOptions {
+        max_inflight_batches: 4,
+        fetch_concurrency: 1,
+        decode_concurrency: 1,
+        ..SourceBackpressureOptions::default()
+    };
+    opts.sink = SinkPoolOptions {
+        max_concurrent_commits: 2,
+        retry_max_attempts: 0,
+        retry_initial_backoff_ms: 0,
+    };
+
+    let runtime = Runtime::builder()
+        .add_source(fx.source)
+        .add_decoder(FakeDecoder::permissive())
+        .set_sink(sink)
+        .with_options(opts)
+        .build()
+        .expect("build");
+
+    let shutdown = CancellationToken::new();
+    let shutdown_run = shutdown.clone();
+    let start = std::time::Instant::now();
+    let handle = tokio::spawn(async move { runtime.run(shutdown_run).await });
+
+    // Wait until the first `Sink::write` call has actually parked
+    // before declaring victory on the setup. The parked_entry_count
+    // is incremented inside the gate, after the call lands. A
+    // higher write_call_count without the parked counter advancing
+    // would mean we're in trouble (call entered but isn't the
+    // gated one).
+    let parked_wait_start = std::time::Instant::now();
+    while parked_entry_count.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+        if parked_wait_start.elapsed() > Duration::from_secs(2) {
+            panic!(
+                "first sink.write call never entered the parked state; \
+                 write_call_count={}, write_calls={:?}",
+                write_call_count.load(std::sync::atomic::Ordering::SeqCst),
+                write_calls.lock().unwrap(),
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    // Now the parked worker is in `Sink::write(seq=0).await`. A peer
+    // worker should pick up seq=1 and return Fatal soon after; the
+    // supervisor cancels the abort token; the parked worker exits.
+    let join = timeout(Duration::from_secs(2), handle)
+        .await
+        .expect(
+            "runtime must exit within 2s despite the parked sink \
+             — proving hard_abort wakes the parked Sink::write",
+        )
+        .expect("runtime task join");
+    let elapsed = start.elapsed();
+
+    let err = join.expect_err("Fatal from peer must surface as runtime error");
+    assert!(
+        matches!(err, RuntimeError::Sink(_)),
+        "expected typed RuntimeError::Sink (the original Fatal), got {err:?} \
+         after {elapsed:?}",
+    );
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "runtime should exit promptly after Fatal; took {elapsed:?}",
+    );
+
+    let _ = shutdown;
+    fx.producer.close().await.expect("close producer");
+}
+
+// ===================================================================
+// Multi-descriptor (K > 1) admission tests.
+// ===================================================================
+
+/// INV-ADMISSION-CONTIGUOUS holds at K>1. Same shape as
+/// `pipeline_register_pending_called_in_admission_order` but with
+/// `max_descriptors_per_poll=16` and a larger `max_inflight_batches`
+/// so the admission actor admits in batches > 1. With 100 source
+/// batches produced up-front, the first admission cycle has plenty
+/// of descriptors waiting; the register-all loop must observe them
+/// in source-sequence order even though fetch workers complete
+/// out-of-order under the alternating fast/slow fetch delay.
+#[tokio::test]
+async fn pipeline_admission_batched_k_gt_1_register_order() {
+    let fx = in_memory_buffer_source(
+        "ingest/test/pipeline/k-gt-1-order/manifest",
+        "ingest/test/pipeline/k-gt-1-order/data",
+    )
+    .await;
+    let batch_count = 100u64;
+    for i in 0..batch_count {
+        fx.producer
+            .produce(
+                vec![Bytes::from(format!("payload-{i}").into_bytes())],
+                logs_envelope(),
+            )
+            .await
+            .expect("produce");
+        fx.producer.flush().await.expect("flush");
+    }
+
+    let sink = FakeSink::new("fake-sink");
+    let captured = Arc::clone(&sink.captured);
+
+    let recorder: AdmissionRecorder = Arc::new(Mutex::new(Vec::new()));
+    let recorder_runtime = Arc::clone(&recorder);
+
+    // Same alternating delay as the K=1 register-order test —
+    // forces fetch completions out of order so we're testing the
+    // structural admission ordering, not happenstance.
+    let delay_fn: Arc<dyn Fn(u64) -> Duration + Send + Sync> = Arc::new(|seq: u64| {
+        if seq.is_multiple_of(2) {
+            Duration::from_millis(1)
+        } else {
+            Duration::from_millis(10)
+        }
+    });
+
+    let mut opts = options_with_fetch_concurrency(4);
+    opts.max_descriptors_per_poll = 16;
+    opts.source_defaults.max_inflight_batches = 32;
+    let metrics = Arc::new(RuntimeMetrics::new());
+
+    let runtime = Runtime::builder()
+        .add_source(fx.source)
+        .add_decoder(FakeDecoder::permissive())
+        .set_sink(sink)
+        .with_options(opts)
+        .with_runtime_metrics(Arc::clone(&metrics))
+        .with_admission_recorder(recorder_runtime)
+        .with_test_fetch_delay(delay_fn)
+        .build()
+        .expect("build");
+    let mut progress_rx = runtime.progress();
+
+    let shutdown = CancellationToken::new();
+    let shutdown_run = shutdown.clone();
+    let handle = tokio::spawn(async move { runtime.run(shutdown_run).await });
+
+    timeout(Duration::from_secs(30), async {
+        loop {
+            progress_rx
+                .changed()
+                .await
+                .expect("progress channel closed");
+            let p = *progress_rx.borrow();
+            if p.source_ranges_committed >= batch_count {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("runtime did not commit all batches in time");
+
+    shutdown.cancel();
+    handle
+        .await
+        .expect("runtime task join")
+        .expect("runtime exited cleanly");
+
+    let events = recorder.lock().unwrap().clone();
+    assert_eq!(events.len(), batch_count as usize);
+    let expected: Vec<(SourceId, u64)> = (0..batch_count)
+        .map(|i| (SourceId::from("buffer"), i))
+        .collect();
+    assert_eq!(
+        events, expected,
+        "INV-ADMISSION-CONTIGUOUS must hold at K>1: register order = source-sequence order",
+    );
+
+    let mut committed = captured.lock().unwrap().clone();
+    committed.sort_by_key(|c| c.low_sequence);
+    assert_eq!(committed.len(), batch_count as usize);
+    for (i, c) in committed.iter().enumerate() {
+        assert_eq!(c.low_sequence, i as u64);
+        assert_eq!(c.high_sequence, i as u64);
+    }
+
+    // K_effective sanity: 100 descriptors over fewer than 100 calls
+    // means batching happened at least once. (Not a tight bound —
+    // depends on producer-side timing — but if K=1 had regressed
+    // this would fail.)
+    let calls = metrics
+        .admission_next_descriptors_calls
+        .get_or_create(&SourceLabels {
+            source: "buffer".into(),
+        })
+        .get();
+    assert!(
+        calls < batch_count,
+        "K_effective > 1 expected; saw {calls} calls for {batch_count} descriptors",
+    );
+
+    fx.producer.close().await.expect("close producer");
+}
+
+/// **Load-bearing amortization proof.** Counts manifest GETs at the
+/// `ObjectStore::get_opts` boundary and asserts a single admission
+/// cycle with `max_descriptors_per_poll=8` corresponds to exactly
+/// one manifest GET (not 8).
+///
+/// Test sizing keeps the actor permit-blocked after the first cycle:
+/// `max_inflight_batches=8`, exactly 8 batches produced, sink pool=1
+/// gating on every write. The first sink call parks indefinitely;
+/// the 7 trailing commits queue behind it head-of-line; no
+/// `WriteCompletion` ever returns; admission's batch semaphore stays
+/// drained. With no permits returned, admission cannot do a
+/// follow-up `next_descriptors` call before the assertion fires.
+#[tokio::test]
+async fn pipeline_admission_amortizes_manifest_gets() {
+    let fx = counting_in_memory_buffer_source(
+        "ingest/test/pipeline/k-gt-1-amortize/manifest",
+        "ingest/test/pipeline/k-gt-1-amortize/data",
+    )
+    .await;
+    let batch_count = 8u64;
+    for i in 0..batch_count {
+        fx.producer
+            .produce(
+                vec![Bytes::from(format!("payload-{i}").into_bytes())],
+                logs_envelope(),
+            )
+            .await
+            .expect("produce");
+        fx.producer.flush().await.expect("flush");
+    }
+
+    // Producer-side setup wrote / read the manifest. Reset both
+    // counters so only the runtime's manifest reads count below.
+    fx.manifest_gets.store(0, Ordering::SeqCst);
+    fx.data_gets.store(0, Ordering::SeqCst);
+
+    let sink = ProgrammableSink::new(
+        opendata_ingest_runtime::sink::SinkId::from("programmable"),
+        // Script never runs: the gate parks every write before the
+        // script is consulted. Provide enough Ok entries so a buggy
+        // gate doesn't surface as "exhausted script" instead of
+        // "didn't park."
+        vec![ScriptedWrite::Ok { rows_written: 1 }; batch_count as usize],
+        opendata_ingest_runtime::sink::CommitStatus::Committed,
+    );
+    // Gate writes (also_gate_write=true) so EVERY write call parks.
+    // With sink pool=1 the head-of-line block stops all further
+    // commits; with pool>1 it wouldn't.
+    let gate = sink.block_until_released(true);
+
+    let mut opts = options_with_fetch_concurrency(4);
+    opts.max_descriptors_per_poll = 8;
+    opts.source_defaults.max_inflight_batches = 8; // matched to produced count
+    opts.sink.max_concurrent_commits = 1;
+
+    let metrics = Arc::new(RuntimeMetrics::new());
+    let recorder: AdmissionRecorder = Arc::new(Mutex::new(Vec::new()));
+    let recorder_runtime = Arc::clone(&recorder);
+
+    let runtime = Runtime::builder()
+        .add_source(fx.source)
+        .add_decoder(FakeDecoder::permissive())
+        .set_sink(sink)
+        .with_options(opts)
+        .with_runtime_metrics(Arc::clone(&metrics))
+        .with_admission_recorder(recorder_runtime)
+        .build()
+        .expect("build");
+
+    let shutdown = CancellationToken::new();
+    let shutdown_run = shutdown.clone();
+    let handle = tokio::spawn(async move { runtime.run(shutdown_run).await });
+
+    // Wait for the register-all pass to complete (recorder reaches
+    // 8). Because the first sink call parks via the gate and
+    // pool=1 blocks the rest, no completion fires → no permit
+    // returns → admission cannot do a second cycle.
+    timeout(Duration::from_secs(10), async {
+        loop {
+            if recorder.lock().unwrap().len() >= batch_count as usize {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .expect("admission did not register 8 descriptors in time");
+
+    // Also wait for the first write to enter the gate, so we know
+    // the pipeline has fully drained admission → fetch → decode →
+    // sink. This is a stronger "no second admission" signal: a
+    // second admission cycle could only happen after a permit
+    // returns, which requires a completion, which requires the
+    // gated write to return — which it can't while gate is held.
+    gate.wait_for_entry().await;
+
+    // Object-store boundary assertion: exactly one manifest GET
+    // for the K=8 cycle.
+    let manifest_gets = fx.manifest_gets.load(Ordering::SeqCst);
+    assert_eq!(
+        manifest_gets, 1,
+        "K=8 admission cycle must hit one manifest GET, not 8",
+    );
+
+    // Runtime-metric assertions: paired confirmation at the
+    // crate-internal boundary.
+    let calls = metrics
+        .admission_next_descriptors_calls
+        .get_or_create(&SourceLabels {
+            source: "buffer".into(),
+        })
+        .get();
+    assert_eq!(calls, 1, "exactly one next_descriptors call");
+
+    let handed_out = metrics
+        .descriptors_handed_out
+        .get_or_create(&SourceLabels {
+            source: "buffer".into(),
+        })
+        .get();
+    assert_eq!(handed_out, 8, "all 8 descriptors handed out");
+
+    let releases = metrics
+        .admission_extension_releases
+        .get_or_create(&SourceLabels {
+            source: "buffer".into(),
+        })
+        .get();
+    assert_eq!(
+        releases, 0,
+        "no excess gates released (buffer returned full K_target)",
+    );
+
+    // Release the gate, drain, confirm clean shutdown.
+    drop(gate);
+    shutdown.cancel();
+    handle
+        .await
+        .expect("runtime task join")
+        .expect("runtime exited cleanly");
+
+    fx.producer.close().await.expect("close producer");
+}
+
+/// When the buffer returns fewer descriptors than the extension
+/// loop acquired gates for, the excess gates' Drop must release the
+/// batch permits + byte reservations AND increment
+/// `runtime_admission_extension_releases_total` by the overshoot.
+///
+/// With K_target=16 capped by `max_inflight_batches=8`, cycle 1
+/// acquires 8 gates and the buffer returns 5 → 3 releases. The 5
+/// in-flight descriptors hold 5 batch_permits, leaving 3 free —
+/// admission immediately runs a second cycle that acquires 3 gates
+/// (1 blocking + 2 try_acquire) and `next_descriptors` returns 0,
+/// adding 3 more releases. Empty cycles can keep firing while the
+/// sink is parked; the test asserts the deterministic invariant
+/// `releases == 3 × calls` (or `3 × (calls-1)` for the brief window
+/// between cycle N's call-increment and release-increment), which
+/// holds under any number of follow-up empty cycles.
+#[tokio::test]
+async fn pipeline_admission_k_gt_1_releases_excess_permits() {
+    let fx = in_memory_buffer_source(
+        "ingest/test/pipeline/k-gt-1-release/manifest",
+        "ingest/test/pipeline/k-gt-1-release/data",
+    )
+    .await;
+    let batch_count = 5u64;
+    for i in 0..batch_count {
+        fx.producer
+            .produce(
+                vec![Bytes::from(format!("payload-{i}").into_bytes())],
+                logs_envelope(),
+            )
+            .await
+            .expect("produce");
+        fx.producer.flush().await.expect("flush");
+    }
+
+    let sink = ProgrammableSink::new(
+        opendata_ingest_runtime::sink::SinkId::from("programmable"),
+        vec![ScriptedWrite::Ok { rows_written: 1 }; batch_count as usize],
+        opendata_ingest_runtime::sink::CommitStatus::Committed,
+    );
+    let gate = sink.block_until_released(true);
+
+    let mut opts = options_with_fetch_concurrency(4);
+    opts.max_descriptors_per_poll = 16;
+    opts.source_defaults.max_inflight_batches = 8; // caps gates to 8
+    opts.sink.max_concurrent_commits = 1;
+    // poll_interval kept short so shutdown.cancel() lands promptly
+    // — the actor's empty-poll branch sleeps for this duration
+    // before re-entering the select! and observing shutdown.
+    opts.poll_interval = Duration::from_millis(50);
+
+    let metrics = Arc::new(RuntimeMetrics::new());
+    let recorder: AdmissionRecorder = Arc::new(Mutex::new(Vec::new()));
+    let recorder_runtime = Arc::clone(&recorder);
+
+    let runtime = Runtime::builder()
+        .add_source(fx.source)
+        .add_decoder(FakeDecoder::permissive())
+        .set_sink(sink)
+        .with_options(opts)
+        .with_runtime_metrics(Arc::clone(&metrics))
+        .with_admission_recorder(recorder_runtime)
+        .build()
+        .expect("build");
+
+    let shutdown = CancellationToken::new();
+    let shutdown_run = shutdown.clone();
+    let handle = tokio::spawn(async move { runtime.run(shutdown_run).await });
+
+    // Wait for cycle 2 to complete (overshoot in cycle 1 + first
+    // empty cycle). With the sink gated and pool=1, no completion
+    // ever fires, so admission keeps spinning in empty cycles —
+    // each adds 3 to releases. The deterministic invariant under
+    // any number of cycles N ≥ 2 is:
+    //
+    //     releases == 3 * calls   (after cycle N's release-increment)
+    //     releases == 3 * (calls - 1)   (briefly, between cycle N's
+    //                                   call-increment in step 9
+    //                                   and its release-increment
+    //                                   in step 11 — a window of a
+    //                                   handful of synchronous ops)
+    //
+    // Cycle 1 contributes 3 (overshoot 8-5). Each empty cycle (2,
+    // 3, ...) contributes 3 (gates = 1 + 2 try_acquire on the 2
+    // permits left after the blocking gate consumes 1 of the 3
+    // free permits).
+    let calls_label = SourceLabels {
+        source: "buffer".into(),
+    };
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if metrics
+                .admission_next_descriptors_calls
+                .get_or_create(&calls_label)
+                .get()
+                >= 2
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .expect("admission did not complete cycle 2 in time");
+
+    // Snapshot atomically-enough: read calls first, then releases.
+    // Any cycle that fires between these two reads can leave
+    // releases trailing calls by one cycle's worth (3); the
+    // invariant tolerates that with the `||` branch.
+    let calls = metrics
+        .admission_next_descriptors_calls
+        .get_or_create(&calls_label)
+        .get();
+    let releases = metrics
+        .admission_extension_releases
+        .get_or_create(&calls_label)
+        .get();
+    assert!(calls >= 2, "saw {calls} calls (expected at least 2)");
+    assert!(
+        releases == 3 * calls || releases == 3 * (calls.saturating_sub(1)),
+        "releases must equal 3 × cycles (cycle 1 overshoot 8-5 + each \
+         empty cycle's 3-gate release); saw calls={calls} releases={releases}",
+    );
+
+    let handed_out = metrics
+        .descriptors_handed_out
+        .get_or_create(&calls_label)
+        .get();
+    assert_eq!(handed_out, 5, "5 descriptors handed out (cycle 1)");
+
+    let recorded = recorder.lock().unwrap().len();
+    assert_eq!(recorded, 5, "5 descriptors registered with the coordinator");
+
+    drop(gate);
+    shutdown.cancel();
+    handle
+        .await
+        .expect("runtime task join")
+        .expect("runtime exited cleanly");
+
+    fx.producer.close().await.expect("close producer");
+}

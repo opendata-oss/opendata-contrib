@@ -1,0 +1,29 @@
+[package]
+name = "opendata-ingest-runtime"
+version.workspace = true
+edition.workspace = true
+description = "Sink-neutral ingest runtime: source/decoder/router/sink trait surface + orchestration loop. RFC 0002 (opendata-contrib/rfcs/0002-generic-ingest-runtime.md)."
+license = "MIT"
+repository = "https://github.com/opendata-oss/opendata-contrib"
+
+[lib]
+name = "opendata_ingest_runtime"
+path = "src/lib.rs"
+
+[dependencies]
+async-channel = { workspace = true }
+async-trait = "0.1"
+buffer = { workspace = true }
+bytes = { workspace = true }
+metrics = { workspace = true }
+prometheus-client = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+common = { workspace = true }
+futures = { workspace = true }
+slatedb = { workspace = true }
