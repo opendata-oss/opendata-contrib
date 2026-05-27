@@ -2,6 +2,8 @@
 resolver = "2"
 members = [
     "connectors/clickhouse-ingestor",
+    "plugins/opendata-ingest-clickhouse",
+    "plugins/opendata-ingest-otel",
     "runtime/opendata-ingest-runtime",
 ]
 
