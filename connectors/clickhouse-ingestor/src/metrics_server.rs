@@ -139,8 +139,7 @@ mod tests {
         let client = reqwest::Client::new();
         let body = timeout(Duration::from_secs(2), async {
             loop {
-                if let Ok(resp) =
-                    client.get(format!("http://{addr}/metrics")).send().await
+                if let Ok(resp) = client.get(format!("http://{addr}/metrics")).send().await
                     && resp.status().is_success()
                 {
                     return resp.text().await.unwrap();
@@ -204,8 +203,7 @@ mod tests {
         let client = reqwest::Client::new();
         let body = timeout(Duration::from_secs(2), async {
             loop {
-                if let Ok(resp) =
-                    client.get(format!("http://{addr}/metrics")).send().await
+                if let Ok(resp) = client.get(format!("http://{addr}/metrics")).send().await
                     && resp.status().is_success()
                 {
                     return resp.text().await.unwrap();
