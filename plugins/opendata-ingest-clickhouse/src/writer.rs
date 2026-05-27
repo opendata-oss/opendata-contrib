@@ -409,11 +409,7 @@ impl ClickHouseWriter {
             );
             return Ok(());
         }
-        Err(classify_status(
-            status.as_u16(),
-            &resp_body,
-            &self.metrics,
-        ))
+        Err(classify_status(status.as_u16(), &resp_body, &self.metrics))
     }
 
     /// Run a SQL statement (DDL, SELECT, or INSERT-with-data-in-body).
@@ -451,7 +447,10 @@ impl ClickHouseWriter {
     }
 }
 
-fn classify_reqwest(err: &reqwest::Error, metrics: &crate::metrics::ClickHouseMetrics) -> WriterError {
+fn classify_reqwest(
+    err: &reqwest::Error,
+    metrics: &crate::metrics::ClickHouseMetrics,
+) -> WriterError {
     let label = if err.is_timeout() {
         "timeout"
     } else if err.is_connect() {
@@ -484,7 +483,11 @@ fn classify_reqwest(err: &reqwest::Error, metrics: &crate::metrics::ClickHouseMe
     }
 }
 
-fn classify_status(status: u16, body: &str, metrics: &crate::metrics::ClickHouseMetrics) -> WriterError {
+fn classify_status(
+    status: u16,
+    body: &str,
+    metrics: &crate::metrics::ClickHouseMetrics,
+) -> WriterError {
     // §4 commit_errors_total{status_code}: emit before classifying so
     // operators can rate() by literal HTTP code (429 vs 503 vs 4xx).
     metrics

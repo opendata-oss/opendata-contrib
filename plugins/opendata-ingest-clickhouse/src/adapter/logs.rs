@@ -729,11 +729,7 @@ mod tests {
             "COLUMNS must NOT include _odb_clickhouse_inserted_at; CH evaluates now64(9) server-side"
         );
         // Row vector length follows COLUMNS length one-for-one.
-        assert_eq!(
-            COLUMNS.len(),
-            18,
-            "the writer emits 18 columns per row"
-        );
+        assert_eq!(COLUMNS.len(), 18, "the writer emits 18 columns per row");
     }
 
     #[test]

@@ -54,14 +54,29 @@ pub const SECONDS_HISTOGRAM_BUCKETS: &[f64] = &[
 /// (1 KiB → 64 MiB, log2). Covers ClickHouse-row-binary chunks from
 /// tiny smoke runs (KB scale) up to the multi-MiB max chunk size.
 pub const BYTES_HISTOGRAM_BUCKETS: &[f64] = &[
-    1024.0, 4096.0, 16_384.0, 65_536.0, 262_144.0, 1_048_576.0, 4_194_304.0, 16_777_216.0,
+    1024.0,
+    4096.0,
+    16_384.0,
+    65_536.0,
+    262_144.0,
+    1_048_576.0,
+    4_194_304.0,
+    16_777_216.0,
     67_108_864.0,
 ];
 
 /// Histogram bucket boundaries for chunk row counts (100 → 1 M, log10
 /// stepped). Covers a `max_chunk_rows=500_000` config plus headroom.
 pub const ROWS_HISTOGRAM_BUCKETS: &[f64] = &[
-    100.0, 500.0, 1000.0, 5000.0, 10_000.0, 50_000.0, 100_000.0, 500_000.0, 1_000_000.0,
+    100.0,
+    500.0,
+    1000.0,
+    5000.0,
+    10_000.0,
+    50_000.0,
+    100_000.0,
+    500_000.0,
+    1_000_000.0,
 ];
 
 fn seconds_histogram() -> Histogram {
@@ -155,9 +170,7 @@ impl ClickHouseMetrics {
             ),
             chunk_rows: Family::<FormatLabels, Histogram>::new_with_constructor(rows_histogram),
             insert_duration_seconds:
-                Family::<FormatHttpResultLabels, Histogram>::new_with_constructor(
-                    seconds_histogram,
-                ),
+                Family::<FormatHttpResultLabels, Histogram>::new_with_constructor(seconds_histogram),
         }
     }
 
@@ -255,9 +268,7 @@ mod tests {
         encode(&mut buf, &registry).expect("encode");
 
         assert!(
-            buf.contains(
-                "clickhouse_ingestor_rows_committed_total{run_id=\"smoke-test\"} 600"
-            ),
+            buf.contains("clickhouse_ingestor_rows_committed_total{run_id=\"smoke-test\"} 600"),
             "missing rows_committed counter line. Output was:\n{buf}",
         );
         assert!(

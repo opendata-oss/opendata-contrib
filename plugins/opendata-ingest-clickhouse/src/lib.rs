@@ -2,7 +2,7 @@
 //!
 //! Provides the `adapter` and `writer` modules plus the
 //! `opendata_ingest_runtime::Sink` impl that wraps `Adapter::plan(...)`
-//! + `ClickHouseWriter::execute_all(...)` into the runtime's
+//! and `ClickHouseWriter::execute_all(...)` into the runtime's
 //! `SinkCommit` / `SinkCommitFailure` contract.
 
 pub mod adapter;
