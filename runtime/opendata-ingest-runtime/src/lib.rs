@@ -15,7 +15,6 @@
 pub mod ack_coordinator;
 pub mod decoded_batch;
 pub mod decoder;
-pub mod envelope;
 pub mod error;
 pub mod identity;
 pub mod metrics;

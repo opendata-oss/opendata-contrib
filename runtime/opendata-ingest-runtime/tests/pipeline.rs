@@ -12,7 +12,6 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use bytes::Bytes;
-use opendata_ingest_runtime::envelope::{ConfiguredEnvelope, PayloadEncoding, SignalType};
 use opendata_ingest_runtime::runtime::{
     AckFlushPolicy, AckThroughRecorder, AdmissionRecorder, Runtime, RuntimeOptions,
     SinkPoolOptions, SourceBackpressureOptions, TestFetchKillswitch,
@@ -31,11 +30,6 @@ use support::{
 
 fn options_with_fetch_concurrency(fetch_concurrency: u32) -> RuntimeOptions {
     RuntimeOptions {
-        configured_envelope: ConfiguredEnvelope {
-            version: 1,
-            signal_type: SignalType::Logs,
-            encoding: PayloadEncoding::OtlpProtobuf,
-        },
         ack_flush_policy: AckFlushPolicy::EveryCommitGroup,
         dry_run: false,
         poll_interval: Duration::from_millis(2),
@@ -274,7 +268,6 @@ mod large_records {
         TypedSchema,
     };
     use opendata_ingest_runtime::decoder::Decoder;
-    use opendata_ingest_runtime::envelope::MetadataEnvelope;
     use opendata_ingest_runtime::error::RuntimeResult;
     use opendata_ingest_runtime::identity::SchemaVersion;
     use opendata_ingest_runtime::source::SourceBatch;
@@ -326,7 +319,7 @@ mod large_records {
 
     #[async_trait]
     impl Decoder for LargeDecoder {
-        fn accepts(&self, _envelope: &MetadataEnvelope) -> bool {
+        fn accepts(&self, _raw_metadata: &[u8]) -> bool {
             true
         }
 

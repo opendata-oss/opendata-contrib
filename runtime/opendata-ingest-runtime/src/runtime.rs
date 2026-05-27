@@ -88,9 +88,6 @@ use tracing::{debug, info, warn};
 use crate::ack_coordinator::AckCoordinators;
 use crate::decoded_batch::{DecodedBatch, DecodedRecords};
 use crate::decoder::Decoder;
-use crate::envelope::{
-    ConfiguredEnvelope, PayloadEncoding, SignalType, decode_envelopes, validate_consistent,
-};
 use crate::error::{RuntimeError, RuntimeResult};
 use crate::identity::{CommitIdentity, SequenceRange};
 use crate::sink::{CommitStatus, Sink, SinkCommit, SinkCommitFailure, SinkCommitResult, SinkId};
@@ -354,9 +351,6 @@ impl Default for SinkPoolOptions {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RuntimeOptions {
-    /// Configured envelope every entry must match (validated per
-    /// source batch before the decoder runs).
-    pub configured_envelope: ConfiguredEnvelope,
     /// Ack flush cadence.
     pub ack_flush_policy: AckFlushPolicy,
     /// When true, the runtime runs the full decode pipeline but
@@ -404,11 +398,6 @@ pub struct RuntimeOptions {
 impl Default for RuntimeOptions {
     fn default() -> Self {
         Self {
-            configured_envelope: ConfiguredEnvelope {
-                version: 1,
-                signal_type: SignalType::Logs,
-                encoding: PayloadEncoding::OtlpProtobuf,
-            },
             ack_flush_policy: AckFlushPolicy::default(),
             dry_run: true,
             poll_interval: Duration::from_millis(250),
@@ -1411,8 +1400,7 @@ async fn per_source_actor(
                 // on the error return. Already-sent descriptors are
                 // in-flight at workers and replay on restart per RFC
                 // 0003.
-                let mut send_iter = descriptors.into_iter().zip(gates.into_iter());
-                while let Some((descriptor, gate)) = send_iter.next() {
+                for (descriptor, gate) in descriptors.into_iter().zip(gates) {
                     let seq = descriptor.sequence;
                     if descriptor_tx
                         .send(AdmittedDescriptor {
@@ -1423,8 +1411,8 @@ async fn per_source_actor(
                         .await
                         .is_err()
                     {
-                        // Remaining (descriptor, gate) tuples drop
-                        // here via Drop of send_iter on early return.
+                        // Remaining (descriptor, gate) tuples drop here
+                        // via Drop of the loop's iterator on early return.
                         return Err(RuntimeError::Pipeline(format!(
                             "descriptor lost: source={source_id} seq={seq} cause=worker-stage-closed",
                         )));
@@ -1857,21 +1845,15 @@ async fn decode_one(
     reservation: &mut ByteReservation,
     metrics: &crate::metrics::RuntimeMetrics,
 ) -> RuntimeResult<DecodeOutcome> {
-    // Per-entry envelope validation.
-    let envelopes =
-        decode_envelopes(&source_batch).map_err(|e| RuntimeError::Decoder(Box::new(e)))?;
-    validate_consistent(&envelopes, &options.configured_envelope)
-        .map_err(|e| RuntimeError::Decoder(Box::new(e)))?;
-
-    if let Some(envelope) = envelopes.first()
-        && !decoder.accepts(envelope)
+    // The runtime treats per-entry metadata as opaque bytes; the
+    // decoder owns interpretation and validation. Fail fast if the
+    // configured decoder doesn't accept this source's metadata, then
+    // let `decode` validate every entry and error on a mismatch.
+    if let Some(first) = source_batch.entries.first()
+        && !decoder.accepts(&first.raw_metadata)
     {
         return Err(RuntimeError::Decoder(
-            format!(
-                "decoder rejected configured envelope: version={} signal_type={:?} encoding={:?}",
-                envelope.version, envelope.signal_type, envelope.encoding,
-            )
-            .into(),
+            "configured decoder rejected the source's per-entry metadata".into(),
         ));
     }
 

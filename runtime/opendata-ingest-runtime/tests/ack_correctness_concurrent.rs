@@ -18,7 +18,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use opendata_ingest_runtime::envelope::{ConfiguredEnvelope, PayloadEncoding, SignalType};
 use opendata_ingest_runtime::error::RuntimeError;
 use opendata_ingest_runtime::runtime::{
     AckFlushPolicy, Runtime, RuntimeOptions, SinkPoolOptions, SourceBackpressureOptions,
@@ -36,11 +35,6 @@ use support::{
 /// `sink.max_concurrent_commits = 4`.
 fn pipelined_options() -> RuntimeOptions {
     RuntimeOptions {
-        configured_envelope: ConfiguredEnvelope {
-            version: 1,
-            signal_type: SignalType::Logs,
-            encoding: PayloadEncoding::OtlpProtobuf,
-        },
         ack_flush_policy: AckFlushPolicy::EveryCommitGroup,
         dry_run: false,
         poll_interval: Duration::from_millis(5),

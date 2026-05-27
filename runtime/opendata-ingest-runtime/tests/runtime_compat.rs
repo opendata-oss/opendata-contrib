@@ -20,7 +20,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use opendata_ingest_runtime::envelope::{ConfiguredEnvelope, PayloadEncoding, SignalType};
 use opendata_ingest_runtime::runtime::{
     AckFlushPolicy, Runtime, RuntimeOptions, SinkPoolOptions, SourceBackpressureOptions,
 };
@@ -35,11 +34,6 @@ use support::{
 
 fn options(dry_run: bool) -> RuntimeOptions {
     RuntimeOptions {
-        configured_envelope: ConfiguredEnvelope {
-            version: 1,
-            signal_type: SignalType::Logs,
-            encoding: PayloadEncoding::OtlpProtobuf,
-        },
         ack_flush_policy: AckFlushPolicy::EveryCommitGroup,
         dry_run,
         poll_interval: Duration::from_millis(10),
@@ -183,7 +177,7 @@ async fn runtime_fails_closed_when_decoder_rejects_envelope() {
     let err = join.expect_err("decoder rejection must surface as RuntimeError");
     let msg = format!("{err}");
     assert!(
-        msg.contains("decoder rejected configured envelope"),
+        msg.contains("configured decoder rejected"),
         "unexpected error: {msg}"
     );
     let _ = shutdown;

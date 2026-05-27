@@ -12,7 +12,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use opendata_ingest_runtime::envelope::{ConfiguredEnvelope, PayloadEncoding, SignalType};
 use opendata_ingest_runtime::error::RuntimeError;
 use opendata_ingest_runtime::runtime::{
     AckFlushPolicy, Runtime, RuntimeOptions, SinkPoolOptions, SourceBackpressureOptions,
@@ -28,11 +27,6 @@ use support::{
 
 fn live_options() -> RuntimeOptions {
     RuntimeOptions {
-        configured_envelope: ConfiguredEnvelope {
-            version: 1,
-            signal_type: SignalType::Logs,
-            encoding: PayloadEncoding::OtlpProtobuf,
-        },
         ack_flush_policy: AckFlushPolicy::EveryCommitGroup,
         dry_run: false,
         poll_interval: Duration::from_millis(10),
@@ -1078,17 +1072,15 @@ async fn multi_source_runtime_ack_isolation() {
 async fn runtime_rejects_empty_decoder_output() {
     use opendata_ingest_runtime::decoded_batch::DecodedBatch;
     use opendata_ingest_runtime::decoder::Decoder;
-    use opendata_ingest_runtime::envelope::MetadataEnvelope;
     use opendata_ingest_runtime::error::RuntimeResult;
     use opendata_ingest_runtime::source::SourceBatch;
 
     /// Decoder that accepts everything and returns no decoded
-    /// batches at all. v1 production decoders (OTLP logs)
-    /// always return one batch; this fake exercises the
-    /// runtime's guard.
+    /// batches at all. Production decoders (OTLP logs) always
+    /// return one batch; this fake exercises the runtime's guard.
     struct EmptyDecoder;
     impl Decoder for EmptyDecoder {
-        fn accepts(&self, _envelope: &MetadataEnvelope) -> bool {
+        fn accepts(&self, _raw_metadata: &[u8]) -> bool {
             true
         }
         fn decode(&self, _batch: SourceBatch) -> RuntimeResult<Vec<DecodedBatch>> {

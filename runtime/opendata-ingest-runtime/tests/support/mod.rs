@@ -31,7 +31,6 @@ use opendata_ingest_runtime::decoded_batch::{
     BatchStats, DecodedBatch, DecodedRecords, SourceCoordinateColumns, TypedRecords, TypedSchema,
 };
 use opendata_ingest_runtime::decoder::Decoder;
-use opendata_ingest_runtime::envelope::MetadataEnvelope;
 use opendata_ingest_runtime::error::{RuntimeError, RuntimeResult};
 use opendata_ingest_runtime::identity::{CommitIdentity, SchemaVersion};
 use opendata_ingest_runtime::sink::{
@@ -45,11 +44,10 @@ use tokio::sync::Notify;
 // Envelope helper
 // =========================================================================
 
-/// 4-byte metadata envelope matching the runtime's configured
-/// shape: version=1, signal=Logs, encoding=OtlpProtobuf. The fake
-/// decoder accepts any envelope, but the runtime's
-/// `validate_consistent` gate runs first and would reject a
-/// mismatch.
+/// Sample opaque per-entry metadata payload (the 4-byte OTLP-logs
+/// envelope: version=1, signal=Logs, encoding=OtlpProtobuf). The
+/// runtime treats this as opaque bytes; the fake decoder ignores it
+/// and accepts anything. Real decoders parse and validate it.
 pub fn logs_envelope() -> Bytes {
     Bytes::from_static(&[1, 2, 1, 0])
 }
@@ -114,7 +112,7 @@ impl FakeDecoder {
 }
 
 impl Decoder for FakeDecoder {
-    fn accepts(&self, _envelope: &MetadataEnvelope) -> bool {
+    fn accepts(&self, _raw_metadata: &[u8]) -> bool {
         self.accepts_anything
     }
 
