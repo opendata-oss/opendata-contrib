@@ -19,7 +19,6 @@ use opendata_ingest_runtime::decoded_batch::{
     BatchStats, DecodedBatch, DecodedRecords, SourceCoordinateColumns, TypedRecords, TypedSchema,
 };
 use opendata_ingest_runtime::decoder::Decoder;
-use opendata_ingest_runtime::envelope::MetadataEnvelope;
 use opendata_ingest_runtime::error::{RuntimeError, RuntimeResult};
 use opendata_ingest_runtime::identity::{CommitIdentity, SchemaVersion};
 use opendata_ingest_runtime::sink::{
@@ -118,7 +117,7 @@ pub struct LargeDecoder {
 }
 
 impl Decoder for LargeDecoder {
-    fn accepts(&self, _envelope: &MetadataEnvelope) -> bool {
+    fn accepts(&self, _raw_metadata: &[u8]) -> bool {
         true
     }
 
@@ -162,7 +161,7 @@ impl Decoder for LargeDecoder {
 pub struct FakeDecoder;
 
 impl Decoder for FakeDecoder {
-    fn accepts(&self, _envelope: &MetadataEnvelope) -> bool {
+    fn accepts(&self, _raw_metadata: &[u8]) -> bool {
         true
     }
 

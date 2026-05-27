@@ -13,7 +13,6 @@ use clickhouse_ingestor_bench::metrics_recorder::init_metrics_recorder;
 use common::ObjectStoreConfig;
 use common::clock::SystemClock;
 use metrics_util::debugging::DebugValue;
-use opendata_ingest_runtime::envelope::{ConfiguredEnvelope, PayloadEncoding, SignalType};
 use opendata_ingest_runtime::metrics::{
     RuntimeMetrics, SinkLabels, SourceLabels, SourceReasonLabels, StageLabels,
 };
@@ -28,11 +27,6 @@ use tokio_util::sync::CancellationToken;
 
 fn options(retry_initial_backoff_ms: u64) -> RuntimeOptions {
     RuntimeOptions {
-        configured_envelope: ConfiguredEnvelope {
-            version: 1,
-            signal_type: SignalType::Logs,
-            encoding: PayloadEncoding::OtlpProtobuf,
-        },
         ack_flush_policy: AckFlushPolicy::EveryCommitGroup,
         dry_run: false,
         poll_interval: Duration::from_millis(2),

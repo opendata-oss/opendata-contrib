@@ -15,7 +15,6 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
 
-use opendata_ingest_runtime::envelope::{ConfiguredEnvelope, PayloadEncoding, SignalType};
 use opendata_ingest_runtime::error::RuntimeResult;
 use opendata_ingest_runtime::identity::CommitIdentity;
 use opendata_ingest_runtime::runtime::{
@@ -64,11 +63,6 @@ const SINK_LABEL: &str = "bench-sink";
 
 fn pipelined_options(fetch_concurrency: u32) -> RuntimeOptions {
     RuntimeOptions {
-        configured_envelope: ConfiguredEnvelope {
-            version: 1,
-            signal_type: SignalType::Logs,
-            encoding: PayloadEncoding::OtlpProtobuf,
-        },
         ack_flush_policy: AckFlushPolicy::EveryCommitGroup,
         dry_run: false,
         poll_interval: Duration::from_millis(2),
