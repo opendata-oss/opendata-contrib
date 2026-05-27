@@ -365,7 +365,7 @@ pub fn collect_bench_samples(snapshot: Snapshot) -> (StageSamples, ClickHouseSam
             continue;
         };
         match name {
-            n if n == "runtime_stage_latency_seconds" => {
+            "runtime_stage_latency_seconds" => {
                 let stage_label = key.key().labels().find_map(|l| {
                     if l.key() == "stage" {
                         Some(l.value().to_string())
