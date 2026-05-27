@@ -36,7 +36,8 @@ pub trait Decoder: Send + Sync + 'static {
     /// Returning an empty `Vec` is a contract violation:
     /// `Runtime::handle_source_batch` rejects it with
     /// `RuntimeError::Decoder(_)` so descriptors stay admitted in
-    /// contiguous source-sequence order at the [`AckCoordinator`].
+    /// contiguous source-sequence order at the
+    /// [`AckCoordinator`](crate::ack_coordinator::AckCoordinator).
     /// A decoder that has nothing to emit for an
     /// input batch should still produce one
     /// zero-record `DecodedBatch` covering the input

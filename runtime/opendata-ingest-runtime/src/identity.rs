@@ -58,7 +58,7 @@ impl fmt::Display for SequenceRange {
 /// (all four fields are total — no hashing, no fingerprinting, no
 /// sink-specific data).
 ///
-/// The [`Display`] impl produces the canonical
+/// The [`Display`](std::fmt::Display) impl produces the canonical
 /// `{source}:{sink}:{low}-{high}:{schema_version}` string the
 /// runtime uses for logs and metric labels.
 ///

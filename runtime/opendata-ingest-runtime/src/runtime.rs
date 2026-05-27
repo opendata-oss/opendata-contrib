@@ -200,7 +200,7 @@ pub type AdmissionRecorder = Arc<std::sync::Mutex<Vec<(SourceId, u64)>>>;
 pub type AckThroughRecorder = Arc<std::sync::Mutex<Vec<u64>>>;
 
 /// Test instrumentation: callback fired immediately before the
-/// per-source actor calls [`BufferSource::ack_through(f)`]. Lets
+/// per-source actor calls [`BufferSource::ack_through`](crate::source::BufferSource::ack_through). Lets
 /// a test push the ack event onto a shared ordered event log
 /// alongside sink-side commit events emitted by a programmable
 /// sink — the resulting interleaved log proves the temporal
@@ -892,7 +892,7 @@ impl RuntimeBuilder {
 
     /// Attach a test-only [`AckThroughObserver`] callback. Invoked
     /// synchronously immediately before each
-    /// [`BufferSource::ack_through(f)`] call. Use when a test needs
+    /// [`BufferSource::ack_through`](crate::source::BufferSource::ack_through) call. Use when a test needs
     /// to record the ack event onto a shared ordered log
     /// alongside sink-side events (the bench harness's
     /// `no_ack_before_sink_commit` scenario does exactly this).

@@ -104,7 +104,7 @@ impl SourceByteBudget {
         }
     }
 
-    /// Non-blocking variant of [`reserve`]. Returns `Some` if `bytes`
+    /// Non-blocking variant of [`Self::reserve`]. Returns `Some` if `bytes`
     /// fit immediately; `None` otherwise (budget full, would overflow
     /// `u64`, or a racing reservation won the CAS).
     ///
@@ -113,14 +113,14 @@ impl SourceByteBudget {
     /// admission arm tries
     /// non-blockingly to claim more reservations to amortize a single
     /// manifest GET across multiple descriptors. The blocking gate
-    /// continues to use [`reserve`].
+    /// continues to use [`Self::reserve`].
     ///
     /// A zero-byte reservation is admitted unconditionally, matching
-    /// [`reserve`]'s contract.
+    /// [`Self::reserve`]'s contract.
     ///
     /// Uses `checked_add` (not `saturating_add`) so a u64 overflow
     /// returns `None` rather than silently saturating and admitting
-    /// the reservation. [`reserve`] uses `saturating_add` because its
+    /// the reservation. [`Self::reserve`] uses `saturating_add` because its
     /// loop re-polls after a failed capacity check; this function
     /// returns immediately and must not silently misclassify
     /// overflow.
