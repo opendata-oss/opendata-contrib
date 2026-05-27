@@ -22,7 +22,6 @@ use clickhouse_ingestor::{ClickHouseWriter, IngestorConfig, OtlpLogsClickHouseAd
 use metrics_exporter_prometheus::PrometheusBuilder;
 use opendata_ingest_clickhouse::ClickHouseSink;
 use opendata_ingest_otel::logs::OtlpLogsDecoder;
-use opendata_ingest_runtime::envelope::{ConfiguredEnvelope, PayloadEncoding, SignalType};
 use opendata_ingest_runtime::error::{RuntimeError, RuntimeResult};
 use opendata_ingest_runtime::identity::CommitIdentity;
 use opendata_ingest_runtime::runtime::{
@@ -133,11 +132,6 @@ async fn main() -> Result<()> {
     // dry-run mode. The runtime's `dry_run` flag is the actual
     // gate — see Runtime::handle_source_batch.
     let runtime_options = RuntimeOptions {
-        configured_envelope: ConfiguredEnvelope {
-            version: 1,
-            signal_type: SignalType::Logs,
-            encoding: PayloadEncoding::OtlpProtobuf,
-        },
         ack_flush_policy: cfg.ack_flush_policy(),
         dry_run: cfg.runtime.dry_run,
         poll_interval: std::time::Duration::from_millis(cfg.runtime.poll_interval_ms),

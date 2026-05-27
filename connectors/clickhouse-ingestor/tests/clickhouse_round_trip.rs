@@ -17,7 +17,6 @@ use clickhouse_ingestor::writer::{ClickHouseWriter, WriterConfig};
 use clickhouse_ingestor::{ClickHouseSink, OtlpLogsDecoder};
 use common::ObjectStoreConfig;
 use common::clock::SystemClock;
-use opendata_ingest_runtime::envelope::{ConfiguredEnvelope, PayloadEncoding, SignalType};
 use opendata_ingest_runtime::runtime::{
     AckFlushPolicy, Runtime, RuntimeOptions, SinkPoolOptions, SourceBackpressureOptions,
 };
@@ -204,11 +203,6 @@ async fn clickhouse_round_trip_with_dedup() -> Result<(), Box<dyn std::error::Er
     let source = BufferSource::new(consumer, "buffer", manifest_path, None);
 
     let runtime_options = RuntimeOptions {
-        configured_envelope: ConfiguredEnvelope {
-            version: 1,
-            signal_type: SignalType::Logs,
-            encoding: PayloadEncoding::OtlpProtobuf,
-        },
         ack_flush_policy: AckFlushPolicy::EveryCommitGroup,
         dry_run: false,
         poll_interval: Duration::from_millis(20),

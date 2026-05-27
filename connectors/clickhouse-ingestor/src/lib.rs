@@ -30,8 +30,9 @@ pub mod metrics_registry;
 pub mod metrics_server;
 
 pub use opendata_ingest_clickhouse::{adapter, writer};
+pub use opendata_ingest_otel::envelope;
 pub use opendata_ingest_otel::logs as signal;
-pub use opendata_ingest_runtime::{envelope, source};
+pub use opendata_ingest_runtime::source;
 
 pub use adapter::logs::{LogsAdapterConfig, OtlpLogsClickHouseAdapter, logs_table_ddl};
 pub use adapter::{

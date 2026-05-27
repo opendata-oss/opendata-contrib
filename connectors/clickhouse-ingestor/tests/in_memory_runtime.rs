@@ -24,7 +24,6 @@ use common::ObjectStoreConfig;
 use common::clock::SystemClock;
 use opendata_ingest_otel::logs::TypedDecodedLogs;
 use opendata_ingest_runtime::decoded_batch::DecodedRecords;
-use opendata_ingest_runtime::envelope::{ConfiguredEnvelope, PayloadEncoding, SignalType};
 use opendata_ingest_runtime::error::{RuntimeError, RuntimeResult};
 use opendata_ingest_runtime::identity::CommitIdentity;
 use opendata_ingest_runtime::runtime::{
@@ -185,11 +184,6 @@ impl Sink for RecordingSink {
 
 fn options(dry_run: bool) -> RuntimeOptions {
     RuntimeOptions {
-        configured_envelope: ConfiguredEnvelope {
-            version: 1,
-            signal_type: SignalType::Logs,
-            encoding: PayloadEncoding::OtlpProtobuf,
-        },
         ack_flush_policy: AckFlushPolicy::EveryCommitGroup,
         dry_run,
         poll_interval: Duration::from_millis(10),
