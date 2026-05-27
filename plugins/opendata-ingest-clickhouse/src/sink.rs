@@ -1,6 +1,6 @@
 //! `opendata_ingest_runtime::Sink` impl for ClickHouse.
 //!
-//! Wraps the [`OtlpLogsClickHouseAdapter::plan`] +
+//! Wraps the `OtlpLogsClickHouseAdapter::plan` +
 //! [`ClickHouseWriter::execute_all`] path. RFC 0002 contract:
 //!
 //! - `Ok(_)` means the full source-range commit (every chunk for
