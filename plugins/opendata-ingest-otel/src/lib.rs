@@ -5,4 +5,5 @@
 //! the runtime. The runtime crate never depends on this crate; the
 //! dependency runs OTel→runtime only.
 
+pub mod envelope;
 pub mod logs;

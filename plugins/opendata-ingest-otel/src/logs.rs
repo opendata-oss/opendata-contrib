@@ -19,10 +19,13 @@ use opendata_ingest_runtime::decoded_batch::{
     BatchStats, DecodedBatch, DecodedRecords, SourceCoordinateColumns, TypedRecords, TypedSchema,
 };
 use opendata_ingest_runtime::decoder::Decoder;
-use opendata_ingest_runtime::envelope::{MetadataEnvelope, PayloadEncoding, SignalType};
 use opendata_ingest_runtime::error::{RuntimeError, RuntimeResult};
 use opendata_ingest_runtime::identity::SchemaVersion;
 use opendata_ingest_runtime::source::{SourceBatch, SourceEntry};
+
+use crate::envelope::{
+    ConfiguredEnvelope, PayloadEncoding, SignalType, decode_envelopes, validate_consistent,
+};
 
 #[derive(Debug, Error)]
 pub enum OtelDecodeError {
@@ -100,12 +103,29 @@ impl DecodedLogRecord {
     }
 }
 
-#[derive(Debug, Default)]
-pub struct OtlpLogsDecoder;
+/// OTLP logs decoder. Owns the per-entry metadata envelope it expects
+/// (`v1`, `logs`, `otlp_protobuf`); the runtime hands it opaque
+/// metadata bytes and this decoder parses and validates them.
+#[derive(Debug)]
+pub struct OtlpLogsDecoder {
+    expected: ConfiguredEnvelope,
+}
+
+impl Default for OtlpLogsDecoder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl OtlpLogsDecoder {
     pub fn new() -> Self {
-        Self
+        Self {
+            expected: ConfiguredEnvelope {
+                version: 1,
+                signal_type: SignalType::Logs,
+                encoding: PayloadEncoding::OtlpProtobuf,
+            },
+        }
     }
 
     /// Decode every OTLP-protobuf entry in `batch` into flattened
@@ -172,13 +192,20 @@ impl TypedRecords for TypedDecodedLogs {
 }
 
 impl Decoder for OtlpLogsDecoder {
-    fn accepts(&self, envelope: &MetadataEnvelope) -> bool {
-        envelope.version == 1
-            && envelope.signal_type == SignalType::Logs
-            && envelope.encoding == PayloadEncoding::OtlpProtobuf
+    fn accepts(&self, raw_metadata: &[u8]) -> bool {
+        crate::envelope::decode_one(0, raw_metadata)
+            .map(|env| self.expected.matches(&env))
+            .unwrap_or(false)
     }
 
     fn decode(&self, batch: SourceBatch) -> RuntimeResult<Vec<DecodedBatch>> {
+        // The decoder owns envelope interpretation. Parse and validate
+        // every entry's metadata against the expected envelope; a
+        // short, unknown, or mismatched envelope is a fatal error.
+        let envelopes = decode_envelopes(&batch).map_err(|e| RuntimeError::Decoder(Box::new(e)))?;
+        validate_consistent(&envelopes, &self.expected)
+            .map_err(|e| RuntimeError::Decoder(Box::new(e)))?;
+
         let source = batch.source.clone();
         let manifest_path = batch.manifest_path.clone();
         let data_path = batch.data_object_path.clone();
