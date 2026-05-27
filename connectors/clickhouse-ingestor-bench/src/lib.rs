@@ -2,7 +2,7 @@
 //!
 //! The primary surface is the in-memory `correctness.json` smoke
 //! run: five [`ack_invariant_checks`] driven against an in-memory
-//! `ObjectStore` + scripted [`BenchSink`]. The harness writes its
+//! `ObjectStore` + scripted [`BenchSink`](crate::fixtures::BenchSink). The harness writes its
 //! artifacts under
 //! `bench-results/correctness-smoke/<UTC>-smoke/`.
 //! Real ClickHouse + S3 runs are operator work; the binary in

@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 
 /// Append-mode JSONL writer. Flushes on `close()`. One witness
-/// file per scenario; the [`output::CorrectnessReport`] points
+/// file per scenario; the [`crate::output::CorrectnessReport`] points
 /// `ack_invariant_checks[*].evidence` at the relative path under
 /// `raw/correctness/`.
 pub struct WitnessWriter {

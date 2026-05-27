@@ -2,7 +2,7 @@
 //! the `BenchSink` hooks to a trait so the same correctness
 //! scenarios run against both the in-memory `BenchSink` and the
 //! production `ClickHouseSink<OtlpLogsClickHouseAdapter>` (via
-//! [`crate::real_ch::RealClickHouseSink`]) end-to-end.
+//! `RealClickHouseSink`, behind the `real-ch` feature) end-to-end.
 //!
 //! This trait is the scaffolding for running the 4 named
 //! `ack_invariant_checks` against the production sink — without it,
