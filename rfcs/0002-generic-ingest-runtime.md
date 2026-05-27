@@ -9,8 +9,7 @@
 ## Summary
 
 This RFC defines `opendata-ingest-runtime`, a runtime and trait API for
-writing OpenData Buffer streams into a configured sink. It is the
-sink-neutral generalization of the shipped ClickHouse ingestor.
+writing OpenData Buffer streams into a configured sink.
 
 The runtime solves three problems:
 
@@ -43,8 +42,8 @@ API so many systems can be connected without re-writing the plumbing
 each time — here narrowed to sink connectors that read Buffer batch
 files and manifests from object storage.
 
-The first sink ported onto the runtime is the ClickHouse ingestor
-(opendata-contrib RFC 0001), with no intentional behavior change.
+The first sink built on the runtime is a ClickHouse logs sink; its
+design is opendata-contrib RFC 0001.
 
 ## Motivation
 
@@ -63,32 +62,14 @@ to sink connectors over Buffer. Three things drive the design:
   that a sink connector can make its writes idempotent, so retries and
   crash-replay don't duplicate data.
 
-The shipped ClickHouse ingestor (opendata-contrib RFC 0001) already does
-all of this for one sink, but the machinery is fused to that sink:
-
-1. The polling loop, commit grouping, and ack control live in the
-   `clickhouse-ingestor` crate. A second sink would duplicate them or
-   depend on a ClickHouse crate just to reuse them.
-2. The decoded unit is a ClickHouse-shaped row (`Vec<RowValue>`) —
-   row-oriented and JSON-leaning, not a useful interchange shape for a
-   columnar sink or a binary ClickHouse path.
-3. There is one source, one serial decode path, one writer pass — no
-   per-source ack coordinator and no source/decoder/sink boundary.
-4. The Buffer consumer API is serial: `next_batch` fuses manifest read,
-   object fetch, and decode in one call, capping source throughput
-   regardless of downstream concurrency.
-5. Backpressure is implicit in the synchronous loop — no shared byte
-   budget and no surfaced "backpressure reason".
-6. The schema and target table are compiled in, so an operator can't
-   retarget the same logs to a different table or sink without forking
-   the binary.
-
-The fix is to pull the runtime, ack control, and pipeline scaffolding
-into their own crate, define the trait surface a sink plugs into, and
-re-host the ClickHouse path on top of it without intentional behavior
-change. That separates the correctness work (per-source ack frontier,
-single-sink commit invariants, deterministic commit identity) from the
-throughput work (parallel fetch, parallel decode).
+None of these come for free in a sink-specific ingestor, where the
+polling loop, ack control, and decoded row shape all tend to fuse to the
+one target system. So the design pulls the runtime, ack control, and
+pipeline scaffolding into their own crate behind a sink-neutral trait
+surface. That split separates the correctness work (per-source ack
+frontier, single-sink commit invariants, deterministic commit identity)
+from the throughput work (parallel fetch, parallel decode), and lets a
+new sink be a new crate rather than a fork.
 
 ## Goals
 
@@ -177,8 +158,8 @@ This RFC builds on:
   `Consumer::next_descriptors`, concurrent-safe descriptor fetch, and
   `ack_through(sequence)`. The runtime depends on this for parallel
   fetch and bulk ack.
-- **opendata-contrib RFC 0001 (ClickHouse Ingestor)**: shipped layering
-  for the ClickHouse logs path. The generic runtime preserves that
+- **opendata-contrib RFC 0001 (ClickHouse Ingestor)**: the layering for
+  the ClickHouse logs path. The generic runtime preserves that
   layering and generalizes only what must change to support a
   sink-neutral runtime that can host different sink types (one per
   service).
@@ -388,8 +369,9 @@ construction.
 
 ### Trait Surface
 
-The trait and type names below match the shipped `opendata-ingest-runtime`
-crate. The invariants stated alongside them are the contract.
+The trait and type names below match the `opendata-ingest-runtime`
+crate as implemented. The invariants stated alongside them are the
+contract.
 
 #### Source Side: Concrete `BufferSource`
 
@@ -1033,8 +1015,7 @@ implementations are defined in their own crates and follow-up RFCs:
 
 - The OTLP decoder (`logs`, and later `metrics`/`traces`) lives in the
   decoder plugin crate.
-- The ClickHouse sink — the first integration, ported from the shipped
-  ingestor with no intentional behavior change — and a future Iceberg
+- The ClickHouse sink — the first integration — and a future Iceberg
   sink each live in their own crate and RFC.
 
 A runtime service runs one configured sink; each source's `DecodedBatch`
