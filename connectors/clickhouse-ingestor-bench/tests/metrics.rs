@@ -17,12 +17,12 @@ use opendata_ingest_runtime::envelope::{ConfiguredEnvelope, PayloadEncoding, Sig
 use opendata_ingest_runtime::metrics::{
     RuntimeMetrics, SinkLabels, SourceLabels, SourceReasonLabels, StageLabels,
 };
-use prometheus_client::encoding::text::encode;
-use prometheus_client::registry::Registry;
 use opendata_ingest_runtime::runtime::{
     AckFlushPolicy, Runtime, RuntimeOptions, SinkPoolOptions, SourceBackpressureOptions,
 };
 use opendata_ingest_runtime::source::BufferSource;
+use prometheus_client::encoding::text::encode;
+use prometheus_client::registry::Registry;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
@@ -226,7 +226,10 @@ async fn process_recorder_captures_all_named_series_after_10_batches() {
         );
     }
 
-    let sink_inflight_final = metrics.sink_inflight_bytes.get_or_create(&sink_labels).get();
+    let sink_inflight_final = metrics
+        .sink_inflight_bytes
+        .get_or_create(&sink_labels)
+        .get();
     assert_eq!(
         sink_inflight_final, 0,
         "runtime_sink_inflight_bytes{{sink={sink_id}}} \
@@ -260,8 +263,9 @@ async fn process_recorder_captures_all_named_series_after_10_batches() {
     encode(&mut rendered, &registry).expect("encode");
 
     for stage in ["source", "fetch", "decode", "sink_dispatch"] {
-        let expected =
-            format!("runtime_stage_latency_seconds_count{{stage=\"{stage}\",source=\"{source_label}\"}}");
+        let expected = format!(
+            "runtime_stage_latency_seconds_count{{stage=\"{stage}\",source=\"{source_label}\"}}"
+        );
         let line = rendered
             .lines()
             .find(|l| l.starts_with(&expected))
@@ -275,9 +279,7 @@ async fn process_recorder_captures_all_named_series_after_10_batches() {
             .rsplit(' ')
             .next()
             .and_then(|s| s.parse().ok())
-            .unwrap_or_else(|| {
-                panic!("could not parse trailing count from {line:?}")
-            });
+            .unwrap_or_else(|| panic!("could not parse trailing count from {line:?}"));
         assert!(
             count > 0,
             "stage_latency_seconds{{stage={stage}}} should have observations; \

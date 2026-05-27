@@ -294,10 +294,8 @@ fn stamped_record(
     let mut rec = bare_record(sequence, body, row_timestamp_ns);
     // Stringified u64 — mirror exactly what
     // `string_value(IntValue(stamp))` in the OTel decoder produces.
-    rec.resource_attributes.insert(
-        "_odb_gateway_received_at".into(),
-        gateway_ts_ns.to_string(),
-    );
+    rec.resource_attributes
+        .insert("_odb_gateway_received_at".into(), gateway_ts_ns.to_string());
     rec
 }
 
