@@ -8,109 +8,98 @@
 
 ## Summary
 
-This RFC defines `opendata-ingest-runtime`, a sink-neutral runtime that consumes
-OpenData Buffer streams (and, later, other sources) and writes decoded records
-to **one configured sink per runtime service**. It generalizes the layering
-from the shipped ClickHouse ingestor (RFC 0001) into traits and a per-source
-`AckCoordinator` that holds even when multiple sources share one sink and
-ranges complete out of order.
+This RFC defines `opendata-ingest-runtime`, a runtime and trait API for
+writing OpenData Buffer streams into a configured sink. It is the
+sink-neutral generalization of the shipped ClickHouse ingestor.
 
-A single runtime service hosts N sources -> 1 sink. **Independent sinks are
-isolated by independent Buffer queues and runtime service instances.** If the
-same upstream data must land in two sinks, the documented deployment is
-producer-side queue duplication plus two isolated runtime processes.
-Independent sinks should not share a runtime ack frontier, memory budget,
-retry loop, or process liveness.
+The runtime solves three problems:
 
-The runtime is built around two plugin trait boundaries — `Decoder`
-and `Sink` — plus a concrete `BufferSource` on the source side.
-Logical commit identity is a deterministic struct projection
-(`CommitIdentity`); no trait is needed for its construction. For v1, the source side is not a trait: Heracles has one
-source type (OpenData Buffer), and a trait surface would be near 1:1 with
-`buffer::Consumer` / `ConsumerFetchHandle` with no second caller to
-justify it. See "Source Side: Concrete `BufferSource` for v1" and
-"Alternatives: Re-introduce a `SourceReader` Trait Now". The pipeline is
-staged with bounded queues and a shared in-flight byte budget, so a slow
-or failing sink pauses upstream work without unbounded memory growth. For each source, Buffer ack advances
-only when the configured sink has durably committed the corresponding source
-sequence range, or has verified that the range was already committed by an
-earlier attempt.
+1. **Generalize to many sink targets.** Sink-specific code — ClickHouse
+   today — is reduced to a `Sink` trait plus a decoder. The polling,
+   decode orchestration, retry, ack, and backpressure machinery is
+   shared and sink-neutral, so a new sink (Iceberg, another database) is
+   a new crate implementing the trait, not a fork of the ingestor.
+2. **Idempotent writes.** The runtime gives each Buffer source range a
+   unique, deterministic identity (`CommitIdentity`), so a sink can make
+   its writes idempotent under retry and crash-replay. At-least-once
+   delivery from Buffer plus a deterministic identity is what lets a sink
+   achieve exactly-once *effect* without the runtime having to guarantee
+   exactly-once delivery.
+3. **End-to-end pipelining.** Fetch, decode/encode, and write run as
+   concurrent stages with bounded queues and a shared in-flight byte
+   budget, and a per-source ack coordinator advances the Buffer ack
+   frontier only after the sink has durably committed the corresponding
+   range. This lets one service approach single-node network or
+   sink-ingest limits. Parallel fetch and bulk ack build on the Buffer
+   read-ahead API (opendata-buffer RFC 0003).
 
-The decoded unit starts as typed Rust records (compatible with the
-current `DecodedLogRecord` path) and migrates to Arrow `RecordBatch`
-before the first lakehouse sink lands and before ClickHouse moves off
-JSONEachRow. Pluggability starts at native plugin crates plus
-declarative schema/mapping config; WASM and subprocess plugins are
-deferred until the native path is measured.
+A runtime service hosts one or more Buffer sources writing to **one
+configured sink**. To deliver the same upstream data to two sinks, run
+two services with two Buffer queues; independent sinks do not share a
+process, ack frontier, memory budget, or retry loop.
 
-The first integration is RFC 0001's ClickHouse ingestor, ported through
-the generic runtime without intentional behavior changes. The next sink
-is an append-only Iceberg writer (separate RFC), deployed as a standalone
-single-sink runtime service.
+The shape is analogous to Kafka Connect, which provides a runtime and an
+API so many systems can be connected without re-writing the plumbing
+each time — here narrowed to sink connectors that read Buffer batch
+files and manifests from object storage.
+
+The first sink ported onto the runtime is the ClickHouse ingestor
+(opendata-contrib RFC 0001), with no intentional behavior change.
 
 ## Motivation
 
-RFC 0001 ships an ingestor that polls Buffer, validates per-entry
-metadata envelopes, decodes OTLP logs, coalesces records into commit
-groups, plans deterministic ClickHouse insert chunks, executes them, and
-acks Buffer only after all chunks succeed. The layering is sound, but
-six things are tied to the ClickHouse sink today:
+We want an API and runtime for writing OpenData Buffer streams into
+arbitrary downstream systems — the way Kafka Connect provides a runtime
+and an API for moving data between Kafka and many systems, narrowed here
+to sink connectors over Buffer. Three things drive the design:
 
-1. **The runtime is ClickHouse-specific.** The runtime polling loop, the
-   commit group, and the ack controller live in the `clickhouse-ingestor`
-   crate. A different sink (e.g. Iceberg) would either duplicate them or
-   import a ClickHouse-specific crate just to reuse them.
-2. The adapter trait outputs `Vec<InsertChunk>` with a
-   ClickHouse-shaped `Row = Vec<RowValue>`. That row type is
-   row-oriented, JSON-leaning, and not a useful interchange format for
-   columnar sinks like Iceberg/Delta or for a binary ClickHouse path.
-3. **The runtime is single-source / single-loop.** One Buffer manifest,
-   one serial decode path, one writer pass. There is no per-source ack
-   coordinator, no source/decoder/sink boundary, and no model for
-   multiple sources sharing one sink in the same process.
-4. The Buffer consumer API is serial: `Consumer::next_batch` combines
-   manifest read, object fetch, and decode in one call. That ceiling
-   limits source throughput regardless of decode/sink concurrency.
-5. **Backpressure is implicit** in the synchronous pipeline. Slow sinks
-   slow the loop, but there is no shared byte budget and no explicit
-   "backpressure reason" surfaced in metrics.
-6. The schema and target table are compiled into the binary. There is
-   no path for an operator to write the same OTLP logs to a custom
-   ClickHouse table or a new Iceberg table without forking the binary.
+- **Reach.** Different systems (ClickHouse today; Iceberg and others
+  next) should be writable from Buffer without each one re-implementing
+  polling, decode, retry, ack, and backpressure.
+- **Throughput.** The runtime should be built for very high-throughput
+  workloads — parallel fetch, parallel decode, parallel writes — not a
+  serial poll-decode-write loop.
+- **Idempotency.** The API should encode enough about each Buffer range
+  that a sink connector can make its writes idempotent, so retries and
+  crash-replay don't duplicate data.
 
-The high-throughput design calls for one service that can host
-**multiple Buffer sources for one sink**, preserve
-at-least-once with per-source idempotency at the sink, and approach
-single-node network or sink-ingest limits. None of that fits inside the
-ClickHouse ingestor as written. Independent sinks (e.g. ClickHouse and
-Iceberg) deploy as separate runtime services with their own Buffer
-queues; same-process multi-sink fanout is out of scope (see
-"Alternatives: Same-Process Multi-Sink Fanout").
+The shipped ClickHouse ingestor (opendata-contrib RFC 0001) already does
+all of this for one sink, but the machinery is fused to that sink:
 
-The cheapest path forward is to pull the runtime, ack control, and
-pipeline scaffolding into a separate crate, define the trait
-surface that source readers and sinks plug into, and re-host the
-ClickHouse logs path on top of it without intentional behavior
-changes. That refactor isolates the correctness work (per-source
-ack frontier, single-sink commit invariants, deterministic logical
-commit identity) from the throughput work (parallel fetch,
-parallel decode, columnar representation, binary serialization).
-Chunking shape — how a sink turns one source-range `SinkCommit`
-into one or many physical writes — is sink-internal; the runtime
-hands the sink one `SinkCommit` per source range and never
-inspects how the sink plans physical writes.
+1. The polling loop, commit grouping, and ack control live in the
+   `clickhouse-ingestor` crate. A second sink would duplicate them or
+   depend on a ClickHouse crate just to reuse them.
+2. The decoded unit is a ClickHouse-shaped row (`Vec<RowValue>`) —
+   row-oriented and JSON-leaning, not a useful interchange shape for a
+   columnar sink or a binary ClickHouse path.
+3. There is one source, one serial decode path, one writer pass — no
+   per-source ack coordinator and no source/decoder/sink boundary.
+4. The Buffer consumer API is serial: `next_batch` fuses manifest read,
+   object fetch, and decode in one call, capping source throughput
+   regardless of downstream concurrency.
+5. Backpressure is implicit in the synchronous loop — no shared byte
+   budget and no surfaced "backpressure reason".
+6. The schema and target table are compiled in, so an operator can't
+   retarget the same logs to a different table or sink without forking
+   the binary.
+
+The fix is to pull the runtime, ack control, and pipeline scaffolding
+into their own crate, define the trait surface a sink plugs into, and
+re-host the ClickHouse path on top of it without intentional behavior
+change. That separates the correctness work (per-source ack frontier,
+single-sink commit invariants, deterministic commit identity) from the
+throughput work (parallel fetch, parallel decode).
 
 ## Goals
 
 - Define a sink-neutral runtime crate, `opendata-ingest-runtime`, that
-  owns polling, decode orchestration, retry, ack, and backpressure.
-  One source-range `DecodedBatch` → one `SinkCommit` (RFC 0002
-  §Runtime/Sink Boundary); chunking config is owned by each sink
-  plugin, not by the runtime.
-- Define the trait surface for source reading, decoding, and sinks,
-  with no ClickHouse-specific types. Logical commit identity is a
-  deterministic struct projection (`CommitIdentity`); no contract
-  trait is needed for its construction.
+  owns polling, decode orchestration, retry, ack, and backpressure. The
+  runtime hands the sink one commit unit per source range; how that
+  becomes one or many physical writes is the sink's concern.
+- Define the trait surface for decoding and for sinks, with no
+  sink-specific types on the runtime boundary, plus a deterministic
+  commit identity (`CommitIdentity`) for each source range that a sink
+  can derive idempotent write tokens from.
 - Define the per-source `AckCoordinator` state machine and the
   single-sink ack invariant:
 
@@ -118,16 +107,12 @@ inspects how the sink plans physical writes.
   > durably committed or verified prior commit for the relevant source
   > sequence range.
 
-- Define the bounded-stage pipeline with shared byte budget and
+- Define the bounded-stage pipeline with a shared byte budget and
   source-aware fairness, so sink slowdown pauses source pulls without
-  unbounded memory growth and a hot source does not permanently starve
-  a low-volume source on the shared sink writer pool.
-- Define the columnar migration path: typed records first, Arrow
-  `RecordBatch` before the first lakehouse sink and before ClickHouse
-  binary serialization.
-- Define pluggability: native plugin crates as the v1 path, declarative
-  schema/mapping for target tables as the v2 path, dynamic plugins as a
-  measured follow-up.
+  unbounded memory growth and one hot source can't permanently starve a
+  low-volume source on the shared sink writer pool.
+- Define pluggability: a sink is a crate that implements the `Sink`
+  trait and registers by name, so adding a sink needs no runtime change.
 - Define the configuration shape that supports **multiple sources and
   one sink in one process**, with independent per-source ack frontiers.
 - Set validation criteria for the runtime extraction and for the
@@ -147,17 +132,16 @@ inspects how the sink plans physical writes.
   ack frontier, memory budget, retry loop, or process liveness.
 - **Per-sink "skip-and-record" data-loss policy.** Without an explicit
   operator-facing data-loss policy, silently dropping a range from one
-  sink is worse than halting; v1 chooses safety and a single sink
-  per service avoids the question.
+  sink is worse than halting; the runtime chooses safety, and a single
+  sink per service avoids the question.
 - Buffer producer-side concerns. Producer parallelism, exporter
   configuration, and manifest commit coordination are separate work in
   the `opendata-go` repo.
 - Buffer wire format or manifest semantics. The descriptor read-ahead
   and `ack_through` API are specified in a separate `opendata`
   RFC; this RFC consumes them.
-- Schema evolution and DDL ownership. v1 still expects target table
-  schemas to be applied out of band. Declarative schema/mapping config
-  is scoped here, but server-owned migrations are not.
+- Schema evolution and DDL ownership. Target table schemas are applied
+  out of band; server-owned migrations are not in scope.
 - WASM, dylib, or subprocess plugin ABIs. Deferred until the native
   hot path is measured. Mentioned here so the trait shapes do not
   preclude them.
@@ -165,9 +149,6 @@ inspects how the sink plans physical writes.
   at-least-once and lets sinks provide their own idempotent commit
   semantics, derived deterministically from `CommitIdentity` plus the
   sink's own adapter configuration.
-- Replacement of the ClickHouse alpha's correctness model. RFC 0001's
-  dedupe and crash semantics carry over to the ClickHouse sink as it
-  ports to the runtime.
 
 ### Deployment Guidance for Independent Sinks
 
@@ -194,17 +175,13 @@ This RFC builds on:
   strict in-order requirement and `flush()`'s durable dequeue.
 - **opendata-buffer RFC 0003 (Read-Ahead and `ack_through`)**: adds
   `Consumer::next_descriptors`, concurrent-safe descriptor fetch, and
-  `ack_through(sequence)`. The runtime depends on this RFC for
-  parallel fetch and bulk ack; it can ship a serial-fallback path while
-  RFC 0003 is in flight.
+  `ack_through(sequence)`. The runtime depends on this for parallel
+  fetch and bulk ack.
 - **opendata-contrib RFC 0001 (ClickHouse Ingestor)**: shipped layering
-  for the ClickHouse logs path. The generic runtime preserves every
-  layer in 0001 and renames or generalizes only what must change to
-  support a sink-neutral runtime that can host different sink types
-  (one per service).
-- **The high-throughput ingestor design narrative**: the companion
-  design doc this RFC formalizes. The design doc is the product story;
-  this RFC is the contract.
+  for the ClickHouse logs path. The generic runtime preserves that
+  layering and generalizes only what must change to support a
+  sink-neutral runtime that can host different sink types (one per
+  service).
 
 The relevant Buffer types (read-ahead form, `Consumer` calls collapsed
 to what the runtime uses):
@@ -242,23 +219,26 @@ The runtime relies on three properties from this contract:
   concurrency-safe. This is what makes parallel object fetch possible
   without changing manifest semantics.
 - **Per-range metadata is per-entry, not per-batch**. The runtime
-  preserves the `RawEntry` materialization from RFC 0001 (see "Source
-  Reader" below).
+  flattens the per-entry metadata onto each materialized entry (see
+  "Source Side" below). Buffer stores this metadata as an **opaque byte
+  payload** — it never interprets it — and the runtime carries it
+  through unchanged. Any envelope structure inside those bytes is a
+  producer↔decoder convention the decoder owns, not part of the Buffer
+  wire format or the runtime.
 
 ## Design
 
 ### Architecture
 
-The runtime owns the horizontal stages between Buffer (or another source)
-and the configured sink. N source pipelines feed one shared sink writer
-pool:
+The runtime owns the horizontal stages between Buffer and the configured
+sink. N source pipelines feed one shared sink writer pool:
 
 ```text
                           ╔═══ ingest-runtime process (1 sink) ════════════════════════════════════════════════════════════════════════╗
                           ║                                                                                                            ║
                           ║   ┌──────────────┐   ┌──────────────┐   ┌─────────────────┐                                                 ║
-                          ║   │ Descriptor   │   │  Fetch+      │   │ Envelope+Signal │                                                 ║
-                       ┌──╫───▶  poller      ├───▶  decompress  ├───▶ decoder         ├──┐                                              ║
+                          ║   │ Descriptor   │   │  Fetch+      │   │ Envelope +      │                                                 ║
+                       ┌──╫───▶  poller      ├───▶  decompress  ├───▶ decode          ├──┐                                              ║
                        │  ║   │ (per source) │   │   workers    │   │   workers       │  │                                              ║
 ╔══Object Storage══╗   │  ║   └──────┬───────┘   └──────────────┘   └─────────────────┘  │ one SinkCommit                              ║
 ║                  ║   │  ║          │ N source pipelines                                │ per source range                            ║
@@ -279,18 +259,18 @@ pool:
                           ╚════════════════════════════════════════════════════════════════════════════════════════════════════════════╝
 ```
 
-There is **no `CommitGroup` stage** between decode and the shared
-sink writer pool. The runtime emits one `SinkCommit` per source
-range. Any future sink-side chunking accumulator lives inside the
-sink plugin, not on the runtime surface.
+Decode hands each `DecodedBatch` straight to the shared sink writer
+pool as one `SinkCommit` per source range. There is no intermediate
+accumulation stage on the runtime surface; if a sink wants to batch or
+chunk, it does so inside the plugin.
 
 What is generic vs. plugin:
 
 | Layer | Owner |
 |---|---|
-| Source descriptor poller, fetch workers, decompression | Runtime (`BufferSource` concrete for v1) |
-| Per-entry envelope materialization (RFC 0001 `RawEntry`) | Runtime |
-| Signal decoder | Plugin (`Decoder`) |
+| Source descriptor poller, fetch workers, decompression | Runtime (`BufferSource`) |
+| Per-entry envelope materialization | Runtime |
+| Decoder | Plugin (`Decoder`) |
 | Logical commit identity (`CommitIdentity`) | Runtime |
 | Sink write, physical idempotency tokens, chunk/file planning, retry classification | Plugin (`Sink`) |
 | Per-source `AckCoordinator`, source ack/flush, multi-source fairness across the shared sink writer | Runtime |
@@ -328,37 +308,29 @@ distinct:
 
 The trait surface follows from this split.
 
-**Runtime responsibilities:**
+**The runtime** reads from the source and owns the manifest cursor (it
+holds the per-source `&mut BufferSource`). It admits descriptors in
+contiguous source-sequence order — no gaps — which is the property that
+lets the ack coordinator advance the frontier by a simple
+contiguous-prefix check. It orchestrates fetch and decode across
+parallel workers under bounded queues and byte/batch budgets, runs the
+retry loop (including resolving an ambiguous write via
+`Sink::check_committed`), and coordinates per-source acks so the
+frontier advances correctly even when ranges complete out of order.
+Finally, it constructs the `CommitIdentity` for each range — a
+deterministic projection of `(source, sink, range, schema_version)`,
+with no hashing, fingerprinting, or sink-specific fields.
 
-- Source IO and manifest cursor ownership (per-source
-  `&mut BufferSource`).
-- Descriptor admission and `INV-ADMISSION-CONTIGUOUS`.
-- Fetch and decode orchestration (parallel workers, bounded queues,
-  byte/batch budgets).
-- Per-source ack coordination (`AckCoordinator`; frontier advancement
-  under out-of-order completion).
-- Retry orchestration (`write_with_retry`; `MaybeCommitted` resolution
-  via `Sink::check_committed`).
-- `CommitIdentity` construction — a deterministic projection of
-  `(source, sink, sequence_range, schema_version)`. No hashing, no
-  fingerprinting, no sink-specific fields.
+**The sink** receives one `SinkCommit` per source range and turns it
+into durable writes. It reads the decoded records it understands,
+validates its own invariants (row ordering, schema compatibility),
+plans the physical writes (chunking, file boundaries, partitioning),
+derives its physical idempotency tokens from the `CommitIdentity` plus
+its own configuration, and executes the writes. How a range becomes one
+or many physical operations is entirely the sink's decision; the runtime
+never inspects it.
 
-**Sink/plugin responsibilities:**
-
-- Downcasting `DecodedBatch` to the typed records the sink understands.
-- Validating sink-specific invariants (single manifest path, row
-  ordering, schema compatibility).
-- Planning physical writes — chunking, file boundaries, partition
-  selection. The runtime hands the sink one `SinkCommit` per source
-  range; the sink decides how that range becomes one or many physical
-  operations.
-- Computing physical idempotency tokens from `CommitIdentity` +
-  adapter configuration. The runtime supplies the logical identity;
-  the sink turns it into whatever primitive its target system
-  requires.
-- Executing the writes.
-
-**Handoff shape:**
+**The runtime → sink handoff types:**
 
 ```rust
 pub struct SequenceRange {
@@ -416,24 +388,31 @@ construction.
 
 ### Trait Surface
 
-All trait names below are placeholders the implementation may rename;
-the invariants are the contract.
+The trait and type names below match the shipped `opendata-ingest-runtime`
+crate. The invariants stated alongside them are the contract.
 
-#### Source Side: Concrete `BufferSource` for v1
+#### Source Side: Concrete `BufferSource`
 
-The runtime owns a concrete `BufferSource` per configured source.
-There is no source-side trait surface in v1: Heracles has one source
-type (OpenData Buffer), and a trait surface would be near 1:1 with
-`buffer::Consumer` / `ConsumerFetchHandle` (RFC 0003) with no second
-caller to justify it. See "Re-introduce a `SourceReader` Trait Now"
-under Alternatives Considered for the trade-off.
+The runtime owns a concrete `BufferSource` per configured source. The
+source side is concrete rather than a trait because there is one source
+type — OpenData Buffer — and a trait over it would be close to 1:1 with
+`buffer::Consumer` / `ConsumerFetchHandle`. (The trade-off, and what it
+would take to add a second source type, is in "A Source Trait Instead of
+a Concrete Source" under Alternatives Considered.)
 
-`BufferSource` wraps `buffer::Consumer` (manifest owner, `&mut self`)
-and exposes a paired `BufferSourceFetchHandle` (cloneable,
-`Send + Sync + 'static`) that wraps `buffer::ConsumerFetchHandle`. The
-split mirrors RFC 0003: the owner mutates manifest cursors and the
-durable ack frontier under `&mut self`; the handle is cloned into N
-fetch worker tasks under `&self`.
+`BufferSource` is a thin wrapper over `buffer::Consumer`. The wrapper
+earns its place by doing two things the bare consumer doesn't:
+
+1. **It adapts Buffer's types into the runtime's sink-neutral types.**
+   `fetch` flattens each batch's per-entry metadata onto the entries it
+   returns and attaches runtime-only fields (`SourceId`, the manifest
+   and data paths) that the sink needs as source coordinates but that
+   `buffer` does not carry.
+2. **It splits the mutable owner from the cloneable fetch handle.** The
+   owner mutates the manifest cursor and the durable ack frontier under
+   `&mut self`; the paired `BufferSourceFetchHandle` (cloneable,
+   `Send + Sync + 'static`) is handed to N fetch worker tasks that pull
+   objects concurrently under `&self`.
 
 ```rust
 pub struct BufferSource {
@@ -485,14 +464,6 @@ pub struct SourceBatchDescriptor {
     pub sequence: u64,
     pub location: String,
     pub per_range_metadata: Vec<SourceRangeMetadata>,
-    /// Object size in bytes, when the source can supply it without an
-    /// extra round trip. `BufferSource` passes this through from
-    /// `BatchDescriptor.object_bytes` (RFC 0003), which is `None`
-    /// until the manifest format carries object size as a follow-up.
-    /// When `None`, the runtime's byte-budget accounting uses the
-    /// configured `source.estimated_max_batch_bytes` as a pessimistic
-    /// reservation; see "Backpressure Model > Byte Budget Accounting".
-    pub object_bytes: Option<u64>,
 }
 
 pub struct SourceBatch {
@@ -511,79 +482,61 @@ pub struct SourceEntry {
 }
 ```
 
-`SourceBatch` is a renamed superset of RFC 0001's `RawBufferBatch`.
 `BufferSource::next_descriptors` calls
 `buffer::Consumer::next_descriptors(max)` and filters returned
 descriptors against `budget.bytes_remaining`. `fetch_handle()` returns
 a cheap clone. `ack_through` and `flush_acks` are pass-throughs to
 `Consumer::ack_through` / `Consumer::flush`.
-`BufferSourceFetchHandle::fetch` calls `ConsumerFetchHandle::fetch`
-(RFC 0003) and runs `split_into_raw_entries` to produce a `SourceBatch`.
+`BufferSourceFetchHandle::fetch` calls `ConsumerFetchHandle::fetch` and
+flattens the result into a `SourceBatch`.
 
-The data types above (`SourceId`, `SourceBatchDescriptor`,
-`SourceBatch`, `SourceEntry`, `SourceBudget`, `SourceRangeMetadata`)
-stay sink-neutral in the runtime crate. They carry runtime-only
-fields — `SourceId` for idempotency keys and metric labels;
-`manifest_path` for the `_odb_manifest_path` system column;
-pre-flattened `per_range_metadata` parallel to entries — that the
-underlying buffer types don't.
+These types (`SourceId`, `SourceBatchDescriptor`, `SourceBatch`,
+`SourceEntry`, `SourceBudget`, `SourceRangeMetadata`) stay sink-neutral
+in the runtime crate. They exist to carry the source metadata the sink
+needs — the source identity, the manifest and data object paths, and
+the per-entry metadata flattened parallel to entries — none of which the
+underlying `buffer` types expose in this shape.
 
-If RFC 0003 of opendata-buffer is not yet released, `BufferSource`
-falls back to a serial path that calls `Consumer::next_batch` and
-emits a single descriptor whose location is the just-fetched batch.
-`BufferSourceFetchHandle::fetch` then pops from an internal
-sequence-keyed cache of pre-fetched batches. This compatibility path
-is dropped once the read-ahead consumer ships.
-
-For test fakes in the correctness harness, the runtime crate
-introduces a `#[cfg(test)]` source seam — production callers stay on
-the concrete `BufferSource`. The seam shape (small trait under
-`#[cfg(test)]` vs. a `Source` enum vs. handcrafted fixtures) is an
-implementation detail of the harness.
-
-If/when a non-Buffer source lands (Kafka direct, OTLP HTTP push,
-file scan), reintroducing a `SourceReader` trait is a local change
-inside the runtime crate. Sinks and the correctness harness do not
-depend on the source shape, so the cost of waiting is bounded.
+For test fakes, the runtime crate introduces a `#[cfg(test)]` source
+seam so the correctness harness can drive a fake source; production
+callers stay on the concrete `BufferSource`.
 
 #### `Decoder`
 
 ```rust
 pub trait Decoder: Send + Sync + 'static {
-    fn accepts(&self, envelope: &MetadataEnvelope) -> bool;
+    /// Whether this decoder handles entries carrying the given opaque
+    /// per-entry metadata bytes. The runtime passes the bytes through
+    /// without interpreting them.
+    fn accepts(&self, raw_metadata: &[u8]) -> bool;
 
     fn decode(&self, batch: SourceBatch)
         -> RuntimeResult<Vec<DecodedBatch>>;
 }
-
-pub struct MetadataEnvelope {
-    pub version: u8,
-    pub signal_type: SignalType,
-    pub encoding: PayloadEncoding,
-}
 ```
 
-v1 contract: **one decoder per source**. The runtime calls
-`accepts(envelope)` once per source, with the source's configured
-envelope, at startup or on first non-empty batch. If `accepts` returns
-false, the runtime fails closed (mirroring RFC 0001). `decode` is then
-called per `SourceBatch` and consumes the whole batch.
+**The runtime treats per-entry metadata as opaque bytes.** It does not
+parse, interpret, or validate them — it carries them through on each
+`SourceEntry` and hands them to the decoder. The decoder owns the
+metadata format: it decides via `accepts` whether it handles a given
+payload, and validates the metadata inside `decode`, returning `Err`
+on an unexpected or inconsistent payload, which the runtime treats as
+fatal (no ack advances). Any envelope shape — for the OTLP decoders
+shipping today, a small header naming the OTLP signal and encoding — is
+defined and parsed entirely in the decoder's own crate, never in the
+runtime.
 
-The trait shape is wider than the v1 contract on purpose: the decoder
-is invoked per-batch, but `accepts(envelope)` takes a single envelope
-so a future runtime can dispatch entries with different envelopes to
-different decoders. **That future dispatch is not implemented in v1**
-because `Decoder::decode(&self, batch: SourceBatch)` consumes the
-entire batch; supporting it requires either splitting `SourceBatch`
-upstream of decoders (a runtime change) or evolving the trait to
-`decode(&self, batch: SourceBatch, entry_indices: &[u32])` (a trait
-change). Either path is a follow-up RFC; v1 keeps the homogeneous-
-envelope-per-source rule from RFC 0001.
+The contract is **one decoder per source**. The runtime calls
+`accepts` on the first entry's metadata as a fail-fast, then calls
+`decode` per `SourceBatch`; `decode` consumes the whole batch,
+validates every entry's metadata, and returns one `DecodedBatch`.
 
-`decode` returns `Vec<DecodedBatch>` so a future per-signal split can
-emit multiple decoded batches (e.g. mixed signals in a future
-multi-signal source). **For v1 each `Decoder` returns at most one
-`DecodedBatch` per call.**
+The trait is shaped slightly wider than that contract — `accepts` takes
+one entry's metadata and `decode` returns a `Vec` — so a future runtime
+can route entries with different metadata to different decoders and emit
+several decoded batches per source batch. That dispatch is not built
+today (a single source carries homogeneous metadata); see "Future
+Improvements".
 
 #### `DecodedBatch`
 
@@ -606,23 +559,11 @@ pub struct DecodedBatch {
 }
 
 pub enum DecodedRecords {
-    /// Typed Rust records, today: `Vec<DecodedLogRecord>` from RFC 0001.
-    /// Wrapped in `Arc` so the runtime can hand the batch through
-    /// async stages (decode handoff, sink-writer queue, retry path)
-    /// without copying records; sinks that need a typed view
-    /// downcast through `as_any`.
+    /// Typed Rust records, reference-counted so the runtime can move
+    /// the batch through async stages without copying records; sinks
+    /// downcast through `as_any` to the concrete record type.
     Typed(Arc<dyn TypedRecords + Send + Sync>),
-    /// Arrow columnar batch. `RecordBatch` is internally `Arc`-shared
-    /// across columns, but we wrap it in an outer `Arc` so the
-    /// `DecodedRecords` enum is `Clone` cheaply across stages.
-    Arrow(Arc<arrow_array::RecordBatch>),
-}
-
-impl Clone for DecodedRecords {
-    /// O(1) reference-count clone. Used by the runtime to pass the
-    /// decoded batch through async stages (sink-writer queue,
-    /// retry path) without copying records.
-    fn clone(&self) -> Self { /* trivial */ unimplemented!() }
+    // A columnar `Arrow(Arc<RecordBatch>)` variant is future work.
 }
 
 pub trait TypedRecords: Send + Sync {
@@ -643,53 +584,20 @@ pub struct SourceCoordinateColumns {
 }
 ```
 
-Two design decisions worth flagging:
+`SourceCoordinateColumns` ties each decoded record back to its place in
+the source. A Buffer batch (one sequence) holds a list of entries (one
+per producer append); the decoder expands each entry into zero or more
+records. The parallel vectors map every output record to the batch it
+came from (`sequences`), the entry within that batch (`entry_indices`),
+and the record's position within the entry (`record_indices`), plus the
+batch's manifest/data paths and per-entry ingestion time. Keeping these
+parallel to the records rather than embedded in them lets each sink
+materialize the subset it needs — as system columns, file metadata, or
+otherwise — without the decoder having to know any sink's schema.
 
-- **The `DecodedRecords` enum exists for migration, not as a permanent
-  shape.** The current path ships Typed only; an Arrow variant is future
-  work, to land alongside benches that compare the two. Once Arrow is in,
-  Typed is retained for the OTLP-logs path until ClickHouse and Iceberg
-  are both on Arrow, then removed.
-- **`source_columns` is parallel to records, not embedded in them.**
-  This lets the ClickHouse adapter materialize source columns as system
-  columns (RFC 0001 `_odb_*`), and lets the Iceberg writer attach them
-  to snapshot metadata or as Parquet columns, without forcing every
-  decoder to know either sink's schema.
-- **`DecodedRecords` is reference-counted; `SourceCoordinateColumns`
-  is plain-owned.** A `DecodedBatch` produced by a decoder is
-  consumed once by the runtime, which constructs one `SinkCommit`
-  for that source range and hands it to the configured sink.
-  `DecodedRecords` wraps its payload in `Arc` (`Typed(Arc<dyn
-  TypedRecords>)` or `Arrow(Arc<RecordBatch>)`) so the
-  `SinkCommit` clone on the retry path is O(1) for the
-  potentially-large record payload. `SourceCoordinateColumns`,
-  by contrast, is a plain owned struct of small `Vec`s
-  (`Vec<u64>` / `Vec<u32>` / `Vec<i64>` parallel to records);
-  the retry-path `clone()` deep-copies those vectors. The Vecs
-  are sized by the row count of one source range and the retry
-  rate is low, so the deep copy is acceptable; if a future
-  workload demonstrates measurable retry-path overhead from
-  source-column cloning, wrapping the struct in `Arc` is a
-  local change. Sinks that need to materialize a projection of
-  the batch (e.g. an Iceberg writer that writes Parquet columns
-  from a subset of fields) do so on their own thread; they read
-  records through the `Arc` and either project columns
-  directly or own the resulting projection.
-
-`source_entry_count` lets the per-source `AckCoordinator` advance
-the input high-watermark even when `records` is empty, mirroring
-RFC 0001's "Input progress is independent of output rows" property.
-
-#### Routing (Future)
-
-There is no `Router` trait in v1. A runtime service has one configured
-sink and the entire `DecodedBatch` flows to that sink for the source
-range it covers. If a future use case requires record-level routing
-inside one sink (e.g. attribute-based table selection), that is
-handled at the sink/schema-mapping layer (see "Configuration Shape" and
-"Future Improvements") rather than as a runtime trait. Cross-sink
-fanout in one runtime process is explicitly out of scope; see
-"Alternatives: Same-Process Multi-Sink Fanout".
+`source_entry_count` lets the per-source `AckCoordinator` advance the
+input high-watermark even when `records` is empty, so a batch that
+decodes to zero records still advances the Buffer ack frontier.
 
 #### `Sink`
 
@@ -727,16 +635,12 @@ Iceberg can cancel a snapshot commit but cannot reliably delete data
 files written outside that commit. Requiring atomic-with-rollback
 would force sinks into either a two-phase commit none of these systems
 support cleanly, or aggressive cleanup paths that turn ambiguous
-errors into data loss. The "idempotent retry" rule is the right
-contract for both ClickHouse insert dedupe and Iceberg snapshot-based
-identity.
+errors into data loss.
 
-What the runtime *does* require: between `Err(_)` and the next
-`write` retry, the sink must not produce divergent state for the
-same `CommitIdentity`. A sink that decides on retry to use a
-different chunking, a different Parquet schema, or a different
-internal commit identity violates the idempotency contract and will
-cause duplicate data.
+What the runtime *does* require: between `Err(_)` and the next `write`
+retry, the sink must not produce divergent state for the same
+`CommitIdentity`. A sink that uses a different commit identity on retry
+violates the idempotency contract and will cause duplicate data.
 
 ```rust
 #[async_trait::async_trait]
@@ -840,8 +744,8 @@ Without it, a `MaybeCommitted` event would either ack-on-first-success
 used for crash-replay (after a process restart, before the runtime
 advances acks past the durable frontier) and for `MaybeCommitted`
 resolution. The ClickHouse sink implements it as a no-op that
-always returns `Unknown` because alpha ClickHouse dedupes at the
-table layer with `ReplacingMergeTree(_adapter_version)`. The
+always returns `Unknown` because it dedupes at the table layer with
+`ReplacingMergeTree(_adapter_version)`. The
 Iceberg sink implements it by inspecting snapshot metadata for a
 file whose path / token matches the one its adapter would
 recompute from `identity`.
@@ -860,8 +764,7 @@ configuration; the runtime never inspects sink-physical tokens.
 ```rust
 pub struct SchemaVersion(pub u32);
 
-/// Inclusive range over Buffer batch sequences. Single-batch ranges
-/// have `low == high` — the runtime never coalesces source ranges.
+/// Inclusive range over Buffer batch sequences.
 pub struct SequenceRange {
     pub low: u64,
     pub high: u64,
@@ -880,34 +783,48 @@ pub struct CommitIdentity {
 }
 ```
 
+`range` is an inclusive span over Buffer batch sequences. The runtime
+emits one commit per source batch and does not coalesce batches, so
+`low == high` always today; the span is a range rather than a single
+sequence only to leave room for a future runtime that merges several
+small source batches into one commit. A sink should not assume
+single-batch ranges.
+
+`schema_version` identifies the version of the *decoded record schema* —
+the shape the decoder produces and the sink writes. It is not the
+producer's wire-envelope `version` byte, and it is not read from the
+source: the decoder stamps it on every `DecodedBatch` as a property of
+itself and its target schema. It is in the commit identity so that
+changing the decoded schema changes the identity — a write under a new
+schema is never deduped against an old-schema write of the same range.
+
 The canonical `Display` projection is
 
 ```text
 {source}:{sink}:{low}-{high}:{schema_version}
 ```
 
-which the runtime uses for log fields and metric labels. The
-ClickHouse sink, internally, builds its full per-chunk
-`insert_deduplication_token` by appending its adapter version, its
-chunking fingerprint (a hash of its own adapter configuration), and
-its `chunk_index`:
-
-```text
-{manifest_path}:{database}.{table}:{low}-{high}:{adapter_version}:{chunking_fingerprint}:{chunk_index}
-```
-
-The Iceberg sink does the analogous thing for its Parquet file
-identity. Sinks own those suffixes; the runtime never constructs
-them. The chunking fingerprint is a sink concern — every sink's
-adapter configuration produces its own — and it never appears on
-the runtime surface.
+which the runtime uses for log fields and metric labels. A sink builds
+its own physical dedupe token by extending this identity with whatever
+its target system needs (e.g. a ClickHouse `insert_deduplication_token`
+appends the adapter version, a chunking fingerprint, and a chunk index).
+Those suffixes are a sink concern; the runtime never constructs or
+inspects them.
 
 ### Per-Source Ack Coordinator
 
-The ack coordinator is the single most important piece of correctness
-that changes from RFC 0001 to this RFC. There is **one coordinator per
-source**; coordinators are independent — one source's committed range
-never advances another source's frontier.
+The ack coordinator is the piece that makes parallel writes safe. Buffer
+ack must advance as a contiguous prefix of the sequence stream, but the
+pipeline fetches, decodes, and commits ranges concurrently, so ranges
+finish out of order. The coordinator reconciles those out-of-order
+commits into a monotonic, gap-free ack frontier: it tracks which ranges
+have committed and advances the durable Buffer ack only across the
+contiguous committed prefix. Without it, concurrency could either
+advance the ack past a hole (data loss on replay) or not advance it at
+all.
+
+There is **one coordinator per source**; coordinators are independent —
+one source's committed range never advances another source's frontier.
 
 #### State Machine
 
@@ -959,8 +876,7 @@ The state transitions are:
    over a hole.
 4. **Flush** calls `BufferSource::ack_through(frontier)` and then
    `BufferSource::flush_acks` per the configured `AckFlushPolicy`
-   (default: every committed source range, mirroring RFC 0001's
-   per-commit-group flush cadence).
+   (default: flush after every committed source range).
 
 > **Why a single-bit per range is sufficient.** The scope of one
 > configured sink per runtime service, plus the sink contract —
@@ -974,7 +890,7 @@ The state transitions are:
 #### Crash Semantics
 
 - **Crash before sink commit**: nothing in the Buffer ack moves.
-  Source replays the range. Same outcome as RFC 0001.
+  The source replays the range.
 - **Crash after sink commit, before ack flush**: the ack frontier did
   not advance (the range was committed but not yet flushed). On
   replay the runtime calls `check_committed(&identity)` *before*
@@ -1036,11 +952,11 @@ these, but the semantics carry through):
 
 - `source.max_inflight_batches`
 - `source.max_inflight_bytes`
-- `source.estimated_max_batch_bytes` — pessimistic reservation per
-  batch when `BatchDescriptor.object_bytes` is `None`. Defaults to
-  `source.max_inflight_bytes / source.max_inflight_batches` rounded
-  up; operators override when the workload is known to use larger
-  batches.
+- `source.estimated_max_batch_bytes` — the per-batch byte reservation.
+  The manifest does not carry object size, so the runtime reserves this
+  estimate for every batch. Defaults to `source.max_inflight_bytes /
+  source.max_inflight_batches` rounded up; operators override when the
+  workload is known to use larger batches.
 - `source.fetch_concurrency`
 - `source.decompress_concurrency`
 - `decode.concurrency`
@@ -1058,12 +974,10 @@ In-flight bytes are tracked from descriptor reservation through sink
 commit. The accounting rule is the same regardless of source:
 
 1. **At descriptor reservation** (when `next_descriptors` produces a
-   batch and the runtime decides whether to fetch it):
-   - If `descriptor.object_bytes == Some(n)`, reserve `n` bytes from
-     the source's in-flight budget.
-   - If `descriptor.object_bytes == None` (Buffer's current case;
-     RFC 0003 reserves the field but the manifest does not yet carry
-     it), reserve `source.estimated_max_batch_bytes` bytes.
+   batch and the runtime decides whether to fetch it): reserve
+   `source.estimated_max_batch_bytes` from the source's in-flight
+   budget. The manifest carries no object size, so this estimate is the
+   reservation for every batch.
 2. **After fetch and decode**: the reservation is reconciled to the
    actual `SourceBatch` payload size (post-decompress, pre-decode)
    plus the decoded `DecodedBatch.estimated_bytes()`. The previous
@@ -1075,12 +989,10 @@ commit. The accounting rule is the same regardless of source:
    persists until the range is decisively committed or the runtime
    halts.
 
-The runtime never uses HEAD requests against object storage to
-discover sizes. The `estimated_max_batch_bytes` fallback is intentional
-slack: it overcounts in the common case and the source poller pauses
-sooner than it strictly has to. When a future Buffer manifest format
-revision (or an opt-in producer-side metadata extension) provides
-`object_bytes`, the accounting becomes tight.
+The runtime never uses HEAD requests against object storage to discover
+sizes. The `estimated_max_batch_bytes` reservation is deliberately
+pessimistic: it overcounts in the common case, so the source poller
+pauses a little sooner than it strictly has to.
 
 The correctness harness demonstrates this by showing
 `runtime_stage_inflight_bytes{stage,source}` rising and the source
@@ -1106,74 +1018,27 @@ Required metrics (stage-labeled):
 These metrics are how an operator audits the runtime under
 concurrency without re-reading code.
 
-### Columnar Migration
-
-The `DecodedRecords` enum is shaped to support both
-`DecodedRecords::Typed` and a future `DecodedRecords::Arrow`. The
-current state and the planned migration:
-
-1. **Typed only (current)**: the OTLP logs decoder produces
-   `Vec<DecodedLogRecord>`. A `TypedRecords` adapter wraps it and the
-   ClickHouse sink downcasts back. Behavior is equivalent to RFC 0001.
-2. **Arrow prototype (future work)**: an Arrow OTLP logs decoder built
-   behind a feature flag, with benchmarks comparing per-record
-   allocation, end-to-end stage latency, ClickHouse serialization cost,
-   and projected Iceberg/Parquet write cost.
-3. **ClickHouse binary format (future work)**: ClickHouse moves to a
-   binary format (`RowBinaryWithNamesAndTypes` or Native), reading from
-   `Arrow`.
-4. **Iceberg sink (future work)**: Iceberg reads from `Arrow` directly.
-5. **Typed retirement (future work)**: the Typed path is retired for
-   OTLP logs. The runtime may keep `DecodedRecords::Typed` available for
-   unusual signals that do not have a clean Arrow representation, but the
-   default becomes Arrow.
-
-Arrow-vs-typed is a measured decision, not a stylistic one. The Arrow
-benchmark gates the migration; if Arrow loses on the targeted workloads,
-the migration stalls and the runtime contract is revisited.
-
 ### Source Reader: Buffer Implementation
 
-See "Source Side: Concrete `BufferSource` for v1" under Trait Surface.
-That section is the canonical description of `BufferSource` and
-`BufferSourceFetchHandle`, including the RFC 0003 read-ahead path,
-the serial-`next_batch` compatibility fallback, and the
-`split_into_raw_entries` materialization. There is no separate trait
-implementation to describe — the source side is concrete for v1.
+See "Source Side: Concrete `BufferSource`" under Trait Surface for the
+canonical description of `BufferSource` and `BufferSourceFetchHandle`.
+The source side is concrete, so there is no separate trait
+implementation to describe here.
 
-### Decoder: v1 Defaults
+### Decoders and Sinks
 
-v1 ships:
+This RFC defines the runtime-side *interfaces* — the `Decoder` and
+`Sink` traits and the types that cross them. The concrete
+implementations are defined in their own crates and follow-up RFCs:
 
-- `OtlpLogsDecoder`: pulled from `clickhouse-ingestor::signal`,
-  unchanged behavior. `accepts(envelope)` returns true for `(version=1,
-  signal_type=Logs, encoding=OtlpProtobuf)`.
-- A future `OtlpMetricsDecoder` once metrics targets ship; not v1.
+- The OTLP decoder (`logs`, and later `metrics`/`traces`) lives in the
+  decoder plugin crate.
+- The ClickHouse sink — the first integration, ported from the shipped
+  ingestor with no intentional behavior change — and a future Iceberg
+  sink each live in their own crate and RFC.
 
-Per-entry envelope dispatch across decoders is supported by the trait
-shape but not implemented in v1. v1 fails closed on mixed envelopes
-within a single source, mirroring RFC 0001.
-
-There is no `Router` trait in v1. Each source's `DecodedBatch` flows
-to the single configured sink for the runtime service.
-
-### Sink Plugins: ClickHouse and Iceberg
-
-This RFC does not specify the ClickHouse or Iceberg sinks; they have
-their own RFCs and crates. The required compatibility points:
-
-- **ClickHouse**: the existing `Adapter::plan -> Vec<InsertChunk>` path
-  becomes the body of `clickhouse_sink::write`. The deterministic
-  chunking, idempotency token construction, and ClickHouse settings
-  carry over unchanged. `check_committed` returns `Unknown`; the
-  ClickHouse sink relies on `ReplacingMergeTree(_adapter_version)` for
-  long-window dedupe, exactly as RFC 0001 documents.
-- **Iceberg**: writes Parquet data files whose keys are derived
-  deterministically from the runtime's `CommitIdentity` plus the
-  sink's adapter configuration; commits via the configured catalog;
-  and implements `check_committed(&identity)` by inspecting snapshot
-  metadata for a file whose key matches the one the adapter would
-  recompute. Detailed semantics in the Iceberg RFC.
+A runtime service runs one configured sink; each source's `DecodedBatch`
+flows to that sink for the range it covers.
 
 ### Configuration Shape
 
@@ -1197,16 +1062,13 @@ sources:
         type: Aws
         bucket: opendata-otel-logs
         region: us-west-2
-    envelope:
-      version: 1
-      signal_type: logs
-      encoding: otlp_protobuf
+    # The decoder owns the metadata envelope it expects; the runtime
+    # passes per-entry metadata through as opaque bytes. The operator
+    # only selects which decoder to register.
     decoder: otlp_logs
     ack:
-      # `every_source_range` mirrors the runtime contract — one
-      # SinkCommit per source range. The legacy `every_commit_group`
-      # token is still accepted on the YAML side for backward
-      # compatibility with older configs.
+      # Flush the ack frontier after each committed source range (one
+      # SinkCommit per range).
       policy: every_source_range
     backpressure:
       max_inflight_batches: 64
@@ -1240,11 +1102,10 @@ Key shape decisions:
   independent Buffer queues and processes.
 - **Sources are a top-level list keyed by `id`.** Each source has its
   own ack and backpressure config; sharing a pool would couple
-  high-volume and low-volume signals.
-- **`schema_ref` selects a built-in template or a user-supplied
-  schema/mapping file** (see Level 2, future work). The string
-  `builtin/<name>` resolves to a compiled-in template; any other value
-  is a path to a user schema/mapping document.
+  high-volume and low-volume sources.
+- **`schema_ref` selects a built-in template.** The string
+  `builtin/<name>` resolves to a compiled-in template. User-supplied
+  schema/mapping documents are future work (see "Future Improvements").
 - **The sink declares retry and concurrency at the sink level.** The
   runtime applies them; sink plugins do not implement their own retry
   loops.
@@ -1254,80 +1115,55 @@ Key shape decisions:
   `source_mappings` / `tables` / `schema_ref_by_source` structure;
   this is a sink-side feature, not a runtime trait.
 
-### Pluggability Levels
+### Plugin Model
 
-#### Level 1: Native Plugin Crates (v1)
-
-Each plugin is a crate that depends on `opendata-ingest-runtime` and
-implements the trait it owns:
-
-- `opendata-ingest-otel`: `OtlpLogsDecoder`, future
-  `OtlpMetricsDecoder`, `OtlpTracesDecoder`.
-- `opendata-ingest-clickhouse`: `Sink` for ClickHouse.
-- `opendata-ingest-iceberg`: `Sink` for Iceberg append-only.
-
-A binary crate links the plugins it needs and registers them by name:
+A plugin is a crate that depends on `opendata-ingest-runtime` and
+implements the trait it owns — a `Decoder` (e.g. an OTLP decoder crate)
+or a `Sink` (e.g. a ClickHouse or Iceberg crate). A binary crate links
+the plugins it needs and assembles the runtime through a builder:
 
 ```rust
-let mut registry = PluginRegistry::new();
-registry.register_decoder("otlp_logs", OtlpLogsDecoder::new(...));
-registry.register_sink_factory("clickhouse",
-    Box::new(ClickHouseSinkFactory::default()));
-registry.register_sink_factory("iceberg",
-    Box::new(IcebergSinkFactory::default()));
-
-let runtime = Runtime::new(config, registry).await?;
+let runtime = Runtime::builder()
+    .add_source(BufferSource::new(consumer, "logs", manifest_path, None))
+    .add_decoder(OtlpLogsDecoder::new())   // opendata-ingest-otel
+    .set_sink(ClickHouseSink::new(...))    // opendata-ingest-clickhouse
+    .with_options(runtime_options)
+    .build()?;
 runtime.run(shutdown_token).await?;
 ```
 
-Adding a new sink is: write a crate, register a factory by name, ship
-a new binary. No runtime changes, no config schema changes beyond the
-new sink's named config block.
+The decoder it registers owns the metadata envelope it expects, so the
+runtime stays metadata-agnostic. Adding a sink is: write a crate
+implementing `Sink`, link it, set it on the builder, ship a new
+binary — no runtime change.
 
-#### Level 2: Declarative Schema/Mapping (Future)
-
-Target table schemas and projections move out of Rust where practical:
-
-- A schema/mapping document defines columns, types, partition keys,
-  source-coordinate column choices, and any attribute-flattening rules.
-- Built-in templates ship in the binary (`otel_logs_clickhouse_v1`,
-  `otel_logs_iceberg_v1`). User-provided documents are validated at
-  startup.
-- For OTLP, the **decoder is still compiled in** because tree
-  flattening (resource/scope/log) is semantic, not generic protobuf
-  decode.
-- A user can target a custom ClickHouse table without rebuilding the
-  binary by supplying their own schema/mapping document.
-
-This RFC does not specify the schema document format; that is future
-work and gets its own follow-up RFC.
-
-#### Level 3: Dynamic Plugins (Future)
-
-WASM plugins for transforms that are not on the hottest path, or
-subprocess/gRPC plugins for company-specific enrichment. Considered
-explicitly so the trait shapes do not preclude them, but not
-implemented until the native path is benchmarked. Rust `cdylib`
-plugins are rejected: Rust has no stable ABI and a dynamic library
+Two later forms of pluggability are out of scope here and tracked in
+"Future Improvements": declarative schema/mapping documents (target
+table schemas and projections defined out of Rust), and dynamic WASM or
+subprocess plugins for off-hot-path transforms. Rust `cdylib` plugins
+are rejected outright — Rust has no stable ABI and a dynamic-library
 boundary on the row path is the wrong first optimization.
 
-### System Columns and Source Coordinates
+### Source Coordinates
 
-Source-coordinate column ownership generalizes RFC 0001's table:
+The runtime exposes, per record, where the record came from in the
+source. The coordinates and their provenance:
 
-| Column | Owned by | Provenance |
+| Coordinate | Provided by | Provenance |
 |---|---|---|
-| `_odb_sequence` | Runtime | `SourceBatchDescriptor.sequence` |
-| `_odb_entry_index` | Runtime | `SourceEntry.entry_index` |
-| `_odb_record_index` | Decoder | Flat record index within an entry |
-| `_odb_manifest_path` | Runtime | Configured per source |
-| `_odb_data_path` | Runtime | `SourceBatch.data_object_path` |
-| `_odb_ingestion_time_ms` | Runtime | Per-range `Metadata.ingestion_time_ms` |
-| `_adapter_version` / `_schema_version` | Sink | Sink schema version |
+| sequence | Runtime | `SourceBatchDescriptor.sequence` |
+| entry index | Runtime | `SourceEntry.entry_index` |
+| record index | Decoder | record position within an entry |
+| manifest path | Runtime | configured per source |
+| data object path | Runtime | `SourceBatch.data_object_path` |
+| ingestion time | Runtime | per-entry metadata |
+| schema version | Decoder | `DecodedBatch.schema_version` |
 
-Sinks decide which coordinate columns to materialize. The runtime
-provides them as `SourceCoordinateColumns` parallel to records; the
-sink projects them according to its target schema.
+These are not columns the runtime writes — they are carried in
+`SourceCoordinateColumns`, parallel to records, and each sink decides
+which ones to materialize and how to name them. The ClickHouse sink, for
+example, writes the subset it keeps as `_odb_*` system columns; another
+sink might attach them to file metadata instead.
 
 ### Multi-Source, Single-Sink Service
 
@@ -1344,23 +1180,21 @@ across sources:
   per-source queues feeding a shared sink semaphore; weighted
   fairness can be revisited later if the bench surfaces a need.
 - **Two sources feeding the same target table** is allowed but adds a
-  dedupe-key constraint inherited from RFC 0001's "Future:
-  Config-Driven Multi-Source Ingestors": if two sources share a
-  target table, the table's dedupe key must include `_odb_manifest_path`
-  or `source_id` (or the equivalent for non-ClickHouse sinks). The
-  config validator enforces this.
-- **Process readiness fails** when any required source halts. v1 fails
-  readiness on any source halt. Optional sources can be marked
-  `optional: true` in a future revision; named here so the validator
-  can adopt it later without churn.
+  dedupe-key constraint: the table's dedupe key must include the source
+  identity (e.g. `_odb_manifest_path` or `source_id`, or the equivalent
+  for a non-ClickHouse sink), so identical sequence ranges from
+  different sources don't collide. The config validator enforces this.
+- **Process readiness fails** when any source halts. Marking individual
+  sources optional is a future revision; named here so the validator can
+  adopt it later without churn.
 
 ### Operational Surface
 
 - **Dry-run** (per source): full pipeline, including decode and the
   sink's plan/serialize step, but `Sink::write` is replaced with a
   no-op that returns success without side effects, and `ack_through`
-  is skipped. Carry-over from RFC 0001. Toggling dry-run requires a
-  process restart for the same reason as RFC 0001.
+  is skipped. Dry-run is set at startup and toggling it requires a
+  process restart.
 - **Graceful shutdown**: stop admitting new descriptors per source,
   drain all in-flight `SinkCommit`s through the configured sink,
   advance and flush each source's ack frontier, exit. The runtime
@@ -1370,8 +1204,6 @@ across sources:
   `check_committed`, and dedupable at sinks that do not.
 
 ### Failure Modes
-
-Inherited and generalized from RFC 0001:
 
 - **Source unreachable**: `next_descriptors`/`fetch` errors retry under
   the source's retry policy. The pipeline drains and stalls. No
@@ -1402,12 +1234,10 @@ than splitting the crate now.
 ### Use Raw OTLP Protobuf as the Cross-Sink Unit
 
 The runtime could carry source bytes through to the sink and let the
-sink decode them. Rejected because every sink implementation would
-re-decode the same bytes, OTLP tree flattening is non-trivial, and
-the runtime would not be able to apply schema-aware backpressure or
-let each sink chunk its writes against a known row count. The cost is borne even more sharply
-when the same decoded shape is reused across sink types in
-duplicated-queue deployments — every service decodes from scratch.
+sink decode them. Rejected because every sink would re-decode the same
+bytes, OTLP tree flattening is non-trivial, and the runtime could not
+apply schema-aware backpressure or let each sink chunk its writes
+against a known row count.
 
 ### Use `Vec<RowValue>` as the Cross-Sink Unit
 
@@ -1452,12 +1282,10 @@ Considered: in a hypothetical multi-sink runtime, each sink advances
 its own Buffer ack. Rejected because Buffer has one active consumer
 per manifest (epoch fenced); per-sink frontiers would require a
 separate per-sink checkpoint store and a reconciliation algorithm to
-derive the source ack frontier, which is the multi-checkpoint
-complexity RFC 0001 explicitly rejected for the Kafka connector
-design. This alternative is moot under the single-sink scope:
-ack frontiers are per-source against the single configured sink. The
-section is kept for context because it is the argument against
-re-introducing same-process fanout.
+derive the source ack frontier. That multi-checkpoint complexity is
+moot under the single-sink scope: ack frontiers are per-source against
+the single configured sink. The section is kept because it is the
+argument against same-process fanout.
 
 ### WASM-First Plugin Boundary
 
@@ -1485,43 +1313,44 @@ The sink could call `source.ack_through` itself. Rejected because:
   point — it owns the per-source `AckCoordinator` and the source
   reader, the sink owns its idempotent commit semantics.
 
-### Re-introduce a `SourceReader` Trait Now
+### A Source Trait Instead of a Concrete Source
 
-Considered: define `SourceReader` / `SourceFetchHandle` as production
-traits and route the runtime through `Box<dyn SourceReader>` to keep
-the door open for non-Buffer sources (Kafka direct, OTLP HTTP push,
-file scan). Rejected for v1 because:
+Considered: define a `SourceReader` / `SourceFetchHandle` trait pair and
+route the runtime through `Box<dyn SourceReader>`, to keep the door open
+for non-Buffer sources. Rejected because there is one source type and
+the trait methods would be close to 1:1 over `buffer::Consumer` /
+`ConsumerFetchHandle` — API surface to maintain for an abstraction with
+a single implementer. Test fakes get a `#[cfg(test)]` seam inside the
+runtime crate instead; production callers stay concrete.
 
-- There is one source impl (`BufferSource`) and no second source on
-  the roadmap.
-- The trait methods would be near 1:1 over `buffer::Consumer` /
-  `ConsumerFetchHandle`, costing API-surface maintenance for an
-  option we may never exercise.
-- Test fakes use a `#[cfg(test)]` seam inside the runtime crate;
-  production callers stay concrete.
-
-Reintroduction, if and when a second source materializes, is a local
-change inside the runtime crate. The data types
-(`SourceBatchDescriptor`, `SourceBatch`, `SourceEntry`) are
-source-shape-agnostic and stay; sinks and the correctness harness
-don't depend on the source shape. The cost of waiting is bounded.
+The source data types (`SourceBatchDescriptor`, `SourceBatch`,
+`SourceEntry`) are already source-shape-agnostic and don't depend on
+Buffer, so introducing a source trait later — if a second source type
+ever lands — stays a contained change inside the runtime crate.
 
 ## Future Improvements
 
 These do not require changing the trait shapes in this RFC.
 
-- **Per-entry signal dispatch within a single source**: relax v1's
-  homogeneous-envelope requirement. Already supported by the
+- **Per-entry decoder dispatch within a single source**: relax the
+  homogeneous-envelope requirement so entries with different envelopes
+  in one source route to different decoders. Already accommodated by the
   `Decoder::accepts` shape.
+- **Arrow `DecodedRecords` variant**: a columnar record carrier
+  alongside `Typed`, gated by benchmarks comparing the two, ahead of a
+  columnar sink or a binary ClickHouse path.
 - **Optional sources / per-source readiness** in the config validator
   and the metrics surface.
+- **Declarative schema/mapping documents**: move target table schemas
+  and projections out of Rust so an operator can retarget a table
+  without rebuilding the binary. The decoder stays compiled in (OTLP
+  tree flattening is semantic, not generic protobuf decode); only the
+  schema/mapping is declarative. Gets its own follow-up RFC.
 - **Sink-side schema mapping for multi-source -> multi-table**: when
   one sink should land different sources in different physical
   tables, encode the mapping in the sink config (e.g.
   `source_mappings`, `schema_ref_by_source`). This is sink/schema
   work, not a generic runtime route.
-- **Arrow-only DecodedRecords** once the Iceberg sink lands, removing
-  the typed fallback for OTLP logs.
 - **WASM plugins** for off-hot-path transforms (attribute enrichment,
   schema migrations, filter rules).
 - **Deployment tooling for duplicate producer outputs** when one
@@ -1538,15 +1367,12 @@ These do not require changing the trait shapes in this RFC.
   ordered ack across two manifests; today this is explicitly out of
   scope.
 - **Replay tooling**: operator-directed replay from a chosen sequence
-  inside Buffer's retained range. RFC 0001 defers this; the runtime
-  inherits the deferral and exposes the seam (`BufferSource` already
-  takes an initial sequence on construction).
-- **Reintroduce a `SourceReader` trait** if/when a non-Buffer source
-  lands (Kafka direct, OTLP HTTP push, file scan). See "Re-introduce
-  a `SourceReader` Trait Now" in Alternatives Considered. The runtime
-  data types (`SourceBatchDescriptor`, `SourceBatch`, `SourceEntry`)
-  are source-shape-agnostic, so this is a local change inside the
-  runtime crate.
+  inside Buffer's retained range. The seam already exists —
+  `BufferSource` takes an initial sequence on construction.
+- **A source trait for non-Buffer sources** (Kafka direct, OTLP HTTP
+  push, file scan). See "A Source Trait Instead of a Concrete Source"
+  in Alternatives Considered; the runtime data types are
+  source-shape-agnostic, so this stays a contained change.
 
 ## Validation Criteria
 
@@ -1555,7 +1381,7 @@ These do not require changing the trait shapes in this RFC.
 - The OTLP logs path runs end-to-end through the runtime crate's
   traits. The `clickhouse-ingestor` binary is registry/config wiring
   on top of `opendata-ingest-runtime` and `opendata-ingest-clickhouse`.
-- Existing ClickHouse alpha tests pass unchanged.
+- Existing ClickHouse ingestor tests pass unchanged.
 - `cargo test -p opendata-ingest-runtime -p opendata-ingest-clickhouse`
   is green.
 - Behavior is equivalent: same metrics names, same dry-run semantics,
@@ -1563,16 +1389,15 @@ These do not require changing the trait shapes in this RFC.
 
 ### Ack Coordinator and Single-Sink Correctness
 
-- A fake source and a fake (single) sink (success, retryable failure,
-  permanent failure, slow, ambiguous) reproduce every crash-point in
-  the design doc.
+- A fake source and a fake single sink (success, retryable failure,
+  permanent failure, slow, ambiguous) reproduce each crash point in the
+  Crash Semantics section.
 - Tests demonstrate the single-sink ack invariant under
   out-of-order range completion, retry, `MaybeCommitted` resolution,
   and replay.
 - Multi-source ack isolation: one source's committed range never
   advances another source's frontier.
-- `check_committed` contract tests for at least one concrete sink
-  (ClickHouse stub OK; an Iceberg sink is future work).
+- `check_committed` contract tests for at least one concrete sink.
 
 ### Pipelined Runtime Under Concurrency
 
@@ -1585,31 +1410,3 @@ These do not require changing the trait shapes in this RFC.
   does not permanently starve a low-volume source.
 - The single-sink correctness tests still pass under concurrency knobs
   greater than 1.
-
-### Schema/Mapping and Arrow Prototype (Future Work)
-
-- A user-provided schema/mapping document targets a non-default
-  ClickHouse table without binary rebuild.
-- Arrow vs. typed benchmark numbers are recorded with workload shape,
-  hardware, and config.
-
-### Standalone Iceberg Sink Service (Future Work)
-
-- One Buffer source feeds an Iceberg-configured runtime service
-  end-to-end. ClickHouse is not required to be present in the same
-  process.
-- Crash-after-Iceberg-commit-before-ack is verified idempotent on
-  replay (`check_committed` returns `Committed`, no duplicate Parquet
-  file is written).
-- The ack coordinator advances only after the Iceberg sink commits
-  (or verifies).
-
-### Multi-Source Single-Sink E2E (Future Work)
-
-- Multiple Buffer sources feed one runtime service into a single
-  configured sink (e.g. ClickHouse). Per-source ack frontiers and
-  bounded backpressure both hold under load.
-- Optional deployment proof: the same upstream stream is duplicated
-  into two queues and consumed by two isolated runtime services
-  (e.g. one ClickHouse, one Iceberg) — each service is a single-sink
-  service with its own ack frontier.
