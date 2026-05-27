@@ -13,12 +13,14 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use clickhouse_ingestor::adapter::logs::{LogsAdapterConfig, OtlpLogsClickHouseAdapter};
-use clickhouse_ingestor::commit_group::CommitGroupThresholds;
-use clickhouse_ingestor::envelope::{ConfiguredEnvelope, PayloadEncoding, SignalType};
 use clickhouse_ingestor::writer::{ClickHouseWriter, WriterConfig};
-use clickhouse_ingestor::{AckFlushPolicy, BufferConsumerRuntime, OtlpLogsDecoder, RuntimeOptions};
+use clickhouse_ingestor::{ClickHouseSink, OtlpLogsDecoder};
 use common::ObjectStoreConfig;
 use common::clock::SystemClock;
+use opendata_ingest_runtime::runtime::{
+    AckFlushPolicy, Runtime, RuntimeOptions, SinkPoolOptions, SourceBackpressureOptions,
+};
+use opendata_ingest_runtime::source::BufferSource;
 use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
 use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue, any_value::Value};
 use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
@@ -128,6 +130,7 @@ async fn clickhouse_round_trip_with_dedup() -> Result<(), Box<dyn std::error::Er
         request_timeout: Duration::from_secs(15),
         max_attempts: 4,
         initial_backoff: Duration::from_millis(100),
+        ..Default::default()
     });
 
     let database = "responsive_test";
@@ -197,31 +200,29 @@ async fn clickhouse_round_trip_with_dedup() -> Result<(), Box<dyn std::error::Er
     };
     let consumer =
         buffer::Consumer::with_object_store(consumer_config, Arc::clone(&store), None).await?;
+    let source = BufferSource::new(consumer, "buffer", manifest_path, None);
 
     let runtime_options = RuntimeOptions {
-        manifest_path: manifest_path.into(),
-        data_path_prefix: data_prefix.into(),
-        configured_envelope: ConfiguredEnvelope {
-            version: 1,
-            signal_type: SignalType::Logs,
-            encoding: PayloadEncoding::OtlpProtobuf,
-        },
-        commit_group: CommitGroupThresholds {
-            max_rows: 1000,
-            max_bytes: 1_000_000,
-            max_age: Duration::from_millis(100),
-        },
         ack_flush_policy: AckFlushPolicy::EveryCommitGroup,
         dry_run: false,
         poll_interval: Duration::from_millis(20),
+        max_descriptors_per_poll: 1,
+        max_retry_attempts: 3,
+        retry_backoff: Duration::from_millis(100),
+        source_defaults: SourceBackpressureOptions::serial(),
+        source_overrides: Default::default(),
+        sink: SinkPoolOptions::default(),
     };
-    let runtime = BufferConsumerRuntime::new(
-        consumer,
-        OtlpLogsDecoder::new(),
-        OtlpLogsClickHouseAdapter::new(adapter_cfg.clone()),
-        Some(writer.clone()),
-        runtime_options,
-    );
+    let adapter = Arc::new(OtlpLogsClickHouseAdapter::new(adapter_cfg.clone()));
+    let sink_writer = Arc::new(writer.clone());
+    let sink = ClickHouseSink::new("clickhouse_logs", adapter, sink_writer);
+    let runtime = Runtime::builder()
+        .add_source(source)
+        .add_decoder(OtlpLogsDecoder::new())
+        .set_sink(sink)
+        .with_options(runtime_options)
+        .build()
+        .expect("build runtime");
     let mut progress_rx = runtime.progress();
 
     let shutdown = CancellationToken::new();
@@ -235,7 +236,7 @@ async fn clickhouse_round_trip_with_dedup() -> Result<(), Box<dyn std::error::Er
                 .await
                 .expect("progress channel closed");
             let p = *progress_rx.borrow();
-            if p.rows_inserted >= 5 && p.last_acked_sequence.is_some() {
+            if p.records_written >= 5 && p.last_acked_sequence.is_some() {
                 return p;
             }
         }
@@ -245,7 +246,7 @@ async fn clickhouse_round_trip_with_dedup() -> Result<(), Box<dyn std::error::Er
 
     shutdown.cancel();
     let runtime_result = handle.await.expect("runtime task panicked");
-    runtime_result.expect("runtime exited cleanly");
+    runtime_result.map_err(|e| -> Box<dyn std::error::Error> { format!("runtime: {e}").into() })?;
 
     let total_raw = writer
         .execute_statement(&format!("SELECT count() FROM {database}.{table}"))

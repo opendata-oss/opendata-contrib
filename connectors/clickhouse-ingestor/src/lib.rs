@@ -1,50 +1,53 @@
-//! `clickhouse-ingestor` — reusable Rust runtime that consumes OpenData
-//! Buffer batches and writes them into ClickHouse.
+//! `clickhouse-ingestor` — binary crate that wires the sink-neutral
+//! `opendata-ingest-runtime` runtime to the OTel logs decoder and the
+//! ClickHouse sink plugin.
 //!
-//! Layered following RFC 0003:
+//! The binary constructs:
 //!
 //! ```text
-//! BufferConsumerRuntime
-//!   -> MetadataEnvelopeDecoder    (per-entry envelope parsing)
-//!   -> SignalDecoder              (e.g. OtlpLogsDecoder)
-//!   -> CommitGroup                (coalesce records across batches)
-//!   -> Adapter                    (e.g. OtlpLogsClickHouseAdapter)
-//!      -> Vec<InsertChunk>        (deterministic chunking, per-chunk token)
-//!   -> ClickHouseWriter           (sync inserts, classified retry)
-//!   -> AckController              (range ack, flush)
+//! Runtime::builder()
+//!     .add_source(BufferSource::new(buffer::Consumer, ...))
+//!     .add_decoder(OtlpLogsDecoder::new())        // opendata-ingest-otel
+//!     .set_sink(ClickHouseSink::new(...))         // opendata-ingest-clickhouse
+//!     .with_options(...)
+//!     .build()?
+//!     .run(shutdown_token).await
 //! ```
 //!
-//! The infra/app boundary is meaningful: the runtime, envelope decoder,
-//! commit group, ack controller, and writer are signal- and table-shape-
-//! agnostic; the signal decoder and adapter are signal-specific.
+//! This crate keeps the binary's wiring: config loading, metrics
+//! recorder install, signal handling, metrics HTTP server. The
+//! re-exports below let the existing integration tests
+//! (`tests/clickhouse_round_trip.rs`) import legacy names
+//! (`OtlpLogsClickHouseAdapter`, `ClickHouseWriter`,
+//! `OtlpLogsDecoder`, `DecodedLogRecord`, `InsertChunk`, etc.)
+//! through `clickhouse_ingestor::` so the rewrite is import-only
+//! when the tests get ported.
 
-pub mod ack;
-pub mod adapter;
 pub mod bench;
-pub mod commit_group;
 pub mod config;
-pub mod envelope;
 pub mod error;
-pub mod metrics;
+pub mod metrics_registry;
 pub mod metrics_server;
-pub mod runtime;
-pub mod signal;
-pub mod source;
-pub mod writer;
 
-pub use ack::{AckController, AckFlushPolicy};
+pub use opendata_ingest_clickhouse::{adapter, writer};
+pub use opendata_ingest_otel::envelope;
+pub use opendata_ingest_otel::logs as signal;
+pub use opendata_ingest_runtime::source;
+
 pub use adapter::logs::{LogsAdapterConfig, OtlpLogsClickHouseAdapter, logs_table_ddl};
-pub use adapter::{Adapter, ClickHouseSettings, InsertChunk, RowValue};
-pub use commit_group::{CommitGroup, CommitGroupBatch, CommitGroupThresholds};
+pub use adapter::{
+    Adapter, AdapterError, AdapterResult, ClickHouseAdapterBatch, ClickHouseSettings, InsertChunk,
+    RowValue,
+};
 pub use config::IngestorConfig;
 pub use envelope::{
     ConfiguredEnvelope, EnvelopeError, MetadataEnvelope, PayloadEncoding, SignalType,
     decode_envelopes, validate_consistent,
 };
 pub use error::{IngestorError, IngestorResult};
-pub use runtime::{BufferConsumerRuntime, RuntimeOptions};
+pub use opendata_ingest_clickhouse::ClickHouseSink;
 pub use signal::{
-    DecodedLogRecord, DecodedLogs, OtlpLogsDecoder, SignalDecoder, SourceCoordinates,
+    DecodedLogRecord, DecodedLogs, OtelDecodeError, OtlpLogsDecoder, RowSourceCoordinates,
 };
-pub use source::{RawBufferBatch, RawEntry, split_into_raw_entries};
+pub use source::{SourceBatch, SourceEntry, split_into_raw_entries};
 pub use writer::{ClickHouseWriter, WriterError, WriterErrorClass};

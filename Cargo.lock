@@ -475,6 +475,7 @@ name = "clickhouse-ingestor"
 version = "0.1.2"
 dependencies = [
  "anyhow",
+ "async-trait",
  "axum",
  "bytes",
  "clap",
@@ -485,7 +486,11 @@ dependencies = [
  "metrics-exporter-prometheus",
  "opendata-buffer",
  "opendata-common",
+ "opendata-ingest-clickhouse",
+ "opendata-ingest-otel",
+ "opendata-ingest-runtime",
  "opentelemetry-proto",
+ "prometheus-client",
  "prost",
  "reqwest",
  "serde",

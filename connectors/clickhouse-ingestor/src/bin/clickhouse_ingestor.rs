@@ -2,8 +2,9 @@
 //!
 //! Loads YAML config (with `INGESTOR__` env overrides), constructs the
 //! object store, builds a `buffer::Consumer`, wires the OTLP logs
-//! decoder + ClickHouse logs adapter + writer + ack controller into a
-//! `BufferConsumerRuntime`, and runs until `SIGINT`/`SIGTERM`.
+//! decoder + ClickHouse sink (or a no-op `DryRunSink`) into a generic
+//! [`Runtime`] via [`Runtime::builder`], and runs until
+//! `SIGINT`/`SIGTERM`.
 //!
 //! Also serves `/metrics` (Prometheus text) and `/-/healthy` on a
 //! dedicated HTTP port so the OTel collector can scrape runtime metrics.
@@ -13,14 +14,23 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use async_trait::async_trait;
 use clap::Parser;
-use clickhouse_ingestor::envelope::{ConfiguredEnvelope, PayloadEncoding, SignalType};
+use clickhouse_ingestor::metrics_registry::MetricsRegistry;
 use clickhouse_ingestor::metrics_server;
-use clickhouse_ingestor::{
-    AckFlushPolicy, BufferConsumerRuntime, ClickHouseWriter, IngestorConfig,
-    OtlpLogsClickHouseAdapter, OtlpLogsDecoder, RuntimeOptions,
-};
+use clickhouse_ingestor::{ClickHouseWriter, IngestorConfig, OtlpLogsClickHouseAdapter};
 use metrics_exporter_prometheus::PrometheusBuilder;
+use opendata_ingest_clickhouse::ClickHouseSink;
+use opendata_ingest_otel::logs::OtlpLogsDecoder;
+use opendata_ingest_runtime::error::{RuntimeError, RuntimeResult};
+use opendata_ingest_runtime::identity::CommitIdentity;
+use opendata_ingest_runtime::runtime::{
+    AckFlushPolicy, Runtime, RuntimeOptions, SinkPoolOptions, SourceBackpressureOptions,
+};
+use opendata_ingest_runtime::sink::{
+    CommitStatus, Sink, SinkBudget, SinkCommit, SinkCommitFailure, SinkCommitResult, SinkId,
+};
+use opendata_ingest_runtime::source::BufferSource;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
@@ -36,6 +46,35 @@ struct Cli {
     config: PathBuf,
 }
 
+/// A `Sink` placeholder used in dry-run mode. The `Runtime`'s
+/// `dry_run` flag short-circuits the write path before `write` is
+/// called, so this only needs to satisfy the trait. Carrying a real
+/// `SinkId` keeps idempotency-key logs and metrics stable across
+/// dry-run vs live runs.
+struct DryRunSink {
+    id: SinkId,
+}
+
+#[async_trait]
+impl Sink for DryRunSink {
+    fn id(&self) -> &SinkId {
+        &self.id
+    }
+    fn write_budget(&self) -> SinkBudget {
+        SinkBudget::default()
+    }
+    async fn write(&self, _commit: SinkCommit) -> Result<SinkCommitResult, SinkCommitFailure> {
+        Err(SinkCommitFailure::Fatal(
+            "DryRunSink::write called; runtime should have short-circuited via dry_run=true"
+                .to_string()
+                .into(),
+        ))
+    }
+    async fn check_committed(&self, _identity: &CommitIdentity) -> RuntimeResult<CommitStatus> {
+        Ok::<CommitStatus, RuntimeError>(CommitStatus::Unknown)
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -48,24 +87,29 @@ async fn main() -> Result<()> {
     let cfg = IngestorConfig::load(&cli.config)
         .with_context(|| format!("loading ingestor config from {}", cli.config.display()))?;
 
-    info!(
-        manifest = %cfg.buffer.manifest_path,
-        endpoint = %cfg.clickhouse.endpoint,
-        database = %cfg.clickhouse.database,
-        table = %cfg.clickhouse.table,
-        dry_run = cfg.runtime.dry_run,
-        metrics_bind_addr = %cfg.metrics_server.bind_addr,
-        "configuration loaded",
-    );
+    // Dump the full effective IngestorConfig (post-figment YAML+env
+    // merge) as a single log line so a deployment can confirm
+    // exactly which knobs took effect.
+    info!(config = ?cfg, "configuration loaded");
 
-    // Install the metrics-rs recorder before any code that records or
-    // describes metrics runs. `runtime.run` calls `metrics::describe()`
-    // and the runtime emits counters/gauges from its first tick; both
-    // need the recorder in place to be observable.
+    // Runtime + plugin emissions flow through prometheus-client
+    // (`MetricsRegistry`), so the `metrics-rs` recorder only needs to
+    // render the buffer crate's emissions. Buffer-side counters are
+    // name-only with no `_seconds` histograms, so the default builder
+    // (no bucket matchers) is sufficient.
     let recorder = PrometheusBuilder::new().build_recorder();
     let metrics_handle = recorder.handle();
     metrics::set_global_recorder(recorder)
         .map_err(|e| anyhow::anyhow!("install global metrics recorder: {e}"))?;
+
+    // Typed prometheus-client surface. The bin owns the Registry;
+    // runtime + sink + writer get `Arc<RuntimeMetrics>` /
+    // `Arc<ClickHouseMetrics>` so every emission lands in the
+    // registered Family<_, _>.
+    let metrics_registry =
+        MetricsRegistry::new(metrics_handle).context("building metrics registry")?;
+    let runtime_metrics = Arc::clone(&metrics_registry.runtime);
+    let clickhouse_metrics = Arc::clone(&metrics_registry.clickhouse);
 
     let object_store = common::create_object_store(&cfg.buffer.object_store)
         .context("constructing object store")?;
@@ -81,34 +125,73 @@ async fn main() -> Result<()> {
             .await
             .context("initializing buffer consumer")?;
 
-    let writer = if cfg.runtime.dry_run {
-        None
-    } else {
-        Some(ClickHouseWriter::new(cfg.writer_config()))
-    };
-
-    let adapter = OtlpLogsClickHouseAdapter::new(cfg.logs_adapter_config());
+    let source = BufferSource::new(consumer, "buffer", cfg.buffer.manifest_path.clone(), None);
     let decoder = OtlpLogsDecoder::new();
 
+    // ClickHouseSink in live mode; DryRunSink (never invoked) in
+    // dry-run mode. The runtime's `dry_run` flag is the actual
+    // gate — see Runtime::handle_source_batch.
     let runtime_options = RuntimeOptions {
-        manifest_path: cfg.buffer.manifest_path.clone(),
-        data_path_prefix: cfg.buffer.data_prefix.clone(),
-        configured_envelope: ConfiguredEnvelope {
-            version: 1,
-            signal_type: SignalType::Logs,
-            encoding: PayloadEncoding::OtlpProtobuf,
-        },
-        commit_group: cfg.commit_group_thresholds(),
         ack_flush_policy: cfg.ack_flush_policy(),
         dry_run: cfg.runtime.dry_run,
         poll_interval: std::time::Duration::from_millis(cfg.runtime.poll_interval_ms),
+        max_descriptors_per_poll: cfg.runtime.max_descriptors_per_poll,
+        max_retry_attempts: cfg.runtime.retry_max_attempts,
+        retry_backoff: std::time::Duration::from_millis(cfg.runtime.retry_initial_backoff_ms),
+        // Per-source backpressure knobs threaded from
+        // `IngestorConfig.runtime.*`. Defaults reproduce the
+        // library's pipelined profile (64/8/4 in-flight/fetch/decode);
+        // operators override via `INGESTOR__RUNTIME__*` env or YAML.
+        source_defaults: SourceBackpressureOptions {
+            max_inflight_batches: cfg.runtime.max_inflight_batches,
+            max_inflight_bytes: cfg.runtime.max_inflight_bytes,
+            estimated_max_batch_bytes: cfg.runtime.estimated_max_batch_bytes,
+            fetch_concurrency: cfg.runtime.fetch_concurrency,
+            decode_concurrency: cfg.runtime.decode_concurrency,
+            oversize_fault_multiplier: cfg.runtime.oversize_fault_multiplier,
+        },
+        source_overrides: Default::default(),
+        sink: SinkPoolOptions {
+            max_concurrent_commits: cfg.sink.max_concurrent_commits,
+            // The sink-namespaced retry knobs shadow the legacy
+            // top-level fields per `RuntimeOptions::effective_retry_*`;
+            // mirror the operator's `retry_*` settings here so the
+            // resolved attempt count + backoff match what the YAML
+            // describes.
+            retry_max_attempts: cfg.runtime.retry_max_attempts,
+            retry_initial_backoff_ms: cfg.runtime.retry_initial_backoff_ms,
+        },
     };
-
-    // Compile-check that the policies aren't accidentally constructed
-    // wrong; not strictly necessary at runtime.
+    // Compile-time sanity check that the policy translation didn't
+    // drift; not strictly necessary at runtime.
     let _: AckFlushPolicy = runtime_options.ack_flush_policy;
 
-    let runtime = BufferConsumerRuntime::new(consumer, decoder, adapter, writer, runtime_options);
+    let sink_id = "clickhouse_logs";
+    let mut builder = Runtime::builder()
+        .add_source(source)
+        .add_decoder(decoder)
+        .with_options(runtime_options)
+        .with_runtime_metrics(Arc::clone(&runtime_metrics));
+    builder = if cfg.runtime.dry_run {
+        builder.set_sink(DryRunSink {
+            id: SinkId::from(sink_id),
+        })
+    } else {
+        let adapter = Arc::new(OtlpLogsClickHouseAdapter::new(cfg.logs_adapter_config()));
+        let writer = Arc::new(ClickHouseWriter::new_with_metrics(
+            cfg.writer_config(),
+            Arc::clone(&clickhouse_metrics),
+        ));
+        builder.set_sink(ClickHouseSink::new_with_metrics(
+            sink_id,
+            adapter,
+            writer,
+            Arc::clone(&clickhouse_metrics),
+        ))
+    };
+    let runtime = builder
+        .build()
+        .map_err(|e| anyhow::anyhow!("building runtime: {e}"))?;
 
     let shutdown = CancellationToken::new();
     let signal_shutdown = shutdown.clone();
@@ -126,19 +209,18 @@ async fn main() -> Result<()> {
     })?;
     let metrics_shutdown = shutdown.clone();
     let metrics_task = tokio::spawn(async move {
-        if let Err(e) = metrics_server::serve(metrics_handle, metrics_addr, metrics_shutdown).await
+        if let Err(e) =
+            metrics_server::serve(metrics_registry, metrics_addr, metrics_shutdown).await
         {
             error!(error = %e, "metrics server exited with error");
         }
     });
 
     let runtime_result = runtime.run(shutdown.clone()).await;
-    // Cancel the metrics server on runtime exit so the process doesn't
-    // hang on shutdown.
     shutdown.cancel();
     if let Err(e) = metrics_task.await {
         error!(error = %e, "metrics server task join failed");
     }
-    runtime_result?;
+    runtime_result.map_err(|e| anyhow::anyhow!("runtime: {e}"))?;
     Ok(())
 }

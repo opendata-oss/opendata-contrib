@@ -1,6 +1,6 @@
 //! ORDER BY benchmark harness.
 //!
-//! RFC 0003 calls for benchmarking the alpha logs table's `ORDER BY`
+//! RFC 0001 calls for benchmarking the alpha logs table's `ORDER BY`
 //! shape against a query-optimized alternative before the alpha goes
 //! live. This module defines:
 //!
