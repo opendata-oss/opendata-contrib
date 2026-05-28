@@ -472,7 +472,7 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
 name = "clickhouse-ingestor"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2362,7 +2362,7 @@ dependencies = [
 
 [[package]]
 name = "opendata-ingest-clickhouse"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "hex",
@@ -2382,7 +2382,7 @@ dependencies = [
 
 [[package]]
 name = "opendata-ingest-otel"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "hex",
@@ -2394,7 +2394,7 @@ dependencies = [
 
 [[package]]
 name = "opendata-ingest-runtime"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "async-channel",
  "async-trait",
