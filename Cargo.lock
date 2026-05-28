@@ -497,7 +497,7 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "sha2",
- "slatedb",
+ "slatedb 0.12.1",
  "tempfile",
  "testcontainers",
  "testcontainers-modules",
@@ -554,6 +554,17 @@ name = "core-foundation-sys"
 version = "0.8.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
+
+[[package]]
+name = "core_affinity"
+version = "0.8.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a034b3a7b624016c6e13f5df875747cc25f884156aad2abd12b6c46797971342"
+dependencies = [
+ "libc",
+ "num_cpus",
+ "winapi",
+]
 
 [[package]]
 name = "cpufeatures"
@@ -882,6 +893,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "fastant"
+version = "0.1.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2e825441bfb2d831c47c97d05821552db8832479f44c571b97fededbf0099c07"
+dependencies = [
+ "small_ctor",
+ "web-time",
+]
+
+[[package]]
 name = "fastrand"
 version = "2.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -955,6 +976,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d9c4f5dac5e15c24eb999c26181a6ca40b39fe946cbe4c263c7209467bc83af2"
 
 [[package]]
+name = "foldhash"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
+
+[[package]]
 name = "form_urlencoded"
 version = "1.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -970,15 +997,35 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "642093b1a72c4a0ef89862484d669a353e732974781bb9c49a979526d1e30edc"
 dependencies = [
  "equivalent",
- "foyer-common",
- "foyer-memory",
- "foyer-storage",
+ "foyer-common 0.18.1",
+ "foyer-memory 0.18.1",
+ "foyer-storage 0.18.1",
  "madsim-tokio",
  "mixtrics",
  "pin-project",
  "serde",
  "thiserror 2.0.18",
  "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "foyer"
+version = "0.22.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3b0abc0b87814989efa711f9becd9f26969820e2d3905db27d10969c4bd45890"
+dependencies = [
+ "anyhow",
+ "equivalent",
+ "foyer-common 0.22.3",
+ "foyer-memory 0.22.3",
+ "foyer-storage 0.22.3",
+ "foyer-tokio",
+ "futures-util",
+ "mea",
+ "mixtrics",
+ "pin-project",
+ "serde",
  "tracing",
 ]
 
@@ -1003,6 +1050,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "foyer-common"
+version = "0.22.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a3db80d5dece93adb7ad709c84578794724a9cba342a7e566c3551c7ec626789"
+dependencies = [
+ "anyhow",
+ "bincode",
+ "bytes",
+ "cfg-if",
+ "foyer-tokio",
+ "mixtrics",
+ "parking_lot",
+ "pin-project",
+ "serde",
+ "twox-hash",
+]
+
+[[package]]
 name = "foyer-intrusive-collections"
 version = "0.10.0-dev"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1021,7 +1086,7 @@ dependencies = [
  "bitflags 2.11.1",
  "cmsketch",
  "equivalent",
- "foyer-common",
+ "foyer-common 0.18.1",
  "foyer-intrusive-collections",
  "hashbrown 0.15.5",
  "itertools",
@@ -1032,6 +1097,31 @@ dependencies = [
  "serde",
  "thiserror 2.0.18",
  "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "foyer-memory"
+version = "0.22.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "db907f40a527ca2aa2f40a5f68b32ea58aa70f050cd233518e9ffd402cfba6ce"
+dependencies = [
+ "anyhow",
+ "bitflags 2.11.1",
+ "cmsketch",
+ "equivalent",
+ "foyer-common 0.22.3",
+ "foyer-intrusive-collections",
+ "foyer-tokio",
+ "futures-util",
+ "hashbrown 0.16.1",
+ "itertools",
+ "mea",
+ "mixtrics",
+ "parking_lot",
+ "paste",
+ "pin-project",
+ "serde",
  "tracing",
 ]
 
@@ -1047,8 +1137,8 @@ dependencies = [
  "bytes",
  "equivalent",
  "flume",
- "foyer-common",
- "foyer-memory",
+ "foyer-common 0.18.1",
+ "foyer-memory 0.18.1",
  "fs4",
  "futures-core",
  "futures-util",
@@ -1067,6 +1157,48 @@ dependencies = [
  "tracing",
  "twox-hash",
  "zstd",
+]
+
+[[package]]
+name = "foyer-storage"
+version = "0.22.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1983f1db3d0710e9c9d5fc116d9202dccd41a2d1e032572224f1aff5520aa958"
+dependencies = [
+ "allocator-api2",
+ "anyhow",
+ "bytes",
+ "core_affinity",
+ "equivalent",
+ "fastant",
+ "foyer-common 0.22.3",
+ "foyer-memory 0.22.3",
+ "foyer-tokio",
+ "fs4",
+ "futures-core",
+ "futures-util",
+ "hashbrown 0.16.1",
+ "io-uring",
+ "itertools",
+ "libc",
+ "lz4",
+ "mea",
+ "parking_lot",
+ "pin-project",
+ "rand 0.9.4",
+ "serde",
+ "tracing",
+ "twox-hash",
+ "zstd",
+]
+
+[[package]]
+name = "foyer-tokio"
+version = "0.22.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f6577b05a7ffad0db555aedf00bfe52af818220fc4c1c3a7a12520896fc38627"
+dependencies = [
+ "tokio",
 ]
 
 [[package]]
@@ -1283,7 +1415,18 @@ checksum = "9229cfe53dfd69f0609a49f65461bd93001ea1ef889cd5529dd176593f5338a1"
 dependencies = [
  "allocator-api2",
  "equivalent",
- "foldhash",
+ "foldhash 0.1.5",
+]
+
+[[package]]
+name = "hashbrown"
+version = "0.16.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "841d1cc9bed7f9236f321df977030373f4a4163ae1a7dbfe1a51a2c1a51d9100"
+dependencies = [
+ "allocator-api2",
+ "equivalent",
+ "foldhash 0.2.0",
 ]
 
 [[package]]
@@ -1291,6 +1434,11 @@ name = "hashbrown"
 version = "0.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4f467dd6dccf739c208452f8014c75c18bb8301b050ad1cfb27153803edb0f51"
+dependencies = [
+ "allocator-api2",
+ "equivalent",
+ "foldhash 0.2.0",
+]
 
 [[package]]
 name = "heck"
@@ -1303,6 +1451,12 @@ name = "heck"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
+
+[[package]]
+name = "hermit-abi"
+version = "0.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fc0fef456e4baa96da950455cd02c081ca953b141298e41db3fc7e36b1da849c"
 
 [[package]]
 name = "hex"
@@ -1677,6 +1831,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c8fae54786f62fb2918dcfae3d568594e50eb9b5c25bf04371af6fe7516452fb"
 
 [[package]]
+name = "io-uring"
+version = "0.7.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4d09b98f7eace8982db770e4408e7470b028ce513ac28fecdc6bf4c30fe92b62"
+dependencies = [
+ "bitflags 2.11.1",
+ "cfg-if",
+ "libc",
+]
+
+[[package]]
 name = "ipconfig"
 version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1796,6 +1961,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5e5032e24019045c762d3c0f28f5b6b8bbf38563a65908389bf7978758920897"
 
 [[package]]
+name = "lru"
+version = "0.18.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8a860605968fce16869fd239cf4237a82f3ac470723415db603b0e8b6c8d4fb9"
+dependencies = [
+ "hashbrown 0.17.0",
+]
+
+[[package]]
 name = "lru-slab"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1898,6 +2072,15 @@ checksum = "d89e7ee0cfbedfc4da3340218492196241d89eefb6dab27de5df917a6d2e78cf"
 dependencies = [
  "cfg-if",
  "digest",
+]
+
+[[package]]
+name = "mea"
+version = "0.6.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6747f54621d156e1b47eb6b25f39a941b9fc347f98f67d25d8881ff99e8ed832"
+dependencies = [
+ "slab",
 ]
 
 [[package]]
@@ -2055,6 +2238,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "num_cpus"
+version = "1.17.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "91df4bbde75afed763b708b7eee1e8e7651e02d97f6d5dd763e89367e957b23b"
+dependencies = [
+ "hermit-abi",
+ "libc",
+]
+
+[[package]]
 name = "objc2-core-foundation"
 version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2127,8 +2320,9 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
 name = "opendata-buffer"
-version = "0.2.0"
-source = "git+https://github.com/opendata-oss/opendata.git?rev=39b02fc84cc63c3a3cf05d885864dcdca6e1cc7f#39b02fc84cc63c3a3cf05d885864dcdca6e1cc7f"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "77382cc439da63d70a2e0f43a09e0e7dbef484bc450e0d5aab245ce0770170f7"
 dependencies = [
  "bytes",
  "futures",
@@ -2136,7 +2330,7 @@ dependencies = [
  "opendata-common",
  "serde",
  "serde_with",
- "slatedb",
+ "slatedb 0.13.1",
  "tokio",
  "tokio-util",
  "tracing",
@@ -2146,21 +2340,23 @@ dependencies = [
 
 [[package]]
 name = "opendata-common"
-version = "0.1.14"
-source = "git+https://github.com/opendata-oss/opendata.git?rev=39b02fc84cc63c3a3cf05d885864dcdca6e1cc7f#39b02fc84cc63c3a3cf05d885864dcdca6e1cc7f"
+version = "0.1.16"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fdd4eb919971e00fb22c5038f3418c236cc012ae13ba280608900c30b8165528"
 dependencies = [
  "async-trait",
  "bytes",
- "foyer",
+ "foyer 0.22.3",
  "futures",
  "metrics",
  "mixtrics",
  "serde",
- "slatedb",
- "slatedb-common",
+ "slatedb 0.13.1",
+ "slatedb-common 0.13.1",
  "tokio",
  "tokio-util",
  "tracing",
+ "ulid",
  "uuid",
 ]
 
@@ -2209,7 +2405,7 @@ dependencies = [
  "opendata-common",
  "prometheus-client",
  "serde",
- "slatedb",
+ "slatedb 0.12.1",
  "thiserror 2.0.18",
  "tokio",
  "tokio-util",
@@ -3279,7 +3475,7 @@ dependencies = [
  "fail-parallel",
  "figment",
  "flatbuffers",
- "foyer",
+ "foyer 0.18.1",
  "futures",
  "log",
  "object_store",
@@ -3291,8 +3487,55 @@ dependencies = [
  "serde",
  "serde_json",
  "siphasher",
- "slatedb-common",
- "slatedb-txn-obj",
+ "slatedb-common 0.12.1",
+ "slatedb-txn-obj 0.12.1",
+ "sysinfo",
+ "thiserror 1.0.69",
+ "thread_local",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "ulid",
+ "url",
+ "uuid",
+ "walkdir",
+]
+
+[[package]]
+name = "slatedb"
+version = "0.13.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f77abe3a47e3d669877cc9c83c5e853cb34d250cd1953ede8308b69e04e32c9d"
+dependencies = [
+ "async-channel",
+ "async-trait",
+ "atomic",
+ "backon",
+ "bitflags 2.11.1",
+ "bytes",
+ "chrono",
+ "crc32fast",
+ "crossbeam-skiplist",
+ "dotenvy",
+ "duration-str",
+ "fail-parallel",
+ "figment",
+ "flatbuffers",
+ "foyer 0.22.3",
+ "futures",
+ "log",
+ "lru",
+ "object_store",
+ "once_cell",
+ "ouroboros",
+ "parking_lot",
+ "rand 0.9.4",
+ "rand_xoshiro 0.7.0",
+ "serde",
+ "serde_json",
+ "siphasher",
+ "slatedb-common 0.13.1",
+ "slatedb-txn-obj 0.13.1",
  "sysinfo",
  "thiserror 1.0.69",
  "thread_local",
@@ -3318,6 +3561,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "slatedb-common"
+version = "0.13.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "396a08a34b93becfc72e7d7286f620ac887b48ad37bdaa4768b024df7c0ea7f5"
+dependencies = [
+ "chrono",
+ "log",
+ "serde",
+ "tokio",
+]
+
+[[package]]
 name = "slatedb-txn-obj"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3329,9 +3584,31 @@ dependencies = [
  "futures",
  "log",
  "object_store",
- "slatedb-common",
+ "slatedb-common 0.12.1",
  "thiserror 1.0.69",
 ]
+
+[[package]]
+name = "slatedb-txn-obj"
+version = "0.13.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "37172cf2255b0f0c56f0d2e98dbc865b2f6dd56333ed297147e9bba5d9ecf97a"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "chrono",
+ "futures",
+ "log",
+ "object_store",
+ "slatedb-common 0.13.1",
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "small_ctor"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "88414a5ca1f85d82cc34471e975f0f74f6aa54c40f062efa42c0080e7f763f81"
 
 [[package]]
 name = "smallvec"

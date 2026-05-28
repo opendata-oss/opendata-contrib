@@ -70,13 +70,6 @@ pub struct SourceBatchDescriptor {
     /// fetch path is stateless: the consumer doesn't need to
     /// cache anything per sequence.
     pub buffer_metadata: Vec<buffer::Metadata>,
-    /// Object size in bytes when the source can supply it without an
-    /// extra round trip. `BufferSource` passes through
-    /// `BatchDescriptor.object_bytes` (RFC 0003), which is `None`
-    /// until the manifest format extension lands; the runtime's
-    /// budget accounting falls back to
-    /// `source.estimated_max_batch_bytes` when this is `None`.
-    pub object_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -177,7 +170,6 @@ impl BufferSourceFetchHandle {
             sequence: descriptor.sequence,
             location: descriptor.location,
             metadata: descriptor.buffer_metadata,
-            object_bytes: descriptor.object_bytes,
         };
         let consumed = self
             .inner
@@ -295,7 +287,6 @@ impl BufferSource {
                     .collect(),
                 location: d.location,
                 buffer_metadata: d.metadata,
-                object_bytes: d.object_bytes,
             })
             .collect())
     }

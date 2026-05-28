@@ -12,7 +12,7 @@ version = "0.1.2"
 edition = "2024"
 
 [workspace.dependencies]
-buffer = { package = "opendata-buffer", version = "0.2.0" }
+buffer = { package = "opendata-buffer", version = "0.3.0" }
 common = { package = "opendata-common", version = "0.1.14" }
 
 anyhow = "1.0"
@@ -48,30 +48,3 @@ urlencoding = "2.1"
 [profile.release]
 debug = true
 strip = "none"
-
-# Temporary dependency patch. Repoints opendata-buffer and
-# opendata-common at the unpublished consumer read-ahead surface
-# (`next_descriptors`, `fetch_handle`, `ack_through`; RFC 0003 in
-# opendata) by git SHA. Remove this block and switch back to the
-# crates.io versions once those changes ship in a published
-# opendata-buffer / opendata-common release.
-#
-# CI / image-build default: pull from the upstream branch by SHA so
-# `build-image.yml` (which has no sibling worktree on the runner)
-# succeeds. `opendata-oss/opendata` is public so HTTPS clone works
-# without a deploy key.
-#
-# Update SHA whenever the buffer side lands a change worth picking up.
-# Cargo will refetch the git tree on the next build.
-[patch.crates-io]
-opendata-buffer = { git = "https://github.com/opendata-oss/opendata.git", rev = "39b02fc84cc63c3a3cf05d885864dcdca6e1cc7f" }
-opendata-common = { git = "https://github.com/opendata-oss/opendata.git", rev = "39b02fc84cc63c3a3cf05d885864dcdca6e1cc7f" }
-
-# Local-dev alternative — fast iteration against a sibling worktree at
-# `worktrees/odb-ht/opendata-2-buffer-readahead-impl/`. To use:
-#   1. Comment out the two `git = ...` lines above.
-#   2. Uncomment the two `path = ...` lines below.
-# Restore the git-rev form before pushing — CI fails on the path form
-# because the sibling dir doesn't exist on a runner.
-# opendata-buffer = { path = "../opendata-2-buffer-readahead-impl/buffer" }
-# opendata-common = { path = "../opendata-2-buffer-readahead-impl/common" }
