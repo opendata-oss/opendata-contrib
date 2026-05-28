@@ -1,0 +1,46 @@
+# clickhouse-ingestor config for the tutorial.
+# Reads from the MinIO-backed Buffer the collector is writing to,
+# decodes OTLP logs, and inserts rows into the `tutorial.logs` table.
+
+buffer:
+  manifest_path: otel/logs/manifest
+  data_prefix: otel/logs/data
+  object_store:
+    type: Aws
+    region: us-east-1
+    bucket: tutorial-buffer
+    # AWS_ENDPOINT=http://minio:9000, AWS_ALLOW_HTTP=true, and
+    # AWS_VIRTUAL_HOSTED_STYLE_REQUEST=false are set in docker-compose.yml;
+    # the underlying Rust object_store crate picks them up from the
+    # standard AWS env chain.
+
+clickhouse:
+  endpoint: http://clickhouse:8123
+  database: tutorial
+  table: logs
+  # insert_quorum omitted: tutorial uses a single-node ClickHouse.
+
+runtime:
+  dry_run: false
+  poll_interval_ms: 250
+  retry_max_attempts: 6
+  retry_initial_backoff_ms: 100
+  request_timeout_secs: 30
+
+ack:
+  policy: every_commit_group
+
+adapter:
+  adapter_version: 1
+  max_chunk_rows: 10000
+  max_chunk_bytes: 4194304          # 4 MiB
+  # Single-node ClickHouse rejects insert_deduplication_token; turn it off.
+  apply_deduplication_token: false
+
+sink:
+  max_concurrent_commits: 2
+  serialization_format: json_each_row
+  client_mode: per_call
+
+metrics_server:
+  bind_addr: 0.0.0.0:9090

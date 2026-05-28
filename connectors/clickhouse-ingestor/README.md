@@ -2,9 +2,15 @@
 
 A standalone service that consumes OTLP logs from an OpenData Buffer and writes them to a ClickHouse table.
 
-The runtime is generic at the Buffer-reader and metadata-envelope layers; signal-specific decoding and ClickHouse table mapping live in pluggable adapters. The current alpha **ships an OTLP logs adapter** as the published binary; the trait surfaces (`SignalDecoder`, `Adapter`) are public so you can compose your own decoder + adapter for any other signal type — see ["Add a new signal type"](#add-a-new-signal-type) below for a worked OTLP traces example.
+The binary is a thin wrapper that wires three libraries: the sink-agnostic [`opendata-ingest-runtime`](../../runtime/opendata-ingest-runtime/) (pipelined fetch / decode / sink with K>1 admission and byte-budgeted backpressure), the [`opendata-ingest-otel`](../../plugins/opendata-ingest-otel/) OTLP decoder, and the [`opendata-ingest-clickhouse`](../../plugins/opendata-ingest-clickhouse/) ClickHouse `Sink` implementation. The first published configuration is OTLP logs into a `ReplacingMergeTree` table.
 
-The design (ack semantics, dedupe, idempotency tokens, schema ownership) is described in [`rfcs/0001-clickhouse-ingestor.md`](../../rfcs/0001-clickhouse-ingestor.md). The first part of this README is for operators who want to run the published binary against an OTLP logs source; the last section is for developers who want to extend it.
+Design references:
+
+- [RFC 0001](../../rfcs/0001-clickhouse-ingestor.md): ClickHouse sink design (ack semantics, dedupe, idempotency tokens, schema ownership).
+- [RFC 0002](../../rfcs/0002-generic-ingest-runtime.md): generic ingest runtime (Sink/Decoder traits, pipelining, ack coordinator).
+- [Runtime README](../../runtime/opendata-ingest-runtime/README.md): public API surface and how to build a new sink.
+
+The first half of this README is for operators running the published binary against an OTLP logs source; the last section points at the runtime crate for anyone extending it to a new sink or signal type.
 
 ## What you need
 
@@ -22,7 +28,7 @@ Pick one:
 ```sh
 # Latest release: https://github.com/opendata-oss/opendata-contrib/releases
 curl -fL -o clickhouse-ingestor.tar.gz \
-  https://github.com/opendata-oss/opendata-contrib/releases/download/clickhouse-ingestor%2Fv0.1.2/clickhouse-ingestor-0.1.2-x86_64-unknown-linux-gnu.tar.gz
+  https://github.com/opendata-oss/opendata-contrib/releases/download/clickhouse-ingestor%2Fv0.2.0/clickhouse-ingestor-0.2.0-x86_64-unknown-linux-gnu.tar.gz
 tar xzf clickhouse-ingestor.tar.gz
 ./clickhouse-ingestor --help
 ```
@@ -30,7 +36,7 @@ tar xzf clickhouse-ingestor.tar.gz
 **Container image** — `linux/amd64` only:
 
 ```sh
-docker pull ghcr.io/opendata-oss/clickhouse-ingestor:0.1.2
+docker pull ghcr.io/opendata-oss/clickhouse-ingestor:0.2.0
 ```
 
 **Build from source** — for any other platform, or to develop against:
@@ -107,19 +113,19 @@ runtime:
   retry_initial_backoff_ms: 100
   request_timeout_secs: 30
 
-commit_group:
-  max_rows: 100000         # flush whenever any threshold is hit
-  max_bytes: 33554432      # 32 MiB
-  max_age_ms: 1000
-
 ack:
   policy: every_commit_group   # or every_n with `n: <int>` to amortise flush()
 
 adapter:
   adapter_version: 1
-  max_chunk_rows: 100000
-  max_chunk_bytes: 33554432
-  apply_deduplication_token: true   # set false for non-replicated single-node ClickHouse
+  max_chunk_rows: 100000           # one INSERT ≤ this many rows
+  max_chunk_bytes: 33554432        # 32 MiB
+  apply_deduplication_token: true  # set false for non-replicated single-node ClickHouse
+
+sink:
+  max_concurrent_commits: 4        # in-flight Sink::write calls; runtime applies a >= 1 floor
+  serialization_format: json_each_row   # or row_binary
+  client_mode: per_call            # or pooled (single client reused across calls)
 
 metrics_server:
   bind_addr: 0.0.0.0:9090       # /metrics + /-/healthy
@@ -127,13 +133,15 @@ metrics_server:
 
 ### What each section does
 
-- **`buffer`** — what to read. The S3 bucket / prefix / manifest path the OTel collector is writing into.
-- **`clickhouse`** — where to write. Endpoint + database/table that match the DDL you applied.
-- **`runtime`** — polling cadence, retry budget, request timeout. Defaults work for prod; tune `poll_interval_ms` lower if your producer is bursty and you want lower latency.
-- **`commit_group`** — coalesces decoded records across multiple Buffer batches into ClickHouse-sized inserts. Flushes when any threshold trips. Keep `max_rows`/`max_bytes` in the 1k–100k row / 1–32 MiB range that ClickHouse likes; lower `max_age_ms` reduces ingest latency at the cost of more, smaller inserts.
-- **`ack`** — when to advance the durable Buffer position. `every_commit_group` is safest (each successful insert is durably acked). `every_n` amortises the manifest-write cost of `flush()` at the cost of a bounded replay window after a crash.
-- **`adapter`** — chunking and dedupe. `adapter_version` is the merge tiebreaker for `ReplacingMergeTree`; bump it when you change non-key column mappings so a replay resolves to the new mapping. Leave `apply_deduplication_token: true` for replicated tables (the dedupe token is a backstop against ack-then-crash double-insert); set it false for single-node dev/test where the setting is rejected.
-- **`metrics_server`** — Prometheus scrape endpoint + `/-/healthy` liveness probe.
+- **`buffer`**: what to read. The S3 bucket / prefix / manifest path the OTel collector is writing into.
+- **`clickhouse`**: where to write. Endpoint + database/table that match the DDL you applied.
+- **`runtime`**: polling cadence, retry budget, request timeout. Defaults work for prod; tune `poll_interval_ms` lower if your producer is bursty and you want lower latency.
+- **`ack`**: when to advance the durable Buffer position. `every_commit_group` is safest (each successful sink commit is durably acked). `every_n` amortises the manifest-write cost of `flush()` at the cost of a bounded replay window after a crash.
+- **`adapter`**: ClickHouse-side chunking and dedupe. `max_chunk_rows`/`max_chunk_bytes` cap a single `INSERT`; keep them in the 1k–100k row / 1–32 MiB range that ClickHouse likes. `adapter_version` is the merge tiebreaker for `ReplacingMergeTree`; bump it when you change non-key column mappings so a replay resolves to the new mapping. Leave `apply_deduplication_token: true` for replicated tables (the dedupe token is a backstop against ack-then-crash double-insert); set it false for single-node dev/test where the setting is rejected.
+- **`sink`**: shared writer-pool sizing (RFC 0002). `max_concurrent_commits` is the cap on in-flight `Sink::write` calls across all sources. `serialization_format` selects the wire format the writer hands ClickHouse: `json_each_row` is the conservative default; `row_binary` is what was validated at 175k rps. `client_mode` is `per_call` (default) or `pooled` (reuses one HTTP client across calls).
+- **`metrics_server`**: Prometheus scrape endpoint + `/-/healthy` liveness probe.
+
+Older YAMLs that still set a top-level `commit_group:` block parse cleanly; the section is ignored. Chunking thresholds now live in `adapter:`.
 
 ### Env-var overrides
 
@@ -172,7 +180,7 @@ docker run --rm \
   -e AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID \
   -e AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY \
   -p 9090:9090 \
-  ghcr.io/opendata-oss/clickhouse-ingestor:0.1.2 \
+  ghcr.io/opendata-oss/clickhouse-ingestor:0.2.0 \
   --config /etc/clickhouse-ingestor/config.yaml
 ```
 
@@ -221,13 +229,18 @@ Once the process is up:
 
 Re-running the ingestor over already-inserted batches is safe: `ReplacingMergeTree(_adapter_version)` collapses duplicates on merge, the per-chunk `insert_deduplication_token` is a backstop, and queries that need exactly-once semantics should use `FINAL` (or query-time dedupe).
 
-## Add a new signal type
+## Extending the ingestor
 
-The published binary is wired for OTLP logs only — but everything below the binary is generic. The runtime, commit-group coalescer, ack controller, and ClickHouse writer are all signal-agnostic; only the decoder and the adapter are signal-specific. To pipe a different kind of data (OTLP traces, OTLP metrics, your own protobuf, etc.) into ClickHouse, you implement two traits and write a binary that wires them up.
+Two extension paths, two different doors:
 
-The crate's integration tests include a **complete worked example for OTLP traces**: [`tests/clickhouse_round_trip_traces.rs`](tests/clickhouse_round_trip_traces.rs). Read that file first if you want a runnable reference. The summary below mirrors what it does.
+- **A new signal type into ClickHouse** (OTLP traces, OTLP metrics, your own protobuf): implement a `SignalDecoder` and an `Adapter` against the connector's existing ClickHouse pipeline. The runtime, commit-group coalescer, ack controller, and ClickHouse writer are all signal-agnostic; only the decoder and the adapter are signal-specific. Worked example follows.
+- **A different sink entirely** (Iceberg, Postgres, a custom file format): implement the `Sink` trait from [`opendata-ingest-runtime`](../../runtime/opendata-ingest-runtime/) in a fresh crate. See the [runtime README](../../runtime/opendata-ingest-runtime/README.md) and [RFC 0002](../../rfcs/0002-generic-ingest-runtime.md) for the full surface.
 
-### What you write
+The rest of this section walks the first path. The crate's integration tests include a complete worked example for OTLP traces: [`tests/clickhouse_round_trip_traces.rs`](tests/clickhouse_round_trip_traces.rs). Read that file first if you want a runnable reference. The summary below mirrors what it does.
+
+### Add a new signal type
+
+#### What you write
 
 **1. A decoded record type.** One flat struct per logical row, carrying [`SourceCoordinates`](src/signal.rs) (sequence/entry/record indices that uniquely identify the row) plus the fields you'll write into ClickHouse:
 
@@ -314,7 +327,7 @@ runtime.run(shutdown).await
 
 `SignalType` already covers the OTLP signal types (`Logs`, `Metrics`, `Traces`); for arbitrary non-OTLP payloads you'd extend that enum (additive, just byte-mapping + a name) or carry signal-type-as-data inside the envelope's `reserved` byte and dispatch in your decoder.
 
-### Verifying it works
+#### Verifying it works
 
 The traces test runs the same testcontainers + Buffer Producer + runtime + ClickHouse pattern as the logs test:
 
@@ -327,7 +340,10 @@ Both tests should pass on a machine with Docker available — they exercise the 
 
 ## See also
 
-- [RFC 0001 — ClickHouse Ingestor](../../rfcs/0001-clickhouse-ingestor.md): full design, ack/retry semantics, dedupe model.
+- [Runtime README](../../runtime/opendata-ingest-runtime/README.md): `opendata-ingest-runtime` public surface, configuration, metrics, and how to build a new sink.
+- [RFC 0001 — ClickHouse Ingestor](../../rfcs/0001-clickhouse-ingestor.md): ClickHouse-sink design (ack/retry semantics, dedupe model).
+- [RFC 0002 — Generic Ingest Runtime](../../rfcs/0002-generic-ingest-runtime.md): Sink/Decoder traits, pipelining, ack coordinator.
+- [Tutorial](../../tutorial/): end-to-end local pipeline (OTel client → otel-collector → MinIO-backed Buffer → ingestor → ClickHouse).
 - [`tests/clickhouse_round_trip.rs`](tests/clickhouse_round_trip.rs): logs end-to-end test (the published path).
 - [`tests/clickhouse_round_trip_traces.rs`](tests/clickhouse_round_trip_traces.rs): traces end-to-end test (the worked extension example).
 - [opendata-go OpenData OTel exporter](https://github.com/opendata-oss/opendata-go/tree/main/exporter/opendataexporter): the producer side that writes OTLP logs into the Buffer.
