@@ -1,0 +1,129 @@
+# OpenData → ClickHouse local pipeline.
+#
+# Components:
+#   minio                S3-compatible object store backing the Buffer queue.
+#   minio-init           Creates the buffer bucket once MinIO is up.
+#   clickhouse           Destination database. DDL in clickhouse-init.sql runs at start.
+#   otel-collector       Bundled OpenData distribution; receives OTLP, writes to MinIO via the opendata exporter.
+#   clickhouse-ingestor  Reads from the MinIO-backed Buffer, writes rows into ClickHouse.
+#   telemetrygen         One-shot OTLP load generator (run on demand: `docker compose run telemetrygen`).
+#
+# Bring up:        docker compose up -d
+# Send some logs:  docker compose run --rm telemetrygen
+# Query results:   curl http://localhost:8123 --data-urlencode "query=SELECT count() FROM tutorial.logs"
+# Tear down:       docker compose down -v
+
+services:
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9000:9000"   # S3 API
+      - "9001:9001"   # console (http://localhost:9001)
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      sh -c "
+        mc alias set local http://minio:9000 minioadmin minioadmin &&
+        mc mb -p local/tutorial-buffer &&
+        echo 'bucket tutorial-buffer ready'
+      "
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.10.1.2812
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    environment:
+      CLICKHOUSE_DB: tutorial
+      CLICKHOUSE_USER: ingestor
+      CLICKHOUSE_PASSWORD: ingestor
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+    ports:
+      - "8123:8123"   # HTTP
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+      - ./clickhouse-init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8123/ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  otel-collector:
+    image: ghcr.io/opendata-oss/otel-collector:v0.4.0-04f46c2
+    depends_on:
+      minio-init:
+        condition: service_completed_successfully
+    environment:
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+    ports:
+      - "4317:4317"   # OTLP gRPC
+      - "4318:4318"   # OTLP HTTP
+    volumes:
+      - ./otel-collector-config.yaml:/etc/otelcol/config.yaml:ro
+    command: ["--config=/etc/otelcol/config.yaml"]
+
+  clickhouse-ingestor:
+    image: ghcr.io/opendata-oss/clickhouse-ingestor:0.2.0
+    depends_on:
+      minio-init:
+        condition: service_completed_successfully
+      clickhouse:
+        condition: service_healthy
+    environment:
+      # Object store credentials and endpoint (the Rust object_store
+      # crate picks these up from the standard AWS env chain).
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      AWS_ENDPOINT: http://minio:9000
+      AWS_ALLOW_HTTP: "true"
+      AWS_VIRTUAL_HOSTED_STYLE_REQUEST: "false"
+      # ClickHouse credentials come from env (never the YAML).
+      INGESTOR__CLICKHOUSE__USER: ingestor
+      INGESTOR__CLICKHOUSE__PASSWORD: ingestor
+      RUST_LOG: info,opendata_ingest_runtime=info,clickhouse_ingestor=info
+    ports:
+      - "9090:9090"   # Prometheus /metrics
+    volumes:
+      - ./ingestor-config.yaml:/etc/clickhouse-ingestor/config.yaml:ro
+    command: ["--config=/etc/clickhouse-ingestor/config.yaml"]
+
+  # On-demand OTLP load generator. Run with:
+  #   docker compose run --rm telemetrygen
+  # Defaults: 30 seconds of logs at 1000 rps from one worker.
+  telemetrygen:
+    image: ghcr.io/open-telemetry/opentelemetry-collector-contrib/telemetrygen:latest
+    depends_on:
+      - otel-collector
+    profiles: ["load"]
+    command:
+      - "logs"
+      - "--otlp-endpoint=otel-collector:4317"
+      - "--otlp-insecure"
+      - "--duration=30s"
+      - "--rate=1000"
+      - "--workers=1"
+      - "--otlp-attributes=service.name=\"tutorial-app\""
+
+volumes:
+  minio-data:
+  clickhouse-data:

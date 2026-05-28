@@ -1,0 +1,51 @@
+# OpenData OTel collector config for the tutorial.
+# Receives OTLP, batches, writes to a MinIO-backed Buffer queue.
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  batch:
+    timeout: 200ms
+    send_batch_size: 1024
+    send_batch_max_size: 4096
+
+exporters:
+  opendata:
+    object_store:
+      type: s3
+      bucket: tutorial-buffer
+      region: us-east-1
+      endpoint: http://minio:9000     # MinIO inside the compose network
+    data_path_prefix: otel/logs/data
+    manifest_path: otel/logs/manifest
+
+    flush_interval: 100ms
+    flush_size_bytes: 4194304          # 4 MiB; small for tutorial liveness
+    compression: zstd
+
+    # Pipelining (raise these for production; modest values keep tutorial CPU low)
+    encode_concurrency: 2
+    upload_concurrency: 2
+    max_inflight_batches: 16
+    max_inflight_bytes: 33554432       # 32 MiB
+    manifest_append_batch_size: 4
+
+    timeout: 30s
+
+  # Helpful for verifying the collector is receiving data before
+  # debugging the downstream pipeline. Drop in production.
+  debug:
+    verbosity: basic
+
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [opendata, debug]
