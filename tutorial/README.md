@@ -19,7 +19,7 @@ No Kafka, no broker, no managed queue. The OTel collector writes OTLP-protobuf p
 |---|---|---|
 | `minio` | `minio/minio:latest` | S3-compatible object store; backs the Buffer queue |
 | `clickhouse` | `clickhouse/clickhouse-server:24.10.1.2812` | Destination database; table DDL applied at startup |
-| `otel-collector` | `ghcr.io/opendata-oss/otel-collector:v0.4.0-04f46c2` | Receives OTLP, writes to MinIO-backed Buffer |
+| `otel-collector` | `ghcr.io/opendata-oss/otel-collector:v0.4.0` | Receives OTLP, writes to MinIO-backed Buffer |
 | `clickhouse-ingestor` | `ghcr.io/opendata-oss/clickhouse-ingestor:0.2.0` | Reads from Buffer, inserts into ClickHouse |
 | `telemetrygen` (on demand) | `ghcr.io/open-telemetry/opentelemetry-collector-contrib/telemetrygen:latest` | OTLP load generator |
 

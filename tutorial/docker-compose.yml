@@ -66,7 +66,7 @@ services:
       retries: 30
 
   otel-collector:
-    image: ghcr.io/opendata-oss/otel-collector:v0.4.0-04f46c2
+    image: ghcr.io/opendata-oss/otel-collector:v0.4.0
     depends_on:
       minio-init:
         condition: service_completed_successfully
