@@ -2,7 +2,7 @@
 
 A standalone service that consumes OTLP logs from an OpenData Buffer and writes them to a ClickHouse table.
 
-The binary is a thin wrapper that wires three libraries: the sink-agnostic [`opendata-ingest-runtime`](../../runtime/opendata-ingest-runtime/) (pipelined fetch / decode / sink with K>1 admission and byte-budgeted backpressure), the [`opendata-ingest-otel`](../../plugins/opendata-ingest-otel/) OTLP decoder, and the [`opendata-ingest-clickhouse`](../../plugins/opendata-ingest-clickhouse/) ClickHouse `Sink` implementation. The first published configuration is OTLP logs into a `ReplacingMergeTree` table.
+The binary is a thin wrapper that wires three libraries: the sink-agnostic [`opendata-ingest-runtime`](../../runtime/opendata-ingest-runtime/) (pipelined fetch / decode / sink with byte-budgeted backpressure), the [`opendata-ingest-otel`](../../plugins/opendata-ingest-otel/) OTLP decoder, and the [`opendata-ingest-clickhouse`](../../plugins/opendata-ingest-clickhouse/) ClickHouse `Sink` implementation. The first published configuration is OTLP logs into a `ReplacingMergeTree` table.
 
 Design references:
 
